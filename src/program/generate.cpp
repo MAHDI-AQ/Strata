@@ -46,6 +46,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/concurrent_serve.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -275,6 +276,8 @@ struct Options {
     std::string split_device;
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
+    int concurrency = 1, batch_rows = 8, concurrent_prefill = 256;
+    std::string batch_policy = "fair";
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
@@ -372,6 +375,10 @@ void usage() {
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
+                 "  --concurrency N      experimental shared-model serving, 1..4 requests (default 1)\n"
+                 "  --batch-rows N       target rows across requests, 1..8 (default 8)\n"
+                 "  --batch-policy P     fair (shorter windows) or depth (rotate longer windows)\n"
+                 "  --concurrent-prefill N  bounded prompt chunk, 256..1024 (default 256)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
@@ -994,6 +1001,10 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
+        else if (a == "--concurrency") o.concurrency = std::atoi(next("--concurrency"));
+        else if (a == "--batch-rows") o.batch_rows = std::atoi(next("--batch-rows"));
+        else if (a == "--batch-policy") o.batch_policy = next("--batch-policy");
+        else if (a == "--concurrent-prefill") o.concurrent_prefill = std::atoi(next("--concurrent-prefill"));
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_auto = v == "auto";
@@ -1085,6 +1096,23 @@ int main(int argc, char** argv) {
             // tokens would look like a working run.
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
             usage();
+            return 2;
+        }
+    }
+    if (o.concurrency < 1 || o.concurrency > 4 || o.batch_rows < 1 || o.batch_rows > 8 ||
+        (o.batch_policy != "fair" && o.batch_policy != "depth") || o.concurrent_prefill < 256 || o.concurrent_prefill > 1024) {
+        std::fprintf(stderr, "strata: --concurrency 1..4, --batch-rows 1..8, --batch-policy fair|depth, --concurrent-prefill 256..1024\n");
+        return 2;
+    }
+    if (o.concurrency > 1) {
+#if defined(STRATA_USE_HIP)
+        std::fprintf(stderr, "strata: concurrent serving currently requires NVIDIA CUDA\n"); return 2;
+#endif
+        if (!o.serve || o.native_preset.empty() || o.mtp.empty() || o.spec < 2 || o.spec > 8 || o.kv != "int8" ||
+            o.vision || !o.layer_split.empty() || !o.split_device.empty() || o.spec_split ||
+            !o.cvec_files.empty() || o.kv_resident || o.expert_cache_remote[0] || o.expert_cache_remote[1] ||
+            o.expert_cache_remote[2] || o.expert_profile.empty() || o.expert_cache == 0 || o.no_pool || o.no_capture) {
+            std::fprintf(stderr, "strata: concurrency requires --serve, native experts, MTP/spec, int8 resident KV and a profile-filled cache; vision, control vectors, split verify, KV streaming and multi-GPU are not supported\n");
             return 2;
         }
     }
@@ -1728,6 +1756,18 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     }
+    std::unique_ptr<strata::program::ConcurrentServe> concurrent;
+    if (o.concurrency > 1) {
+        strata::program::ConcurrentConfig config;
+        config.requests = o.concurrency; config.rows = o.batch_rows; config.depth = o.batch_policy == "depth";
+        config.window = o.spec; config.mtp_window_rows = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+        config.prefill_chunk = o.concurrent_prefill; config.context = o.max_context; config.draft_context = o.mtp_window;
+        config.reserve_mib = o.vram_reserve_mib; config.mtp_dir = o.mtp; config.spec_min_p = (float) o.spec_min_p;
+        config.suffix = o.suffix_draft; config.eos = o.eos_ids;
+        config.adapt_every = o.adapt_every; config.adapt_swaps = o.adapt_swaps;
+        concurrent = std::make_unique<strata::program::ConcurrentServe>(config);
+        if (!concurrent->prepare(g, ss, mtp, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    }
     // Create the additional contexts after MTP has secured CUDA0 memory, but
     // before the host arena maps its expert pages into their address spaces.
     for (int r = 1; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
@@ -1993,7 +2033,10 @@ int main(int argc, char** argv) {
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
+        // Concurrent session/prompt storage is already allocated. Reserve for verifiers, graph metadata,
+        // draft heads and per-slot prompt host/device staging created after the cache.
+        const int64_t concurrent_mib = concurrent ? 512 + (int64_t) o.concurrency * 256 : 0;
+        const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib + concurrent_mib) << 20;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
@@ -3039,6 +3082,15 @@ int main(int argc, char** argv) {
         }
         return 0;
     };
+    if (concurrent) {
+        strata::core::VerifyHits hits;
+        hits.d_res = d_res; hits.cache_base = drive.d.cache_base; hits.blob = drive.d.cache_blob;
+        hits.slot_off = xcache.slot_offsets(); hits.n_slots = xcache.slots();
+        const int result = concurrent->run(wt, &native_head, srcp, xcache, host_res.data(), hits,
+                                           drive.d, &drive_pool_multi, &drive, err);
+        if (result) std::fprintf(stderr, "strata concurrent serve: %s\n", err.c_str());
+        return result;
+    }
     if (o.serve) {
         if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {

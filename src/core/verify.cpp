@@ -118,6 +118,7 @@ Verifier::~Verifier() {
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     if (cs_) cudaStreamSynchronize(cs_);
+    for (auto& b : batch_graphs_) if (b.graph) cudaGraphExecDestroy(b.graph);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
@@ -318,7 +319,7 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // so the CPU computes A's experts of layer l while the GPU runs B's mixer and router of layer l, and B's experts
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
-bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase, int64_t layer) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const WeightTable& wt = *wt_;
@@ -341,17 +342,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     groups_[T] = G;
 
     // ---- the window's inputs, from mapped staging
+    const int64_t HB = Verifier::handoff_floats(g);
+    const int32_t* pos_k = pos_ + MT * NH;
+    const int32_t* pos_i = pos_k + MT * NKV;
+    if (phase <= 0) {
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
-    const int32_t* pos_k = pos_ + MT * NH;
-    const int32_t* pos_i = pos_ + MT * (NH + NKV);
     if (ple_on) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
 
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
-    const int64_t HB = Verifier::handoff_floats(g);
     if (lb_ > 0) {
         for (int t = 0; t < T; ++t) {
             copy_from_mapped(Rt(t), hand_in_ + (size_t) t * HB, HC * N, cs);
@@ -377,6 +379,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     }
 
+    }
+    if (phase == 0) return true;
     // per-layer state indices (GDN and QSA layers are numbered separately)
     std::vector<int64_t> gdn_idx((size_t) g.n_layers, -1), qsa_idx((size_t) g.n_layers, -1);
     {
@@ -616,13 +620,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
+        if (device_plan_ && phase < 0)   // batch coordinator builds the cross-request plan
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                           (uint32_t) ((l - lb_) * G + grp + 1), cs);
-        doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                         m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+        if (phase < 0)
+            doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                             m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
         stamp(l, 17, grp);
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
@@ -659,6 +664,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
+        if (phase != 3) {
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
         if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
             wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
@@ -718,6 +724,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
         }
         moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        }
+        if (phase == 2) return true;
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
                 native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
@@ -738,6 +746,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         return true;
     };
 
+    if (phase == 1) return pre(layer, 0);
+    if (phase == 2 || phase == 3) return post(layer, 0);
+    if (phase < 0) {
     for (int grp = 0; grp < G; ++grp)
         if (!pre(lb_, grp)) return false;
     for (int64_t l = lb_; l < le_; ++l)
@@ -754,6 +765,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         return true;
     }
 
+    }
     // ---- the head, T columns, and the argmax of each
     stamp(g.n_layers, 0, 0);
     {
@@ -944,17 +956,13 @@ bool Verifier::capture_commit(std::string& err) {
     return true;
 }
 
-bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
-                   std::string& err) {
+bool Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
-    if (pos0 + T > ss.qsa_states[0].max_cells) { err = "verify: the window runs past the context"; return false; }
-    if (!capture(T, err) || !capture_commit(err)) return false;
-    VDBG("captured; staging\n");
-    const Clock::time_point t0 = Clock::now();
+    if (pos0 < 0 || pos0 > ss.qsa_states[0].max_cells - T) { err = "verify: the window runs past the context"; return false; }
     const QsaShapes s = shapes_of(g);
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
@@ -975,6 +983,22 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         if (!ss.ple.table->gather_batch(rows, (size_t) T, h_ple_, err)) return false;
     }
+    last_t_ = T;
+    last_pos0_ = pos0;
+    for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
+    return true;
+}
+
+bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                   std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    g_diag_verifier.store(this);
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const Clock::time_point t0 = Clock::now();
+    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    if (!batch_replay_ && (!capture(T, err) || !capture_commit(err) || !stage_inputs(T, tokens, pos0, err))) return false;
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
@@ -982,10 +1006,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
-    for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
+    if (!batch_replay_) for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    const cudaError_t le = cudaGraphLaunch(batch_replay_ ? batch_replay_ : exec_[T], cs_);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     VDBG("launched\n");
@@ -1048,6 +1072,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    if (batch_replay_) { ++windows; progress_beat(); return true; }
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
         cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
         const int64_t L = g.n_layers;
@@ -1109,6 +1134,108 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     ++windows;
     progress_at("decode");
     progress_beat();
+    return true;
+}
+
+bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user, std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    if (batch.empty() || batch.size() > 4 || split_ || next_ || lb_ != 0 || le_ != g_->n_layers) {
+        err = "batch verify: requires 1..4 complete single-GPU windows"; return false;
+    }
+    int total = 0;
+    std::vector<std::pair<Verifier*, int>> shape;
+    for (const auto& b : batch) {
+        Verifier* v = b.verifier;
+        if (!v || v == this || v->g_ != g_ || v->wt_ != wt_ || v->device_ != device_ || v->split_ || v->next_ ||
+            v->lb_ != 0 || v->le_ != g_->n_layers || b.count < 1 || b.count > v->max_t_ ||
+            !b.tokens || !b.output) {
+            err = "batch verify: incompatible member"; return false;
+        }
+        for (const auto& previous : shape) if (previous.first == v || previous.first->ss_ == v->ss_) {
+            err = "batch verify: duplicate sequence state"; return false;
+        }
+        total += b.count;
+        shape.emplace_back(v, b.count);
+    }
+    if (total > max_t_) { err = "batch verify: row budget exceeded"; return false; }
+    for (const auto& b : batch)
+        if (!b.verifier->stage_inputs(b.count, b.tokens, b.position, err) || !b.verifier->capture_commit(err)) return false;
+    // Expert-only coordinator always uses the host plan. Member graphs never publish doorbells.
+    device_plan_ = false;
+    cudaGraphExec_t graph_exec = nullptr;
+    for (const auto& b : batch_graphs_) if (b.shape == shape) { graph_exec = b.graph; break; }
+    if (!graph_exec) {
+        if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            err = "batch verify: begin capture failed"; return false;
+        }
+        bool ok = true;
+        const int64_t N = g_->n_embd, K = ss_->k;
+        auto copy = [&](void* dst, const void* src, size_t bytes) {
+            if (cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+                err = "batch verify: recording row copy failed"; ok = false;
+            }
+        };
+        for (const auto& b : batch) if (ok) ok = b.verifier->record_window(b.count, cs_, err, 0);
+        for (int64_t l = 0; ok && l < g_->n_layers; ++l) {
+            int row = 0;
+            for (const auto& b : batch) {
+                Verifier& v = *b.verifier;
+                if (!(ok = v.record_window(b.count, cs_, err, 1, l))) break;
+                copy(mixed_ + row * N, v.mixed_, (size_t) b.count * N * sizeof(float));
+                copy(ids_ + row * K, v.ids_, (size_t) b.count * K * sizeof(int32_t));
+                copy(w_ + row * K, v.w_, (size_t) b.count * K * sizeof(float));
+                row += b.count;
+            }
+            if (!ok) break;
+            doorbell_publish(mixed_, ids_, w_, total * N, total * K, m_x_, m_ids_, m_w_, m_seq_, cs_);
+            if (strata::kernels::cpu::expert_layout().native)
+                quantize_q8_1_rows(mixed_, total, N, nat_xq_, cs_);
+            else { err = "batch verify: requires native experts"; ok = false; break; }
+            if (!(ok = record_window(total, cs_, err, 2, l))) break;
+            row = 0;
+            for (const auto& b : batch) {
+                copy(b.verifier->parts_, parts_ + row * K * N, (size_t) b.count * K * N * sizeof(float));
+                if (!ok || !(ok = b.verifier->record_window(b.count, cs_, err, 3, l))) break;
+                row += b.count;
+            }
+        }
+        for (const auto& b : batch) if (ok) ok = b.verifier->record_window(b.count, cs_, err, 4);
+        cudaGraph_t graph = nullptr;
+        const cudaError_t end = cudaStreamEndCapture(cs_, &graph);
+        if (!ok || end != cudaSuccess) {
+            if (graph) cudaGraphDestroy(graph);
+            if (err.empty()) err = "batch verify: end capture failed";
+            return false;
+        }
+        const cudaError_t instantiate = cudaGraphInstantiate(&graph_exec, graph, 0);
+        cudaGraphDestroy(graph);
+        if (instantiate != cudaSuccess) { err = "batch verify: graph instantiation failed"; return false; }
+        // Bound graph memory when confidence/suffix windows produce many layouts.
+        if (batch_graphs_.size() >= 8) {
+            cudaGraphExecDestroy(batch_graphs_.front().graph);
+            batch_graphs_.erase(batch_graphs_.begin());
+        }
+        batch_graphs_.push_back({std::move(shape), graph_exec});
+    }
+    groups_[total] = 1;
+    batch_replay_ = graph_exec;
+    const bool ran = run(total, nullptr, 0, pool, user, nullptr, err);
+    batch_replay_ = nullptr;
+    if (!ran) return false;
+    for (const auto& b : batch) {
+        Verifier& v = *b.verifier;
+        if (v.head_sampling_ && ((!v.sampling_.greedy && v.sampling_.temperature > 0) || v.hist_d_)) {
+            auto sp = v.sampling_;
+            sp.counter = (uint64_t) b.position;
+            sample_tokens(v.head_logits_, b.count, (int) v.n_vocab_, v.hist_d_, v.hist_len_, sp, v.m_out_, cs_);
+        }
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "batch verify: sampling failed"; return false; }
+    for (const auto& b : batch) {
+        for (int t = 0; t < b.count; ++t) b.output[t] = b.verifier->h_out_[t];
+        ++b.verifier->windows;
+    }
     return true;
 }
 

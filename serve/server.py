@@ -155,6 +155,12 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
+        self._request_local = threading.local()
+        self._write_lock = threading.Lock()
+        self._channels_lock = threading.Lock()
+        self._channels = {}
+        self._request_number = 0
+        self.multiplex = False
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -184,6 +190,7 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.multiplex = "multiplex" in f[2:]
                 break
         loading.set()
         if self.max_context <= 0:
@@ -196,11 +203,127 @@ class StrataEngine:
         self.lines: queue.Queue = queue.Queue()
         threading.Thread(target=self._pump, daemon=True).start()
 
+    @property
+    def last(self):
+        if not self.multiplex:
+            return getattr(self, "_last", {})
+        if not hasattr(self._request_local, "last"):
+            self._request_local.last = {}
+        return self._request_local.last
+
+    @last.setter
+    def last(self, value):
+        if self.multiplex:
+            self._request_local.last = value
+        else:
+            self._last = value
+
+    @property
+    def progress(self):
+        return getattr(self._request_local, "progress", None) if self.multiplex else getattr(self, "_progress_value", None)
+
+    @progress.setter
+    def progress(self, value):
+        if self.multiplex:
+            self._request_local.progress = value
+        else:
+            self._progress_value = value
+
+    def _send(self, line):
+        with self._write_lock:
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
+
     def _pump(self):
         for line in self.proc.stdout:
-            self.lines.put(line)
+            if not self.multiplex:
+                self.lines.put(line)
+                continue
+            fields = line.split(" ", 2)
+            if len(fields) != 3 or fields[0] != "R" or not fields[1].isdigit():
+                continue
+            number, payload = int(fields[1]), fields[2]
+            overflow = False
+            with self._channels_lock:
+                channel = self._channels.get(number)
+                if channel is not None:
+                    try:
+                        channel.put_nowait(payload)
+                    except queue.Full:
+                        # Never block all streams behind a slow HTTP client.
+                        self._channels.pop(number, None)
+                        while not channel.empty():
+                            try:
+                                channel.get_nowait()
+                            except queue.Empty:
+                                break
+                        channel.put_nowait("ERR client output queue exceeded 256 events")
+                        overflow = True
+            if overflow:
+                try:
+                    self._send(f"CSTOP {number}")
+                except OSError:
+                    pass
         self.ended = True                               # its output closed: it is gone, even before the OS says so
         self.lines.put(None)
+        with self._channels_lock:
+            for channel in self._channels.values():
+                try:
+                    channel.put_nowait(None)
+                except queue.Full:
+                    channel.get_nowait()
+                    channel.put_nowait(None)
+
+    def _generate_multiplex(self, ids, max_new, sampling, cancel, embeddings):
+        if embeddings:
+            raise ValueError("concurrent serving currently supports text only")
+        self.last = {}
+        self.progress = None
+        channel = queue.Queue(maxsize=256)
+        with self._channels_lock:
+            self._request_number += 1
+            number = self._request_number
+            self._channels[number] = channel
+        done = False
+        sent = False
+        try:
+            self._send(f"CGEN {number} {int(max_new)}{self.sampling_keys(sampling or {})} "
+                       + ",".join(str(int(t)) for t in ids))
+            sent = True
+            heartbeat = time.monotonic()
+            while not cancel.is_set():
+                try:
+                    line = channel.get(timeout=0.25)
+                except queue.Empty:
+                    if not self.alive():
+                        raise EngineDied("the concurrent engine stopped")
+                    if time.monotonic() - heartbeat >= 10:
+                        heartbeat = time.monotonic()
+                        yield None
+                    continue
+                if line is None:
+                    raise EngineDied("the concurrent engine stopped")
+                if line.startswith("T "):
+                    yield int(line[2:])
+                elif line.startswith("PP "):
+                    fields = line.split()
+                    self.progress = (int(fields[1]), int(fields[2]))
+                    yield None
+                elif line.startswith("DONE "):
+                    self._parse_done(line)
+                    done = True
+                    return
+                elif line.startswith("ERR "):
+                    done = True
+                    raise ValueError(line[4:].strip())
+        finally:
+            with self._channels_lock:
+                self._channels.pop(number, None)
+            if sent and not done:
+                try:
+                    self._send(f"CSTOP {number}")
+                except OSError:
+                    pass
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
@@ -307,6 +430,9 @@ class StrataEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        if self.multiplex:
+            yield from self._generate_multiplex(ids, max_new, sampling, cancel, embeddings)
+            return
         self.progress = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
@@ -559,7 +685,9 @@ class Service:
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
-        self.fifo = threading.Lock()
+        self.concurrency = int((getattr(engine, "info", {}) or {}).get("concurrency", 1))
+        self.fifo = threading.BoundedSemaphore(self.concurrency)
+        self.active_requests = 0
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
@@ -695,10 +823,11 @@ class Service:
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
-            "concurrency": {"serving": 1, "requested": 1},       # one request at a time; more wait their turn
+            "concurrency": {"serving": self.concurrency, "requested": self.concurrency},
             "dialects": ["/v1/chat/completions", "/v1/messages"],
             "vision": {"enabled": images, "available": images, "error": None},
-            "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
+            "activity": {"requests": totals["requests"] + int(s.get("active_requests", int(busy))),
+                         "in_flight": int(s.get("active_requests", int(busy))) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
             "machine": {
@@ -717,6 +846,8 @@ class Service:
         self.embeddings.path = None
         images = images_of(messages)
         if images:
+            if self.concurrency > 1:
+                raise ValueError("concurrent serving currently supports text only")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
@@ -812,6 +943,8 @@ class Service:
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
+        request_started = None
+        request_first_token = None
         with self.status_lock:
             self.status["queued"] += 1
         try:
@@ -819,6 +952,8 @@ class Service:
                 with self.status_lock:
                     self.status["queued"] -= 1
                 if hasattr(self.engine, "alive") and not self.engine.alive():
+                    if self.concurrency > 1:
+                        raise EngineDied("the concurrent engine stopped; restart the server after checking its log")
                     # issue #27: it died in an earlier request - start it again instead of failing every request
                     code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
                     print(f"[strata] the engine had stopped (exit code {code}); starting it again "
@@ -826,6 +961,9 @@ class Service:
                     self.engine.restart()
                     print("[strata] the engine is running again", flush=True)
                 with self.status_lock:
+                    self.active_requests += 1
+                    request_started = time.time()
+                    self.status["active_requests"] = self.active_requests
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
                     self.last_request_at = time.time()
@@ -841,6 +979,8 @@ class Service:
                             yield "ping", None
                             continue
                         n += 1
+                        if request_first_token is None:
+                            request_first_token = time.time()
                         if t in self.stop_ids:
                             finish = "stop"
                             raw_ids.append(t)
@@ -856,7 +996,8 @@ class Service:
                 except EngineDied as e:
                     finish = "error"
                     note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
-                    print(f"[strata] {e}. {note} The next request starts the engine again."
+                    recovery = "Restart the server before retrying." if self.concurrency > 1 else "The next request starts the engine again."
+                    print(f"[strata] {e}. {note} {recovery}"
                           f"{' Its log: ' + self.engine.log_path if getattr(self.engine, 'log_path', None) else ''}",
                           flush=True)
                     raise
@@ -875,11 +1016,11 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
             with self.status_lock:
-                if self.status.get("busy"):
+                if request_started is not None:
                     # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
                     last = dict(getattr(self.engine, "last", {}) or {}) \
                         if getattr(self.engine, "last", None) is not engine_last0 else {}
-                    started = self.status.get("started", time.time())
+                    started = request_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                     self.history.append({
@@ -905,15 +1046,18 @@ class Service:
                         self.last_timings = dict(timings, at=int(time.time())) if timings else None
                     self.last_request_at = time.time()
                     now = time.time()
-                    el = now - self.status.get("started", now)
-                    ft = self.status.get("first_token")
+                    el = now - request_started
+                    ft = request_first_token
                     rate = n / max(1e-6, now - ft) if ft else 0.0
                     hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                     print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                           f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
-                self.status["busy"] = False
+                if request_started is not None:
+                    self.active_requests -= 1
+                self.status["active_requests"] = self.active_requests
+                self.status["busy"] = self.active_requests > 0
         for ev in parser.finish():
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),

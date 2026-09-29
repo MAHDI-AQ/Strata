@@ -67,6 +67,16 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    struct BatchWindow {
+        Verifier* verifier;
+        int count;
+        const int32_t* tokens;
+        int64_t position;
+        int32_t* output;
+    };
+    // This instance is a dedicated batch workspace; each member owns independent sequence state.
+    // Shared expert work is packed across requests. Attention, recurrence and commit remain per member.
+    bool run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user, std::string& err);
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
@@ -155,7 +165,11 @@ private:
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
-    bool record_window(int T, cudaStream_t cs, std::string& err);
+    bool record_window(int T, cudaStream_t cs, std::string& err, int phase = -1, int64_t layer = 0);
+    bool stage_inputs(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    struct BatchGraph { std::vector<std::pair<Verifier*, int>> shape; cudaGraphExec_t graph = nullptr; };
+    std::vector<BatchGraph> batch_graphs_;
+    cudaGraphExec_t batch_replay_ = nullptr;
     static constexpr int kProfPer = 32;              // stamps per layer
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps

@@ -46,4 +46,8 @@ build-vision.bat
 /dist/
 *.done
 /third_party/*.zip
+tests/concurrency/*.exe
+tests/concurrency/*.obj
+/build-concurrency/
+/run-concurrency-local.ps1
 
