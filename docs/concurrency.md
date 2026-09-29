@@ -58,6 +58,8 @@ The scheduler test checks 65,536 combinations, bounds, policy allocation and rot
 
 The Windows development checks also run the upstream `serve.test_server` and `serve.test_mcp` suites. On the 0.1.27 base, all 63 upstream tests and all six concurrent-serving tests pass. The scheduler executable passes in Release mode with its assertions explicitly retained.
 
+The complete native Windows Release executable builds successfully with MSVC 19.32, CUDA 13.2 and `CMAKE_CUDA_ARCHITECTURES=120-real`. Its help output exposes the new controls, and invalid concurrency/unsupported configuration checks exit before loading weights. No GPU inference or model parity/performance validation has been performed.
+
 ## Required model validation before everyday use
 
 1. Compare greedy single-request outputs on the original and concurrent paths with matching model, context and sampling settings.
