@@ -772,6 +772,14 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     d.experts += k;
 }
 
+namespace {
+// the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
+// are fixed arrays of this many entries: MAXT tokens of the model's 10 routed experts must fit, and a larger k is
+// refused at run time rather than written past them.
+constexpr int64_t kMaxWindowEntries = 128;
+static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+}  // namespace
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -779,6 +787,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (n_tok < 1 || n_tok > MAXT || k < 1 || k > 16) {
         d.failed = true;
         d.fail = "a verify window has more tokens than the multi-token expert kernel takes";
+        d.fail_layer = d.layers;
+        return;
+    }
+    if (k < 1 || n_tok * k > kMaxWindowEntries) {
+        d.failed = true;
+        d.fail = "a verify window routes more entries than the expert pool's window tables hold";
         d.fail_layer = d.layers;
         return;
     }
@@ -803,12 +817,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
     constexpr int max_entries = MAXT * 16;
+    static_assert(max_entries <= kMaxWindowEntries, "the window tables must fit the entry guard above");
     int32_t kind[max_entries];             // per entry: -1 CPU, 0 VRAM, 1 PCIe
     if (d.plan != nullptr && n > d.plan->cap) {
         d.failed = true; d.fail = "expert dispatch exceeds GPU plan capacity"; d.fail_layer = d.layers;
         return;
     }
-    if (d.plan != nullptr) {
+    if (d.plan != nullptr && n <= kMaxWindowEntries) {
         int64_t distinct[max_entries], first_of[max_entries];
         int nd = 0, nmiss = 0;
         for (int64_t i = 0; i < n; ++i) {
