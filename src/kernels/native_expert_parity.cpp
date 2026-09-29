@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
     std::vector<int> layers;
     for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
     if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
-    const int NT = 3, E = 7;
+    constexpr int NT = 3, E = 7;
     const int64_t H = 2560, FF = 640;
     int failures = 0;
     cudaStream_t s;

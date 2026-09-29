@@ -1,6 +1,6 @@
 # Experimental concurrent serving
 
-This branch adds configurable shared-model serving for **1–4 requests**. It is based on upstream 0.1.27, commit `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`. Model correctness and performance require GPU validation; compilation and CPU/mock tests do not establish inference parity or throughput.
+This branch adds configurable shared-model serving for **1–4 requests**. It is based on upstream 0.1.27, commit `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`. **GPU validation on 2026-09-30 failed token parity. This is an experimental branch, not a validated replacement for stock.** Compilation and CPU/mock tests do not establish inference parity or throughput.
 
 ## Configuration
 
@@ -58,7 +58,20 @@ The scheduler test checks 65,536 combinations, bounds, policy allocation and rot
 
 The Windows development checks also run the upstream `serve.test_server` and `serve.test_mcp` suites. On the 0.1.27 base, all 63 upstream tests and all six concurrent-serving tests pass. The scheduler executable passes in Release mode with its assertions explicitly retained.
 
-The complete native Windows Release executable builds successfully with MSVC 19.32, CUDA 13.2 and `CMAKE_CUDA_ARCHITECTURES=120-real`. Its help output exposes the new controls, and invalid concurrency/unsupported configuration checks exit before loading weights. No GPU inference or model parity/performance validation has been performed.
+The complete native Windows Release executable builds successfully with MSVC 19.32, CUDA 13.2 and `CMAKE_CUDA_ARCHITECTURES=120-real`. Its help output exposes the new controls, and invalid concurrency/unsupported configuration checks exit before loading weights.
+
+### First GPU validation: failed correctness gate
+
+Greedy raw-token comparisons used Swift IQ2_XS, 32768 context, INT8 KV, MTP/spec 4, 256-token prefill chunks, a fixed profile/cache budget, CPU misses (`--pcie-frac 0`), and disabled cache adaptation, prefix checkpoints and suffix drafting. `--short-read 0` matched short-prompt processing. Eight prompts covered prose, code, arithmetic, Chinese, a 722-token prompt, and repetition penalties. Only one model process ran at a time.
+
+- The published stock 0.1.27 executable reproduced two repeat prompts exactly.
+- An unmodified source build with the same local toolchain failed both repeat prompts and differed from the published executable on all eight prompts.
+- Modified c=1, c=2 and c=4 failed token equality. These failures cannot yet be isolated to cross-request batching because the local stock control is itself not repeatable.
+- Changing GGML from native AVX-512 to AVX2 did not restore parity. Disabling MMQ prefill also failed the two-prompt control.
+- Compute Sanitizer reported uninitialized global-memory reads in stock-source MMQ prefill (`mul_mat_q`, IQ2_XS). Instrumentation then hit the Windows kernel timeout; this is an incomplete diagnostic, not a proven root cause. Do not disable the Windows watchdog to reproduce it on a foreground machine.
+- The initial shared-graph stall stopped occurring after kernel row copies, explicit graph upload, and the kernel expert-copy mode were used. Completed c=2 and c=4 runs exercised 83 two-request rounds and 10 four-request rounds, respectively. Completion does not imply numerical correctness.
+
+Performance claims, depth-policy qualification, cancellation and longer-context qualification remain deferred until repeatable token correctness is established. Preserve the stock release for everyday use. The next investigation is the local toolchain/runtime or shared upstream inference paths, with batching regression checks repeated once that control is reliable.
 
 ## Required model validation before everyday use
 

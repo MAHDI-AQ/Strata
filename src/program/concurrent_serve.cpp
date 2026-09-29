@@ -206,6 +206,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     std::jthread watchdog; // outlives the batch graph, including teardown after a failed GPU execution
     core::Verifier batch;
     if (!batch.init(wt, g, *m.slots[0]->state, hits, head, std::max(2, c.rows), err)) return 1;
+    batch.set_pcie_mode(2); // Match the stock Windows-safe kernel-copy path.
     for (auto& ptr : m.slots) {
         auto& s = *ptr;
         if (!s.verify.init(wt, g, *s.state, hits, head, c.window, err) ||
@@ -215,6 +216,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
         s.history.resize((size_t) c.window * 4096, -1);
         if (cudaMalloc(&s.history_device, s.history.size() * sizeof(int32_t)) != cudaSuccess) { err = "concurrency: penalty buffer allocation failed"; return 1; }
         auto* slot = &s;
+        s.verify.set_pcie_mode(2);
         s.prompt.on_chunk = [slot](const float* residual, int64_t n, int64_t position, std::string& e) {
             std::vector<int32_t> next((size_t) n);
             for (int64_t j = 0; j < n; ++j) next[(size_t) j] = (int32_t) slot->request.tokens[(size_t) (position + j + 1)];
@@ -230,6 +232,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     const bool adaptive = c.adapt_every > 0 && c.adapt_swaps > 0;
     if (adaptive) dispatch.usage.assign((size_t) g.n_layers * g.n_expert, 0.0f);
     int64_t rounds = 0;
+    int64_t batch_sizes[5]{};
     auto adapt = [&]() -> bool {
         // All target, commit, prefill and draft work has finished at this boundary. Updating both
         // residency tables here makes cached graph pointers safe without per-request invalidation.
@@ -427,6 +430,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             windows.push_back({&s.verify, s.count, s.window, s.position, s.output});
         }
         if (!windows.empty()) {
+            ++batch_sizes[windows.size()];
             // Stable packing order avoids recapturing a graph merely because fairness rotated the request order.
             std::sort(windows.begin(), windows.end(), [](const auto& a, const auto& b) {
                 return std::less<core::Verifier*>{}(a.verifier, b.verifier);
@@ -479,6 +483,8 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     }
     for (auto& s : m.slots) if (s->active) finish(*s, "cancel");
     for (const auto& r : pending) error(r.id, "server shutting down");
+    std::fprintf(stderr, "strata concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld\n",
+                 (long long) batch_sizes[1], (long long) batch_sizes[2], (long long) batch_sizes[3], (long long) batch_sizes[4]);
     return 0;
 }
 }

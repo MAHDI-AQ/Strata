@@ -1172,9 +1172,9 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
         bool ok = true;
         const int64_t N = g_->n_embd, K = ss_->k;
         auto copy = [&](void* dst, const void* src, size_t bytes) {
-            if (cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
-                err = "batch verify: recording row copy failed"; ok = false;
-            }
+            // Keep the doorbell graph kernel-only. WDDM can wait for a graph memcpy node while
+            // holding the driver lock needed by the host that must service its preceding doorbell.
+            copy_i32_from_mapped((int32_t*) dst, (const int32_t*) src, (int64_t) (bytes / 4), cs_);
         };
         for (const auto& b : batch) if (ok) ok = b.verifier->record_window(b.count, cs_, err, 0);
         for (int64_t l = 0; ok && l < g_->n_layers; ++l) {
@@ -1211,6 +1211,10 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
         const cudaError_t instantiate = cudaGraphInstantiate(&graph_exec, graph, 0);
         cudaGraphDestroy(graph);
         if (instantiate != cudaSuccess) { err = "batch verify: graph instantiation failed"; return false; }
+        if (cudaGraphUpload(graph_exec, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+            cudaGraphExecDestroy(graph_exec);
+            err = "batch verify: graph upload failed"; return false;
+        }
         // Bound graph memory when confidence/suffix windows produce many layouts.
         if (batch_graphs_.size() >= 8) {
             cudaGraphExecDestroy(batch_graphs_.front().graph);
