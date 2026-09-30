@@ -82,7 +82,7 @@ A prototype that packed dense projections across requests gave little additional
 - Only one NVIDIA GPU on native Windows was qualified. Concurrent ROCm, multi-GPU and vision remain rejected by the existing guards.
 - Higher concurrency is limited to four requests; a larger row budget does not increase request capacity.
 - Long-prompt TTFT still includes prompt processing. Concurrent mode has no conversation-prefix checkpoint reuse, so c=1 can be much faster on repeated chat prefixes. Model switching still requires unloading and loading the resident model.
-- MTP drafting remains per request in the serving default. A later overlap experiment is available behind an opt-in flag but was not promoted because its long-form production-parity check failed. Larger batches can reduce the expert cache available per GPU and increase misses; throughput gains depend on workload and available VRAM.
+- MTP drafting remains per request. Larger batches can reduce the expert cache available per GPU and increase misses; throughput gains depend on workload and available VRAM.
 
 Example benchmark invocation (substitute local paths):
 
@@ -91,5 +91,3 @@ python tools/bench_concurrency.py --config local-c4.json --output c4.json --toke
 ```
 
 Model-loading tests consume substantial RAM/VRAM. The CPU-only Python and scheduler suites can be run separately without loading a model.
-
-The [follow-up optimization campaign](concurrency-optimization-results.md) adds stable logical-slot packing and diagnostic tools. It preserves the serving default rather than promoting a short-benchmark gain that fails a broader parity gate. It also documents existing timing-dependent lookup/adaptation limits and the rejected expert-kernel experiment.

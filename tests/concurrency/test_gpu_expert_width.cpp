@@ -14,8 +14,7 @@ static void check(cudaError_t e) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 3) return 2;
-    const bool bench = argc == 3 && std::strcmp(argv[2], "--bench") == 0;
+    if (argc != 2) return 2;
     strata::GgufFile file(argv[1]);
     constexpr int rows = 16, entries = rows * 10, H = 2560, F = 640, expert = 7;
     int failures = 0;
@@ -81,28 +80,6 @@ int main(int argc, char** argv) {
                 different += !std::isfinite(output[i]) || std::memcmp(&output[i], &reference[i], 4) != 0;
             std::printf("GPU layer %d formats %d/%d width %d entries %d: %d differing FP32 cells\n", layer, (int) g->type, (int) d->type, width, entries, different);
             failures += different != 0;
-            if (bench) {
-                const int32_t bounds[2] = {0, width};
-                check(cudaMemcpy(starts, bounds, 8, cudaMemcpyHostToDevice));
-                cudaGraph_t graph;
-                cudaGraphExec_t executable;
-                check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-                strata::kernels::native_expert_grouped(layout, pointers, starts, count, index, tokens,
-                                                      1, width, xq, scratch, out, stream);
-                check(cudaStreamEndCapture(stream, &graph));
-                check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-                for (int i = 0; i < 10; ++i) check(cudaGraphLaunch(executable, stream));
-                cudaEvent_t begin, end;
-                check(cudaEventCreate(&begin)); check(cudaEventCreate(&end));
-                check(cudaEventRecord(begin, stream));
-                for (int i = 0; i < 200; ++i) check(cudaGraphLaunch(executable, stream));
-                check(cudaEventRecord(end, stream)); check(cudaEventSynchronize(end));
-                float ms = 0;
-                check(cudaEventElapsedTime(&ms, begin, end));
-                std::printf("GPU micro formats %d/%d group %d: %.3f us/expert\n", (int) g->type, (int) d->type, width, ms * 5);
-                check(cudaEventDestroy(begin)); check(cudaEventDestroy(end));
-                check(cudaGraphExecDestroy(executable)); check(cudaGraphDestroy(graph));
-            }
         }
         for (void* p : {weights, xq, scratch, (void*) x, (void*) out, (void*) starts,
                         (void*) count, (void*) index, (void*) tokens, (void*) pointers}) check(cudaFree(p));
