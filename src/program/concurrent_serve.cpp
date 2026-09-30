@@ -140,9 +140,14 @@ struct ConcurrentServe::Impl {
     std::vector<std::unique_ptr<Slot>> slots;
     std::vector<ServeStage> stages;             // caller's stage list (N=1: one element, re-root only)
     core::GpuPlanSink** stage_plans = nullptr;  // C4: per-round publish targets (= split_drive.plan)
-    void* prompt_workspace = nullptr;
-    uint64_t prompt_bytes = 0;
-    cudaStream_t prompt_stream = nullptr;
+    // C1-B: the prompt path is stage-owned; N=1 keeps exactly one entry (same resources, same order).
+    struct StageRt {
+        int device = 0;
+        void* prompt_workspace = nullptr;
+        uint64_t prompt_bytes = 0;
+        cudaStream_t prompt_stream = nullptr;
+    };
+    std::vector<StageRt> stage_rt;
     ~Impl() {
         // Graphs and draft state must die before the sessions they reference. The primary session is borrowed.
         std::vector<std::pair<void*, core::QsaState*>> allocations;
@@ -156,8 +161,10 @@ struct ConcurrentServe::Impl {
             delete[] a.second;
             cudaFree(a.first);
         }
-        if (prompt_stream) cudaStreamDestroy(prompt_stream);
-        if (prompt_workspace) cudaFree(prompt_workspace);
+        for (auto& rt : stage_rt) {
+            if (rt.prompt_stream) cudaStreamDestroy(rt.prompt_stream);
+            if (rt.prompt_workspace) cudaFree(rt.prompt_workspace);
+        }
     }
 };
 ConcurrentServe::ConcurrentServe(ConcurrentConfig c) : impl_(std::make_unique<Impl>(std::move(c))) {}
@@ -195,9 +202,15 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
         }
         s->draft->set_max_drafts(c.mtp_window_rows - 1);
     }
-    m.prompt_bytes = prefill::Prefill::bytes_needed(g, primary, c.prefill_chunk);
-    if (!gpu_alloc(&m.prompt_workspace, (size_t) m.prompt_bytes, c.reserve_mib, err)) return false;
-    if (cudaStreamCreateWithFlags(&m.prompt_stream, cudaStreamNonBlocking) != cudaSuccess) { err = "concurrency: prompt stream failed"; return false; }
+    // C1-B: one stage today; the workspace/stream move per stage with C4 (prepare runs before
+    // auto cache sizing, so these allocations keep their original position in the sequence).
+    m.stage_rt.clear();
+    m.stage_rt.resize(1);
+    auto& rt = m.stage_rt[0];
+    rt.device = 0;
+    rt.prompt_bytes = prefill::Prefill::bytes_needed(g, primary, c.prefill_chunk);
+    if (!gpu_alloc(&rt.prompt_workspace, (size_t) rt.prompt_bytes, c.reserve_mib, err)) return false;
+    if (cudaStreamCreateWithFlags(&rt.prompt_stream, cudaStreamNonBlocking) != cudaSuccess) { err = "concurrency: prompt stream failed"; return false; }
     return true;
 }
 
@@ -220,6 +233,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     core::ExpertDispatch& dispatch = *st0.dispatch;
     m.stages = stages;
     m.stage_plans = stage_plans;
+    if (m.stage_rt.empty()) { err = "concurrency: prompt runtime missing (prepare)"; return 1; }
+    Impl::StageRt& rt0 = m.stage_rt[0];   // N=1: the single stage's prompt runtime
     if (!head || !head->loaded() || !wt.find("output.weight")) { err = "concurrency: native head required"; return 1; }
     if (!source || !host_res || !hits.d_res || cache.slots() < 1) {
         err = "concurrency: no profile-filled expert cache fits; reduce context/concurrency or increase available VRAM";
@@ -236,8 +251,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         auto& s = *ptr;
         if (!s.verify.init(wt, g, *s.state, hits, head, c.window, err) ||
             !s.draft->bind(wt, head, s.verify.final_R_all(), err) ||
-            !s.prompt.init(wt, g, *s.state, source, &cache, host_res, c.prefill_chunk, m.prompt_stream,
-                           err, m.prompt_workspace, m.prompt_bytes)) return 1;
+            !s.prompt.init(wt, g, *s.state, source, &cache, host_res, c.prefill_chunk, rt0.prompt_stream,
+                           err, rt0.prompt_workspace, rt0.prompt_bytes)) return 1;
         s.history.resize((size_t) c.window * 4096, -1);
         if (cudaMalloc(&s.history_device, s.history.size() * sizeof(int32_t)) != cudaSuccess) { err = "concurrency: penalty buffer allocation failed"; return 1; }
         auto* slot = &s;
@@ -411,8 +426,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
             s.suffix.reset(); s.policy = spec::DraftPolicy{c.window};
             for (auto token : s.request.tokens) s.suffix.append((int32_t) token);
-            core::session_zero(*s.state, g, nullptr, m.prompt_stream);
-            if (cudaStreamSynchronize(m.prompt_stream) != cudaSuccess) { err = "concurrency: reset failed"; return 1; }
+            core::session_zero(*s.state, g, nullptr, rt0.prompt_stream);
+            if (cudaStreamSynchronize(rt0.prompt_stream) != cudaSuccess) { err = "concurrency: reset failed"; return 1; }
             s.draft->reset(); s.draft->set_prompt_len((int64_t) s.request.tokens.size());
             s.verify.set_sampling(s.request.sampling);
         }
