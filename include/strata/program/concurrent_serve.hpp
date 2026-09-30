@@ -4,6 +4,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/expert_cache.hpp"
 #include <memory>
+#include <vector>
 
 namespace strata::program {
 struct ConcurrentConfig {
@@ -20,15 +21,33 @@ struct ConcurrentConfig {
     std::string kv = "int8";   // resident KV mode (int8, k8v4, q4_0); reported in INFO
     std::vector<int64_t> eos;
 };
+/// One device's share of a layer-split engine, built by the CLI exactly where it builds its
+/// GpuStages.  stages[0] is CUDA0 and carries the CLI's primary objects, so stages.size()==1 is
+/// the single-GPU engine this class has always run: every field then holds the very object the
+/// old run() took as a separate argument.  (Combine build C1; per-stage behavior arrives with C4.)
+struct ServeStage {
+    int device = 0;                            ///< CUDA device this stage runs on
+    const core::WeightTable* wt = nullptr;     ///< this stage's weights (N=1: run()'s wt)
+    const core::NativeHead* head = nullptr;    ///< the head this stage runs (last stage; null before it)
+    int64_t lb = 0;                            ///< first layer of this stage
+    int64_t le = -1;                           ///< one past its last layer (-1 accepted as "to the end")
+    core::SessionState* session = nullptr;     ///< the session slot 0 borrows on this stage (N=1: the primary)
+    core::ExpertCache* cache = nullptr;        ///< this stage's expert cache (N=1: run()'s cache)
+    int32_t* host_res = nullptr;               ///< the residency table (slots|-1; one table, split shares it)
+    core::VerifyHits hits{};                   ///< this stage's d_res/cache_base/slot_off view
+    core::ExpertDispatch* dispatch = nullptr;  ///< the adapter (split: every stage carries the SplitDrive base)
+};
+
 class ConcurrentServe {
 public:
     explicit ConcurrentServe(ConcurrentConfig config);
     ~ConcurrentServe();
     // Allocate sequence states and the shared prompt workspace BEFORE sizing the expert cache.
     bool prepare(const core::ModelGeometry&, core::SessionState&, core::MtpDrafter&, std::string&);
-    int run(const core::WeightTable&, const core::NativeHead*, core::ExpertSource*, core::ExpertCache&,
-            int32_t* host_res, const core::VerifyHits&, core::ExpertDispatch&,
-            core::PoolMultiFn, void* user, std::string&);
+    // stages.size()==1 == the single-GPU engine.  stage_plans = split_drive.plan (nullptr at N=1);
+    // the per-round publish targets the C4 loops refresh.
+    int run(const std::vector<ServeStage>& stages, core::ExpertSource* source,
+            core::PoolMultiFn pool, void* user, core::GpuPlanSink** stage_plans, std::string&);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

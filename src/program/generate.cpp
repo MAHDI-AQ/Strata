@@ -3128,8 +3128,19 @@ int main(int argc, char** argv) {
         strata::core::VerifyHits hits;
         hits.d_res = d_res; hits.cache_base = drive.d.cache_base; hits.blob = drive.d.cache_blob;
         hits.slot_off = xcache.slot_offsets(); hits.n_slots = xcache.slots();
-        const int result = concurrent->run(wt, &native_head, srcp, xcache, host_res.data(), hits,
-                                           drive.d, &drive_pool_multi, &drive, err);
+        // C1: one stage on CUDA0 carries the CLI's primary objects (single-GPU engine, unchanged).
+        std::vector<strata::program::ServeStage> serve_stages(1);
+        serve_stages[0].device = 0;
+        serve_stages[0].wt = &wt;
+        serve_stages[0].head = &native_head;
+        serve_stages[0].lb = 0;
+        serve_stages[0].le = g.n_layers;
+        serve_stages[0].session = &ss;
+        serve_stages[0].cache = &xcache;
+        serve_stages[0].host_res = host_res.data();
+        serve_stages[0].hits = hits;
+        serve_stages[0].dispatch = &drive.d;
+        const int result = concurrent->run(serve_stages, srcp, &drive_pool_multi, &drive, nullptr, err);
         if (result) std::fprintf(stderr, "strata concurrent serve: %s\n", err.c_str());
         return result;
     }
