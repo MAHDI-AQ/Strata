@@ -146,7 +146,8 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
 
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
-    `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
+    `DONE ...`. Legacy requests are serialized. A multiplex-capable engine instead accepts request-tagged
+    `CGEN`/`CSTOP` commands; one reader routes tagged responses to independent bounded queues.
 
     Per-request sampling rides the same line as engine-side keys between max_new and the ids
     (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the

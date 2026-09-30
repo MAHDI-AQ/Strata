@@ -1,6 +1,6 @@
 # Experimental concurrent serving
 
-This branch adds configurable shared-model serving for **1–4 requests**. It is based on upstream 0.1.27, commit `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`. **GPU validation on 2026-09-30 failed token parity. This is an experimental branch, not a validated replacement for stock.** Compilation and CPU/mock tests do not establish inference parity or throughput.
+This branch adds configurable shared-model serving for **1–4 requests**. It is based on upstream 0.1.27, commit `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`. Native Windows qualification on an RTX 5090 established exact token parity at c=1, 2, 3 and 4 under the matched numerical settings below. This remains a single-GPU experimental implementation; the qualification is specific to Swift IQ2_XS and the tested configuration, not a guarantee across all models and settings.
 
 ## Configuration
 
@@ -58,27 +58,53 @@ The scheduler test checks 65,536 combinations, bounds, policy allocation and rot
 
 The Windows development checks also run the upstream `serve.test_server` and `serve.test_mcp` suites. On the 0.1.27 base, all 63 upstream tests and all six concurrent-serving tests pass. The scheduler executable passes in Release mode with its assertions explicitly retained.
 
-The complete native Windows Release executable builds successfully with MSVC 19.32, CUDA 13.2 and `CMAKE_CUDA_ARCHITECTURES=120-real`. Its help output exposes the new controls, and invalid concurrency/unsupported configuration checks exit before loading weights.
+The qualified native Windows Release executable uses MSVC 19.32, **CUDA 13.0**, `STRATA_PORTABLE=ON`, and `CMAKE_CUDA_ARCHITECTURES=120-real`. Its help output exposes the new controls, and invalid concurrency/unsupported configuration checks exit before loading weights. Do not substitute the earlier CUDA 13.2 development executable: even the unmodified stock source built with that configuration failed repeatability.
 
-### First GPU validation: failed correctness gate
+### Exact-token qualification settings
 
-Greedy raw-token comparisons used Swift IQ2_XS, 32768 context, INT8 KV, MTP/spec 4, 256-token prefill chunks, a fixed profile/cache budget, CPU misses (`--pcie-frac 0`), and disabled cache adaptation, prefix checkpoints and suffix drafting. `--short-read 0` matched short-prompt processing. Eight prompts covered prose, code, arithmetic, Chinese, a 722-token prompt, and repetition penalties. Only one model process ran at a time.
+Raw-token comparisons use Swift IQ2_XS, 32768 context, resident INT8 KV, MTP/spec 4 and confidence 0.5, a fixed profile/cache budget (10000 requested, 10501 actual slots), CPU misses and a 2048 MiB reserve. Both the published stock reference and modified engine use:
 
-- The published stock 0.1.27 executable reproduced two repeat prompts exactly.
-- An unmodified source build with the same local toolchain failed both repeat prompts and differed from the published executable on all eight prompts.
-- Modified c=1, c=2 and c=4 failed token equality. These failures cannot yet be isolated to cross-request batching because the local stock control is itself not repeatable.
-- Changing GGML from native AVX-512 to AVX2 did not restore parity. Disabling MMQ prefill also failed the two-prompt control.
-- Compute Sanitizer reported uninitialized global-memory reads in stock-source MMQ prefill (`mul_mat_q`, IQ2_XS). Instrumentation then hit the Windows kernel timeout; this is an incomplete diagnostic, not a proven root cause. Do not disable the Windows watchdog to reproduce it on a foreground machine.
-- The initial shared-graph stall stopped occurring after kernel row copies, explicit graph upload, and the kernel expert-copy mode were used. Completed c=2 and c=4 runs exercised 83 two-request rounds and 10 four-request rounds, respectively. Completion does not imply numerical correctness.
+```text
+--expert-cache 10000 --prefill 256 --short-read 0 --pcie-frac 0
+--adapt-every 0 --suffix-draft 0 --prompt-cache 0 --no-prefill-borrow
+--vram-reserve-mib 2048 --max-context 32768 --kv int8
+--spec 4 --spec-min-p 0.5
+```
 
-Performance claims, depth-policy qualification, cancellation and longer-context qualification remain deferred until repeatable token correctness is established. Preserve the stock release for everyday use. The next investigation is the local toolchain/runtime or shared upstream inference paths, with batching regression checks repeated once that control is reliable.
+Set these environment variables **for both sides of a strict A/B comparison** (the JSON server config accepts an `env` object):
 
-## Required model validation before everyday use
+```json
+"env": {
+  "STRATA_NO_IQ512": "1",
+  "STRATA_NO_IQ256": "1",
+  "STRATA_NO_IQ4NL": "1"
+}
+```
 
-1. Compare greedy single-request outputs on the original and concurrent paths with matching model, context and sampling settings.
-2. Compare c=2 and c=4 against independent reference requests, including unequal prompt lengths, penalties, early EOS, context limits, cancellation and slot reuse.
-3. Exercise fair/depth policies, row budgets 1/4/8, MTP confidence changes, suffix drafting and adaptive cache updates.
-4. Measure peak RAM/VRAM, time to first token, aggregate throughput and per-request latency, including a new long prompt arriving during decode.
-5. Verify memory stability over repeated admission/cancellation and multiple graph shapes.
+Upstream CPU expert dispatch selects different arithmetic for a singleton and a multi-token group ([issue #152](https://github.com/Niko1221/Strata/issues/152)). Those paths round differently. The flags select the same GGML row arithmetic at every width, at a potential throughput cost. The real-weight `strata-expert-width-test` reproduces the difference: 1687 differing FP32 cells in the tested layer with default dispatch, zero with these flags at widths 1, 2, 3, 4 and 8 across three tested layers. The test takes a compatible model shard path; it maps a few tensors and does not start GPU inference.
+
+Cache residency also changes CPU/GPU arithmetic. Automatic cache sizing, adaptive migration, PCIe offload and different prompt chunking are not part of this strict-parity configuration. Exact token equality is not promised when changing those settings. MTP confidence and suffix-draft variations remain outside this qualification.
+
+The 18-case suite includes prose, code, arithmetic, Chinese, repetition penalties, repeated prompts in different slots, seeded sampling, unequal output lengths and prompts up to 5692 tokens; outputs run to EOS or caps of 128/256 tokens. The official stock executable is the reference. A separate unmodified local CUDA 13.0/portable build matched the official executable on all eight initial cases, including a restart repeat. No throughput improvement is implied by token parity: dense operations and MTP remain per request.
+
+| Modified configuration | Exact stock matches | Aggregate tokens/s |
+| --- | ---: | ---: |
+| c=1 | 18/18 | 60.06 |
+| c=2, fair, 8 rows | 18/18 | 53.71 |
+| c=3, fair, 8 rows | 18/18 | 50.75 |
+| c=4, fair, 8 rows | 18/18 | 50.79 |
+| c=4, depth, 8 rows | 18/18 | 48.96 |
+| c=4, fair, 1 row | 18/18 | 44.88 |
+| c=4, fair, 4 rows | 18/18 | 47.50 |
+
+All 126 responses matched. Each run produced 2406 tokens. Timings include prefill and graph capture, exclude model loading, and use groups submitted together with a barrier between groups. They are single-run observations, not isolated decode measurements or a saturated arrival benchmark. Published stock measured 59.94 tokens/s in the same suite. This workload showed **no aggregate throughput gain** from concurrency. c=4/fair/8 executed 114 four-request target rounds; a one-row budget intentionally time-slices the requests.
+
+The real-model lifecycle test passed all 19 checks: queued/prefill/decode cancellation, unaffected-request parity, twelve slot-reuse comparisons over three rounds, invalid-request rejection and valid-request recovery. The tested native executable's SHA-256 is `609b243b3375e413f565db2c25adfebbfa58a06e7981993c5bafb1d2d790dffa`; the official reference is `814c016245a6e407c45d070cdbd77cea4b92445d57c47001e8289b89f3d4b3e0`.
+
+A real HTTP/SSE test observed four active requests simultaneously, four distinct response IDs, complete streams and exact decoded stock-reference text for all four requests. It used the built-in template on both sides; the ordinary server chooses the pack's template when present. All six HTTP assertions passed. The scheduler and real-weight CPU width tests were rebuilt and passed with the qualified CUDA 13.0/portable build configuration.
+
+### Earlier failed controls
+
+The initial CUDA 13.2/nonportable builds failed even unmodified-stock repeatability. Rebuilding with CUDA 13.0 and portable settings resolved the observed corruption; the compiler version and build options were changed together, so this does not isolate a compiler defect. A sanitizer diagnostic on the old stock build reported MMQ uninitialized reads and then hit the Windows timeout; it was incomplete and is not a proven cause. Shared-graph replay stalls were separately fixed with kernel row copies, explicit graph upload/synchronization and kernel expert copying.
 
 On the development machine, **do not launch model validation until the user explicitly approves RAM/VRAM-heavy testing**. Closing an earlier model process does not waive that instruction.

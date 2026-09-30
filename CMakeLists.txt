@@ -661,6 +661,10 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  if(STRATA_BUILD_CONCURRENCY_TESTS)
+    add_executable(strata-expert-width-test tests/concurrency/test_expert_width.cpp)
+    target_link_libraries(strata-expert-width-test PRIVATE strata_kernels_cpu strata_artifact)
+  endif()
   if(STRATA_ENABLE_CUDA)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
     # from the same checkout as ggml above - only mmq.cuh's instances for the packs' types and the quantizer, with
