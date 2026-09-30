@@ -138,6 +138,8 @@ struct ConcurrentServe::Impl {
     ConcurrentConfig config;
     const core::ModelGeometry* geometry = nullptr;
     std::vector<std::unique_ptr<Slot>> slots;
+    std::vector<ServeStage> stages;             // caller's stage list (N=1: one element, re-root only)
+    core::GpuPlanSink** stage_plans = nullptr;  // C4: per-round publish targets (= split_drive.plan)
     void* prompt_workspace = nullptr;
     uint64_t prompt_bytes = 0;
     cudaStream_t prompt_stream = nullptr;
@@ -199,12 +201,25 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
     return true;
 }
 
-int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* head, core::ExpertSource* source,
-                         core::ExpertCache& cache, int32_t* host_res, const core::VerifyHits& hits,
-                         core::ExpertDispatch& dispatch, core::PoolMultiFn pool, void* user, std::string& err) {
+int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSource* source,
+                         core::PoolMultiFn pool, void* user, core::GpuPlanSink** stage_plans, std::string& err) {
     auto& m = *impl_;
     const auto& c = m.config;
     const auto& g = *m.geometry;
+    if (stages.empty() || !stages[0].wt || !stages[0].cache || !stages[0].dispatch) {
+        err = "concurrency: no stage"; return 1;
+    }
+    // C1 boundary: at N=1 every binding below is the very object the old run() took as a separate
+    // argument - same call sequence, same objects, same order (re-root, not a rewrite).
+    const ServeStage& st0 = stages[0];
+    const core::WeightTable& wt = *st0.wt;
+    const core::NativeHead* head = st0.head;
+    core::ExpertCache& cache = *st0.cache;
+    int32_t* host_res = st0.host_res;
+    const core::VerifyHits& hits = st0.hits;
+    core::ExpertDispatch& dispatch = *st0.dispatch;
+    m.stages = stages;
+    m.stage_plans = stage_plans;
     if (!head || !head->loaded() || !wt.find("output.weight")) { err = "concurrency: native head required"; return 1; }
     if (!source || !host_res || !hits.d_res || cache.slots() < 1) {
         err = "concurrency: no profile-filled expert cache fits; reduce context/concurrency or increase available VRAM";
