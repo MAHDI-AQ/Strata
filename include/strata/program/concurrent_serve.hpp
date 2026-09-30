@@ -17,6 +17,7 @@ struct ConcurrentConfig {
     int adapt_every = 4, adapt_swaps = 96;
     float spec_min_p = 0.5f;
     std::string mtp_dir;
+    std::string kv = "int8";   // resident KV mode (int8, k8v4, q4_0); reported in INFO
     std::vector<int64_t> eos;
 };
 class ConcurrentServe {

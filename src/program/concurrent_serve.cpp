@@ -299,8 +299,8 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
         return true;
     };
     std::fprintf(stderr, "strata concurrent: shared expert batching; independent MTP; adaptive cache %s; no conversation-prefix reuse\n", adaptive ? "on" : "off");
-    std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=int8 lookup=%d expert_policy=%s\n",
-                c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.suffix, adaptive ? "adaptive" : "static");
+    std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s\n",
+                c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.kv.c_str(), c.suffix, adaptive ? "adaptive" : "static");
     std::printf("READY %lld stop multiplex\n", (long long) c.context);
     std::fflush(stdout);
     auto input = std::make_shared<Input>();
