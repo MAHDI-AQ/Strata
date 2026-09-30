@@ -277,6 +277,9 @@ struct Options {
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     int concurrency = 1, batch_rows = 8, concurrent_prefill = 256;
+    int batch_graphs = 8;
+    int batch_padding = 0;
+    int batch_parallel = 0;
     std::string batch_policy = "fair";
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
@@ -376,7 +379,10 @@ void usage() {
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --concurrency N      experimental shared-model serving, 1..4 requests (default 1)\n"
-                 "  --batch-rows N       target rows across requests, 1..8 (default 8)\n"
+                 "  --batch-rows N       target rows across requests, 1..16 (default 8)\n"
+                 "  --batch-graphs N     cached batch layouts, 1..64 (default 8; respects VRAM reserve)\n"
+                 "  --batch-padding N    stabilize verification shapes with discarded padding, 0|1 (default 0)\n"
+                 "  --batch-parallel N   overlap independent request projections, 0|1 (default 0)\n"
                  "  --batch-policy P     fair (shorter windows) or depth (rotate longer windows)\n"
                  "  --concurrent-prefill N  bounded prompt chunk, 256..1024 (default 256)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
@@ -1003,6 +1009,9 @@ int main(int argc, char** argv) {
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--concurrency") o.concurrency = std::atoi(next("--concurrency"));
         else if (a == "--batch-rows") o.batch_rows = std::atoi(next("--batch-rows"));
+        else if (a == "--batch-graphs") o.batch_graphs = std::atoi(next("--batch-graphs"));
+        else if (a == "--batch-padding") o.batch_padding = std::atoi(next("--batch-padding"));
+        else if (a == "--batch-parallel") o.batch_parallel = std::atoi(next("--batch-parallel"));
         else if (a == "--batch-policy") o.batch_policy = next("--batch-policy");
         else if (a == "--concurrent-prefill") o.concurrent_prefill = std::atoi(next("--concurrent-prefill"));
         else if (a == "--prefill") {
@@ -1099,9 +1108,12 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (o.concurrency < 1 || o.concurrency > 4 || o.batch_rows < 1 || o.batch_rows > 8 ||
+    if (o.concurrency < 1 || o.concurrency > 4 || o.batch_rows < 1 || o.batch_rows > 16 ||
+        o.batch_graphs < 1 || o.batch_graphs > 64 ||
+        o.batch_padding < 0 || o.batch_padding > 1 ||
+        o.batch_parallel < 0 || o.batch_parallel > 1 ||
         (o.batch_policy != "fair" && o.batch_policy != "depth") || o.concurrent_prefill < 256 || o.concurrent_prefill > 1024) {
-        std::fprintf(stderr, "strata: --concurrency 1..4, --batch-rows 1..8, --batch-policy fair|depth, --concurrent-prefill 256..1024\n");
+        std::fprintf(stderr, "strata: --concurrency 1..4, --batch-rows 1..16, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..1024\n");
         return 2;
     }
     if (o.concurrency > 1) {
@@ -1760,6 +1772,9 @@ int main(int argc, char** argv) {
     if (o.concurrency > 1) {
         strata::program::ConcurrentConfig config;
         config.requests = o.concurrency; config.rows = o.batch_rows; config.depth = o.batch_policy == "depth";
+        config.graph_cache = o.batch_graphs;
+        config.pad_batch = o.batch_padding != 0;
+        config.parallel_batch = o.batch_parallel != 0;
         config.window = o.spec; config.mtp_window_rows = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         config.prefill_chunk = o.concurrent_prefill; config.context = o.max_context; config.draft_context = o.mtp_window;
         config.reserve_mib = o.vram_reserve_mib; config.mtp_dir = o.mtp; config.spec_min_p = (float) o.spec_min_p;
@@ -2035,7 +2050,8 @@ int main(int argc, char** argv) {
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         // Concurrent session/prompt storage is already allocated. Reserve for verifiers, graph metadata,
         // draft heads and per-slot prompt host/device staging created after the cache.
-        const int64_t concurrent_mib = concurrent ? 512 + (int64_t) o.concurrency * 256 : 0;
+        const int64_t concurrent_mib = concurrent ? 512 + (int64_t) o.concurrency * 256 +
+            (int64_t) o.batch_rows * 8 + (int64_t) o.batch_graphs * 16 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib + concurrent_mib) << 20;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());

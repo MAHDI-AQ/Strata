@@ -8,13 +8,14 @@
 using strata::program::schedule_rows;
 int main() {
     assert((schedule_rows({4,4,4,4}, 8, false) == std::vector<int>{2,2,2,2}));
+    assert((schedule_rows({4,4,4,4}, 16, false) == std::vector<int>{4,4,4,4}));
     assert((schedule_rows({4,4,4,4}, 8, true) == std::vector<int>{4,4,0,0}));
     assert((schedule_rows({1,6,2}, 8, false) == std::vector<int>{1,5,2}));
     assert(schedule_rows({}, 8, false).empty());
     int checks = 0;
     for (int a = 1; a <= 8; ++a) for (int b = 1; b <= 8; ++b)
     for (int c = 1; c <= 8; ++c) for (int d = 1; d <= 8; ++d)
-    for (int budget = 1; budget <= 8; ++budget) for (bool depth : {false, true}) {
+    for (int budget = 1; budget <= 16; ++budget) for (bool depth : {false, true}) {
         std::vector<int> wanted{a,b,c,d};
         const auto rows = schedule_rows(wanted, budget, depth);
         assert(std::accumulate(rows.begin(), rows.end(), 0) == std::min(budget, a+b+c+d));
@@ -31,7 +32,7 @@ int main() {
         }
         for (int n : progress) assert(n == 1);
     }
-    for (int invalid : {0,9,16}) {
+    for (int invalid : {0,17,32}) {
         bool rejected = false;
         try { schedule_rows({4,4}, invalid, false); } catch (const std::invalid_argument&) { rejected = true; }
         assert(rejected);

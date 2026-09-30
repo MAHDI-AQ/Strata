@@ -2,6 +2,8 @@
 
 This branch adds configurable shared-model serving for **1–4 requests**. It is based on upstream 0.1.27, commit `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`. Native Windows qualification on an RTX 5090 established exact token parity at c=1, 2, 3 and 4 under the matched numerical settings below. This remains a single-GPU experimental implementation; the qualification is specific to Swift IQ2_XS and the tested configuration, not a guarantee across all models and settings.
 
+The subsequent throughput work adds up to sixteen shared expert rows, optional padded verification and parallel request projections. See [the throughput study](concurrency-throughput.md) for matched measurements, current qualification and recommended settings. The qualification tables later in this document describe the original implementation.
+
 ## Configuration
 
 Add these engine arguments to the usual server JSON `args`:
@@ -13,11 +15,14 @@ Add these engine arguments to the usual server JSON `args`:
 | Option | Values | Meaning |
 | --- | --- | --- |
 | `--concurrency` | 1–4, default 1 | Maximum active sequences; 1 retains the existing serving path |
-| `--batch-rows` | 1–8, default 8 | Total target-verification rows in a scheduling round |
+| `--batch-rows` | 1–16, default 8 | Total target-verification rows in a scheduling round |
+| `--batch-graphs` | 1–64, default 8 | LRU cache of graph layouts, bounded by available VRAM |
+| `--batch-padding` | 0 or 1, default 0 | Pad short windows to the MTP width when the row budget permits; extra outputs are discarded |
+| `--batch-parallel` | 0 or 1, default 0 | Overlap independent request projections in each layer before shared expert dispatch |
 | `--batch-policy` | `fair` or `depth` | Share rows across ready requests, or prioritize longer windows |
 | `--concurrent-prefill` | 256–1024, default 256 | Maximum prompt chunk before returning to ready decode work |
 
-With four ready requests wanting four rows each, `fair` at eight rows gives each two rows. `depth` gives two requests four rows each, then rotates admission order. Smaller budgets also rotate, so requests get turns. A row is one target input token, including the real token and any speculative tokens. This is not a sixteen-row implementation.
+With four ready requests wanting four rows each, `fair` at eight rows gives each two rows; at sixteen rows all four retain their full windows. `depth` gives earlier requests longer windows, then rotates admission order. Smaller budgets also rotate, so requests get turns. A row is one target input token, including the real token and any speculative or discarded padding tokens.
 
 MTP stays enabled and keeps the normal confidence threshold. Each request drafts independently. A short target window can leave some draft work unused; performance must be measured before choosing the best policy. The scheduler does not execute another request concurrently inside a running MTP graph.
 
@@ -35,7 +40,7 @@ Concurrent mode rejects vision, ROCm, multi-GPU, streamed KV, control vectors an
 
 For each layer, the combined CUDA graph runs each request's mixer/router, packs the routed-expert inputs, dispatches experts once over the combined rows, scatters the results, then completes each request's layer. Identical experts across requests can share dispatch and fetch work. Attention, dense projections and MTP remain per request. Existing native GPU expert kernels are reused; this does not add a new matrix-matrix expert kernel.
 
-Each request commits only its own accepted tokens. Graph layouts are cached by slot/window shape with an eight-layout bound. Prompt work uses one dedicated shared workspace and at most one prompt chunk per round. Expert residency changes occur only after GPU work has completed.
+Each request commits only its own accepted tokens. Graph layouts are cached by slot/window shape with a configurable LRU bound. Padding preserves the original acceptance limit and MTP work; causal outputs beyond that limit are discarded and their state rolled back. Parallel mode uses separate request streams and private PLE scratch, joins them before expert dispatch, and shares only immutable weights. Prompt work uses one dedicated shared workspace and at most one prompt chunk per round. Expert residency changes occur only after GPU work has completed.
 
 ## Memory and limitations
 
@@ -43,7 +48,7 @@ Concurrency adds independent sequence state and verifier workspaces. Slots are a
 
 The expert arena remains in system RAM and VRAM experts remain cached copies. This branch does **not** implement exclusive RAM/VRAM expert placement or free cached experts from RAM. More slots may reduce expert cache capacity, so higher concurrency is not guaranteed to increase throughput. Start validation at a moderate context length, such as 32768 per request, rather than multiplying a 196608-token configuration by four.
 
-HTTP output queues are bounded per request; a client that stops consuming output is canceled without blocking other streams. Engine failure terminates affected requests and requires an explicit server restart in concurrent mode. The monitor's live text/rate fields are a shared latest-update view, not separate per-request charts; completion histories and timings are request-local.
+HTTP output queues are bounded per request; a client that stops consuming output is canceled without blocking other streams. Engine failure terminates affected requests and requires an explicit server restart in concurrent mode. Live TPS uses a monotonic aggregate token counter; `/metrics` also exposes `active_requests` with individual counters. Progress log lines include request IDs. Completion histories and timings remain request-local. The existing monitor UI does not draw separate per-request charts.
 
 ## Lightweight verification
 
@@ -54,7 +59,7 @@ cmake --build build-cpu --target strata-batch-schedule-test
 ctest --test-dir build-cpu -R strata-batch-schedule-test --output-on-failure
 ```
 
-The scheduler test checks 65,536 combinations, bounds, policy allocation and rotating progress. The Python tests use mocked engine pipes for four-stream isolation, cancellation, backpressure, EOF and legacy statistics. Neither test loads model weights or runs GPU inference.
+The scheduler test checks 131,072 combinations, bounds, policy allocation and rotating progress. The Python tests use mocked engine pipes for four-stream isolation, cancellation, backpressure, EOF, aggregate live rates and legacy statistics. Neither test loads model weights or runs GPU inference.
 
 The Windows development checks also run the upstream `serve.test_server` and `serve.test_mcp` suites. On the 0.1.27 base, all 63 upstream tests and all six concurrent-serving tests pass. The scheduler executable passes in Release mode with its assertions explicitly retained.
 

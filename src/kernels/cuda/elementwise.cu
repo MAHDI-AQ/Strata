@@ -290,12 +290,15 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 }
 
 __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) dst[i] = src[i];
 }
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
-    copy_i32_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
+    // Small control arrays still use one block. Batched serving also uses this
+    // kernel for large device tensors: one block serialized those copies on one SM.
+    const int blocks = (int) ((n + 127) / 128 < 64 ? (n + 127) / 128 : 64);
+    copy_i32_from_mapped_kernel<<<blocks, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
     check_launch("copy_i32_from_mapped");
 }
 

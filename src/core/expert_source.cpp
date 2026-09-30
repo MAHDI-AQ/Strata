@@ -776,7 +776,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                 float* out) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
-    if (n_tok < 1 || n_tok > MAXT) {
+    if (n_tok < 1 || n_tok > MAXT || k < 1 || k > 16) {
         d.failed = true;
         d.fail = "a verify window has more tokens than the multi-token expert kernel takes";
         d.fail_layer = d.layers;
@@ -802,9 +802,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
-    int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe
-    if (d.plan != nullptr && n <= 128 && n <= d.plan->cap) {
-        int64_t distinct[128], first_of[128];
+    constexpr int max_entries = MAXT * 16;
+    int32_t kind[max_entries];             // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    if (d.plan != nullptr && n > d.plan->cap) {
+        d.failed = true; d.fail = "expert dispatch exceeds GPU plan capacity"; d.fail_layer = d.layers;
+        return;
+    }
+    if (d.plan != nullptr) {
+        int64_t distinct[max_entries], first_of[max_entries];
         int nd = 0, nmiss = 0;
         for (int64_t i = 0; i < n; ++i) {
             first_of[i] = i;

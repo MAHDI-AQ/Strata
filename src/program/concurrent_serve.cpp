@@ -3,6 +3,7 @@
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/layer.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -131,7 +132,8 @@ struct ConcurrentServe::Impl {
         float probability[8]{};
         double prompt_ms = 0;
         Clock::time_point decode_start{};
-        ~Slot() { if (history_device) cudaFree(history_device); }
+        void* ple_scratch = nullptr;
+        ~Slot() { if (history_device) cudaFree(history_device); if (ple_scratch) cudaFree(ple_scratch); }
     };
     ConcurrentConfig config;
     const core::ModelGeometry* geometry = nullptr;
@@ -179,6 +181,12 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
             s->owned.ple.hist = s->owned.ple_hist;
             s->owned.ple.prev = s->owned.ple_prev;
             s->owned.ple.token = &s->owned.ple_token;
+            // PLE weights/table are immutable, but its scratch is written during layer 1.
+            // Parallel member streams must not inherit the primary session's scratch pointer.
+            if (c.parallel_batch && primary.ple.ready()) {
+                if (!gpu_alloc(&s->ple_scratch, (size_t) core::ple_run_scratch_bytes(), c.reserve_mib, err)) return false;
+                s->owned.ple.scratch = static_cast<float*>(s->ple_scratch);
+            }
             s->draft_owner = std::make_unique<core::MtpDrafter>();
             s->draft = s->draft_owner.get();
             if (!s->draft->load(c.mtp_dir, draft_geometry, s->owned, c.window, err, c.draft_context, &draft)) return false;
@@ -205,7 +213,9 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     struct ProgressGuard { ~ProgressGuard() { core::progress().busy.store(false); } } progress_guard;
     std::jthread watchdog; // outlives the batch graph, including teardown after a failed GPU execution
     core::Verifier batch;
-    if (!batch.init(wt, g, *m.slots[0]->state, hits, head, std::max(2, c.rows), err)) return 1;
+    batch.set_batch_cache(c.graph_cache, c.reserve_mib);
+    batch.set_batch_parallel(c.parallel_batch);
+    if (!batch.init(wt, g, *m.slots[0]->state, hits, head, std::max(2, c.rows), err, true)) return 1;
     batch.set_pcie_mode(2); // Match the stock Windows-safe kernel-copy path.
     for (auto& ptr : m.slots) {
         auto& s = *ptr;
@@ -233,6 +243,26 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     if (adaptive) dispatch.usage.assign((size_t) g.n_layers * g.n_expert, 0.0f);
     int64_t rounds = 0;
     int64_t batch_sizes[5]{};
+    const bool profiling = std::getenv("STRATA_CONCURRENT_PROFILE") != nullptr;
+    double target_ms = 0, draft_ms = 0, commit_ms = 0, adapt_ms = 0, prefill_ms = 0;
+    int64_t produced = 0, target_rows = 0;
+    auto report_profile = [&]() {
+        if (!profiling || !rounds) return;
+        double wait = batch.ms_wait, pool_ms = batch.ms_pool, host = batch.ms_host;
+        for (const auto& s : m.slots) {
+            wait += s->verify.ms_wait; pool_ms += s->verify.ms_pool; host += s->verify.ms_host;
+        }
+        std::fprintf(stderr, "strata concurrent profile: rounds=%lld tokens=%lld rows=%lld target_ms=%.1f "
+                     "draft_ms=%.1f commit_ms=%.1f adapt_ms=%.1f prefill_ms=%.1f "
+                     "target_wait_ms=%.1f target_pool_ms=%.1f target_host_ms=%.1f\n",
+                     (long long) rounds, (long long) produced, (long long) target_rows, target_ms,
+                     draft_ms, commit_ms, adapt_ms, prefill_ms, wait, pool_ms, host);
+        std::fflush(stderr);
+        std::fprintf(stderr, "strata concurrent detail: captures=%lld capture_ms=%.1f gpu_pre_ms=%.1f "
+                     "gpu_experts_ms=%.1f gpu_post_ms=%.1f gpu_head_ms=%.1f\n",
+                     (long long) batch.batch_captures, batch.ms_batch_capture, batch.batch_gpu_ms[0],
+                     batch.batch_gpu_ms[1], batch.batch_gpu_ms[2], batch.batch_gpu_ms[3]);
+    };
     auto adapt = [&]() -> bool {
         // All target, commit, prefill and draft work has finished at this boundary. Updating both
         // residency tables here makes cached graph pointers safe without per-request invalidation.
@@ -382,6 +412,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             if (!s.prompt.run(s.request.tokens.data() + s.read, n, s.read, err)) return 1;
             for (int64_t t = 0; t < n; ++t) s.consumed.push_back((int32_t) s.request.tokens[(size_t) (s.read + t)]);
             s.read += n; s.prompt_ms += elapsed(start);
+            prefill_ms += elapsed(start);
             std::printf("R %llu PP %lld %zu\n", (unsigned long long) s.request.id, (long long) s.read, s.request.tokens.size());
             std::fflush(stdout);
             prompt_rotation = (i + 1) % m.slots.size();
@@ -419,6 +450,9 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             if (s.first) s.decode_start = Clock::now();
             s.window[0] = s.current;
             for (int t = 1; t < s.count; ++t) s.window[t] = s.lookup ? s.lookup_tokens[t - 1] : s.drafts[t - 1];
+            // Outputs beyond the real window are never emitted, accepted or committed.
+            // Fixed shapes can amortize graph construction without asking MTP for more drafts.
+            for (int t = s.count; t < c.window; ++t) s.window[t] = s.current;
             const int history = s.request.sampling.penalty_last_n;
             if (history > 0) {
                 kernels::penalty_rows(s.consumed.data(), (int64_t) s.consumed.size(), s.window, s.count, history, s.history.data());
@@ -431,6 +465,14 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
         }
         if (!windows.empty()) {
             ++batch_sizes[windows.size()];
+            if (c.pad_batch && windows.size() > 1) {
+                int padded_rows = 0;
+                for (const auto& w : windows)
+                    padded_rows += (int) std::min<int64_t>(std::max(w.count, c.mtp_window_rows), c.context - w.position);
+                if (padded_rows <= c.rows)
+                    for (auto& w : windows)
+                        w.count = (int) std::min<int64_t>(std::max(w.count, c.mtp_window_rows), c.context - w.position);
+            }
             // Stable packing order avoids recapturing a graph merely because fairness rotated the request order.
             std::sort(windows.begin(), windows.end(), [](const auto& a, const auto& b) {
                 return std::less<core::Verifier*>{}(a.verifier, b.verifier);
@@ -450,6 +492,8 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                 if (dispatch.failed) err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
                 return 1;
             }
+            target_ms += elapsed(start);
+            for (const auto& w : windows) target_rows += w.count;
             for (auto* ptr : ready) {
                 auto& s = *ptr; if (!s.count) continue;
                 int accepted = 0;
@@ -459,7 +503,10 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                 for (int t = 0; t < keep; ++t) if (std::find(c.eos.begin(), c.eos.end(), s.output[t]) != c.eos.end()) {
                     keep = t + 1; eos = true; break;
                 }
+                const auto commit_start = Clock::now();
                 if (!s.verify.commit(keep, err)) return 1;
+                commit_ms += elapsed(commit_start);
+                produced += keep;
                 s.offered += s.count - 1; s.accepted += keep - 1;
                 for (int t = 0; t < keep; ++t) {
                     s.consumed.push_back(s.window[t]); s.suffix.append(s.output[t]); ++s.generated;
@@ -472,17 +519,25 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                 }
                 // Catch-up consumes the verified window; limit the extra speculative chain near the context boundary.
                 s.draft->set_max_drafts((int) std::min<int64_t>(c.mtp_window_rows - 1, c.context - (s.position + keep)));
+                const auto draft_start = Clock::now();
                 if (!s.draft->draft(s.count, s.output, s.position, keep - 1, s.drafts, err, s.probability, s.request.spec_min_p)) return 1;
+                draft_ms += elapsed(draft_start);
                 s.policy.observe(s.lookup, s.count, keep - 1, s.match, elapsed(start));
                 s.current = s.output[keep - 1]; s.position += keep; s.read = s.position;
             }
             ++rounds;
-            if (adaptive && rounds % c.adapt_every == 0 && !adapt()) return 1;
+            if (adaptive && rounds % c.adapt_every == 0) {
+                const auto adapt_start = Clock::now();
+                if (!adapt()) return 1;
+                adapt_ms += elapsed(adapt_start);
+            }
+            if (rounds % 64 == 0) report_profile();
         }
         rotation = (rotation + 1) % m.slots.size();
     }
     for (auto& s : m.slots) if (s->active) finish(*s, "cancel");
     for (const auto& r : pending) error(r.id, "server shutting down");
+    report_profile();
     std::fprintf(stderr, "strata concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld\n",
                  (long long) batch_sizes[1], (long long) batch_sizes[2], (long long) batch_sizes[3], (long long) batch_sizes[4]);
     return 0;

@@ -4,6 +4,7 @@ import collections
 import http.client
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -11,6 +12,22 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, parse_qs
+
+
+def available_backend_port(preferred):
+    """A stopped Windows listener can leave TIME_WAIT sockets on its old port.
+
+    The private backend may move; the public router port and model IDs stay fixed.
+    No SO_REUSEADDR: a live listener must never be shared or displaced.
+    """
+    with socket.socket() as probe:
+        if os.name == 'nt':
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            probe.bind(('127.0.0.1', preferred))
+        except OSError:
+            probe.bind(('127.0.0.1', 0))
+        return probe.getsockname()[1]
 
 
 class Presets:
@@ -45,6 +62,7 @@ class Presets:
 
     def load(self, name):
         self.stop_backend()
+        self.port = available_backend_port(self.port)
         cfg = self.configs[name]
         log_path = Path(self.config['log_dir']) / (name + '.server.log')
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,7 +153,8 @@ def handler(manager):
             if path in ('/router/status', ''):
                 with manager.cv:
                     status = dict(loaded_model=manager.current, active_requests=manager.active,
-                                  queued_requests=len(manager.pending), switching=manager.switching)
+                                  queued_requests=len(manager.pending), switching=manager.switching,
+                                  backend_port=manager.port if manager.current else None)
                 self.send_json(200, status); return
             if path == '/props':
                 name = parse_qs(urlsplit(self.path).query).get('model', [manager.current or next(iter(manager.entries))])[0]

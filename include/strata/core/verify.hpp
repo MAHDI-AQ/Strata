@@ -60,9 +60,10 @@ public:
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
 
-    /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
+    /// `max_t` <= kVerifyMaxT; a dedicated expert-only batch workspace may reserve up to 16 rows.
+    /// `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
-              const NativeHead* head, int max_t, std::string& err);
+              const NativeHead* head, int max_t, std::string& err, bool batch_workspace = false);
 
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
@@ -77,6 +78,9 @@ public:
     // This instance is a dedicated batch workspace; each member owns independent sequence state.
     // Shared expert work is packed across requests. Attention, recurrence and commit remain per member.
     bool run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user, std::string& err);
+    // Configure before init; CLI validation supplies a positive bounded cache limit.
+    void set_batch_cache(int limit, int reserve_mib) { batch_cache_limit_ = limit; batch_reserve_mib_ = reserve_mib; }
+    void set_batch_parallel(bool enabled) { batch_parallel_ = enabled; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
@@ -138,6 +142,9 @@ public:
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_batch_capture = 0;
+    int64_t batch_captures = 0;
+    double batch_gpu_ms[4] = {}; // member pre, shared expert dispatch, member post, head
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
@@ -169,6 +176,9 @@ private:
     bool stage_inputs(int T, const int32_t* tokens, int64_t pos0, std::string& err);
     struct BatchGraph { std::vector<std::pair<Verifier*, int>> shape; cudaGraphExec_t graph = nullptr; };
     std::vector<BatchGraph> batch_graphs_;
+    int batch_cache_limit_ = 8, batch_reserve_mib_ = 0;
+    bool batch_parallel_ = false;
+    cudaEvent_t batch_fork_ = nullptr, batch_join_[4] = {};
     cudaGraphExec_t batch_replay_ = nullptr;
     static constexpr int kProfPer = 32;              // stamps per layer
     bool prof_on_ = false;
@@ -217,7 +227,7 @@ private:
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
-    int groups_[9] = {};
+    int groups_[17] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device

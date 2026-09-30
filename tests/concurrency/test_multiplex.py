@@ -6,6 +6,7 @@ import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 from serve.frontend import ChatTemplate
 from serve.server import StrataEngine, EngineDied, ByteTokenizer, MockEngine, Service
 
@@ -48,6 +49,33 @@ def wait_for(predicate):
 
 
 class MultiplexTests(unittest.TestCase):
+    def test_interleaved_live_rates_are_aggregate_and_monotonic(self):
+        tok = ByteTokenizer()
+        mock = MockEngine(tok, "ok", max_context=4096)
+        mock.info = {"concurrency": 4}
+        template = Path(__file__).resolve().parents[2] / "serve" / "chat_template.jinja"
+        service = Service(mock, tok, ChatTemplate(template))
+        service.active_requests = 2
+        for rid in (1, 2):
+            service.live_requests[rid] = dict(started=100.0, first_token=None, generated=0,
+                prompt_tokens=10, max_tokens=100, phase="reading", tail="", tool=None)
+        with patch("serve.server.time.time", return_value=100.0):
+            service._note(1, [], 1)
+        with patch("serve.server.time.time", return_value=101.0):
+            service._note(51, [], 1)
+            service._note(1, [], 2)  # a new request's smaller counter must not reset the total
+        with patch("serve.server.time.time", return_value=102.0):
+            service._note(101, [], 1)
+            service._note(51, [], 2)
+            self.assertEqual(service.status["generated"], 152)
+            self.assertEqual(service._tok_s(), 75.5)
+            metrics = service.metrics()
+            self.assertEqual(metrics["live"]["rate_scope"], "aggregate")
+            self.assertEqual(metrics["live"]["active_requests"], 2)
+            self.assertEqual([r["generated"] for r in metrics["active_requests"]], [101, 51])
+        with patch("serve.server.time.time", return_value=200.0):
+            self.assertEqual(service._tok_s(), 0.0)
+
     def test_status_reports_capacity_and_active_requests(self):
         tok = ByteTokenizer()
         mock = MockEngine(tok, "ok", max_context=4096)

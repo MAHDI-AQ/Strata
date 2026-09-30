@@ -692,7 +692,11 @@ class Service:
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
-        self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
+        self.rate = collections.deque(maxlen=8192)      # monotonic aggregate token samples
+        self.live_requests = {}
+        self.request_serial = 0
+        self.live_generated = 0
+        self.live_first_token = None
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
@@ -751,24 +755,26 @@ class Service:
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating."""
         with self.status_lock:
-            s = dict(self.status)
+            busy, first, generated = self.active_requests > 0, self.live_first_token, self.live_generated
             rate = list(self.rate)
-        if not s.get("busy") or not s.get("first_token"):
+        if not busy or first is None:
             return 0.0
         now = time.time()
         newest = rate[-1] if rate else None
         oldest = next(((t, g) for t, g in rate if now - t <= RATE_WINDOW_S), None)
         if newest and oldest and newest[0] - oldest[0] >= RATE_MIN_SPAN_S:
             return max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]))
-        return s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
+        if newest and now - newest[0] > RATE_WINDOW_S:
+            return 0.0
+        return generated / max(RATE_MIN_SPAN_S, now - first)
 
     def _tok_s_mean(self):
-        """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
+        """Aggregate mean over this continuously busy serving interval."""
         with self.status_lock:
-            s = dict(self.status)
-        if not s.get("busy") or not s.get("first_token"):
+            busy, first, generated = self.active_requests > 0, self.live_first_token, self.live_generated
+        if not busy or first is None:
             return 0.0
-        return s["generated"] / max(1e-6, time.time() - s["first_token"])
+        return generated / max(RATE_MIN_SPAN_S, time.time() - first)
 
     def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
@@ -777,6 +783,7 @@ class Service:
             s = dict(self.status)
             hist = list(self.history)
             totals = dict(self.totals)
+            active = [dict(request_id=rid, **state) for rid, state in self.live_requests.items()]
         now = time.time()
         progress = getattr(self.engine, "progress", None)
         if s.get("busy") and s.get("first_token") is None:
@@ -798,7 +805,9 @@ class Service:
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        live["active_requests"] = len(active)
+        live["rate_scope"] = "aggregate"
+        return {"engine": engine, "live": live, "active_requests": active, "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -894,13 +903,32 @@ class Service:
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
-    def _note(self, n, evs):
+    def _refresh_status_locked(self):
+        """Preserve the existing status schema, aggregating independent request counters."""
+        states = list(self.live_requests.values())
+        self.status.update(busy=bool(states), active_requests=len(states))
+        if not states:
+            return
+        first = [s["first_token"] for s in states if s["first_token"] is not None]
+        newest = states[-1]
+        self.status.update(started=min(s["started"] for s in states),
+                           first_token=min(first) if first else None,
+                           generated=sum(s["generated"] for s in states),
+                           prompt_tokens=sum(s["prompt_tokens"] for s in states),
+                           max_tokens=sum(s["max_tokens"] for s in states),
+                           phase=newest["phase"] if len(states) == 1 else "generating" if first else "reading the prompt",
+                           tool=newest["tool"], tail=newest["tail"])
+
+    def _note(self, n, evs, request_id):
         with self.status_lock:
-            s = self.status
+            s = self.live_requests[request_id]
+            self.live_generated += max(0, n - s["generated"])
             s["generated"] = n
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
-            self.rate.append((time.time(), n))          # the live rate's window over the last RATE_WINDOW_S
+            if self.live_first_token is None:
+                self.live_first_token = s["first_token"]
+            self.rate.append((time.time(), self.live_generated))
             for ev in evs:
                 if ev.kind == "reasoning":
                     s["phase"] = "thinking"
@@ -911,22 +939,24 @@ class Service:
                 elif ev.kind == "tool_call":
                     s["phase"] = "tool call complete"
                 s["tail"] = (s["tail"] + (ev.text or ""))[-600:]
+            self._refresh_status_locked()
 
-    def _progress(self, last_print, every=1.0):
+    def _progress(self, last_print, every=1.0, request_id=None):
         """A progress line in the server window every `every` seconds while a request runs."""
         now = time.time()
         if now - last_print < every:
             return last_print
         with self.status_lock:
-            s = dict(self.status)
+            s = dict(self.live_requests.get(request_id, self.status))
+        label = f"[strata request {request_id}]" if request_id is not None else "[strata]"
         el = now - s.get("started", now)
         if s.get("first_token") is None:
-            pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
+            pr = getattr(self.engine, "progress", None) if self.concurrency == 1 else None
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
-            print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
+            print(f"{label} reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
-            print(f"[strata] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
+            print(f"{label} {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
 
@@ -946,6 +976,7 @@ class Service:
         engine_last0 = getattr(self.engine, "last", None)
         request_started = None
         request_first_token = None
+        request_id = None
         with self.status_lock:
             self.status["queued"] += 1
         try:
@@ -962,13 +993,18 @@ class Service:
                     self.engine.restart()
                     print("[strata] the engine is running again", flush=True)
                 with self.status_lock:
+                    if self.active_requests == 0:
+                        self.rate.clear()
+                        self.live_generated = 0
+                        self.live_first_token = None
                     self.active_requests += 1
                     request_started = time.time()
-                    self.status["active_requests"] = self.active_requests
-                    self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
-                                       started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
+                    self.request_serial += 1
+                    request_id = self.request_serial
+                    self.live_requests[request_id] = dict(phase="reading the prompt", prompt_tokens=len(ids), generated=0,
+                                       started=request_started, first_token=None, tool=None, tail="", max_tokens=max_new)
+                    self._refresh_status_locked()
                     self.last_request_at = time.time()
-                    self.rate.clear()               # the previous request's samples must not leak into this one
                 before = getattr(self.engine, "last", None)
                 last_print = time.time()
                 gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
@@ -976,20 +1012,21 @@ class Service:
                 try:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
-                            last_print = self._progress(last_print)
+                            last_print = self._progress(last_print, request_id=request_id)
                             yield "ping", None
                             continue
                         n += 1
                         if request_first_token is None:
                             request_first_token = time.time()
                         if t in self.stop_ids:
+                            self._note(n, [], request_id)
                             finish = "stop"
                             raw_ids.append(t)
                             break
                         raw_ids.append(t)
                         evs = parser.feed(detok.push(t))
-                        self._note(n, evs)
-                        last_print = self._progress(last_print)
+                        self._note(n, evs, request_id)
+                        last_print = self._progress(last_print, request_id=request_id)
                         for ev in evs:
                             yield "event", ev
                     if cancel.is_set():
@@ -1051,14 +1088,14 @@ class Service:
                     ft = request_first_token
                     rate = n / max(1e-6, now - ft) if ft else 0.0
                     hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
-                    print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                    print(f"[strata request {request_id}] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                           f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 if request_started is not None:
                     self.active_requests -= 1
-                self.status["active_requests"] = self.active_requests
-                self.status["busy"] = self.active_requests > 0
+                    self.live_requests.pop(request_id, None)
+                self._refresh_status_locked()
         for ev in parser.finish():
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),

@@ -2,12 +2,13 @@
 import concurrent.futures
 import http.client
 import json
+import socket
 import threading
 import time
 import unittest
 from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from serve.preset_router import Presets, handler
+from serve.preset_router import Presets, handler, available_backend_port
 
 
 class FakePresets(Presets):
@@ -26,6 +27,15 @@ class FakePresets(Presets):
 
 
 class RouterTests(unittest.TestCase):
+    def test_busy_private_port_uses_another_port_without_sharing(self):
+        with socket.socket() as occupied:
+            occupied.bind(('127.0.0.1', 0))
+            occupied.listen()
+            chosen = available_backend_port(occupied.getsockname()[1])
+            self.assertNotEqual(chosen, occupied.getsockname()[1])
+            with socket.socket() as replacement:
+                replacement.bind(('127.0.0.1', chosen))
+
     def test_same_preset_has_four_concurrent_leases(self):
         m = FakePresets()
         for _ in range(4): m.acquire('four')

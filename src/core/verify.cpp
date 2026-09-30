@@ -119,6 +119,8 @@ Verifier::~Verifier() {
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& b : batch_graphs_) if (b.graph) cudaGraphExecDestroy(b.graph);
+    if (batch_fork_) cudaEventDestroy(batch_fork_);
+    for (auto e : batch_join_) if (e) cudaEventDestroy(e);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
@@ -132,7 +134,7 @@ Verifier::~Verifier() {
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
-                    const NativeHead* head, int max_t, std::string& err) {
+                    const NativeHead* head, int max_t, std::string& err, bool batch_workspace) {
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
@@ -144,7 +146,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
-    if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT || max_t > strata::kernels::cpu::MAXT) {
+    if (max_t < 2 || max_t > (batch_workspace ? 16 : strata::kernels::kVerifyMaxT) || max_t > strata::kernels::cpu::MAXT) {
         err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
@@ -233,7 +235,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
-        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
+        xq_ = b.take<uint8_t>(T * strata::kernels::native_q8_1_bytes(max_in, 1));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
@@ -286,6 +288,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
+    }
+    if (batch_workspace && batch_parallel_) {
+        if (cudaEventCreateWithFlags(&batch_fork_, cudaEventDisableTiming) != cudaSuccess) {
+            err = "batch verify: fork event failed"; return false;
+        }
+        for (auto& e : batch_join_) if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+            err = "batch verify: join event failed"; return false;
+        }
     }
     // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
@@ -959,7 +969,9 @@ bool Verifier::capture_commit(std::string& err) {
 bool Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
-    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    if (T < 1 || T > max_t_ || (!batch_replay_ && T > strata::kernels::kVerifyMaxT)) {
+        err = "verify: window size out of range"; return false;
+    }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 < 0 || pos0 > ss.qsa_states[0].max_cells - T) { err = "verify: the window runs past the context"; return false; }
@@ -997,7 +1009,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     const Clock::time_point t0 = Clock::now();
-    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    if (T < 1 || T > max_t_ || (!batch_replay_ && T > strata::kernels::kVerifyMaxT)) {
+        err = "verify: window size out of range"; return false;
+    }
     if (!batch_replay_ && (!capture(T, err) || !capture_commit(err) || !stage_inputs(T, tokens, pos0, err))) return false;
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
@@ -1164,43 +1178,70 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
     // Expert-only coordinator always uses the host plan. Member graphs never publish doorbells.
     device_plan_ = false;
     cudaGraphExec_t graph_exec = nullptr;
-    for (const auto& b : batch_graphs_) if (b.shape == shape) { graph_exec = b.graph; break; }
+    for (auto it = batch_graphs_.begin(); it != batch_graphs_.end(); ++it) if (it->shape == shape) {
+        graph_exec = it->graph;
+        std::rotate(it, it + 1, batch_graphs_.end()); // bounded LRU, not creation-order eviction
+        break;
+    }
     if (!graph_exec) {
+        const auto capture_start = Clock::now();
         if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
             err = "batch verify: begin capture failed"; return false;
         }
         bool ok = true;
         const int64_t N = g_->n_embd, K = ss_->k;
-        auto copy = [&](void* dst, const void* src, size_t bytes) {
+        auto copy = [&](void* dst, const void* src, size_t bytes, cudaStream_t stream) {
             // Keep the doorbell graph kernel-only. WDDM can wait for a graph memcpy node while
             // holding the driver lock needed by the host that must service its preceding doorbell.
-            copy_i32_from_mapped((int32_t*) dst, (const int32_t*) src, (int64_t) (bytes / 4), cs_);
+            copy_i32_from_mapped((int32_t*) dst, (const int32_t*) src, (int64_t) (bytes / 4), stream);
         };
         for (const auto& b : batch) if (ok) ok = b.verifier->record_window(b.count, cs_, err, 0);
         for (int64_t l = 0; ok && l < g_->n_layers; ++l) {
+            if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + 27), cs_);
+            if (batch_parallel_ && cudaEventRecord(batch_fork_, cs_) != cudaSuccess) {
+                err = "batch verify: fork failed"; ok = false; break;
+            }
             int row = 0;
+            int member = 0;
             for (const auto& b : batch) {
                 Verifier& v = *b.verifier;
-                if (!(ok = v.record_window(b.count, cs_, err, 1, l))) break;
-                copy(mixed_ + row * N, v.mixed_, (size_t) b.count * N * sizeof(float));
-                copy(ids_ + row * K, v.ids_, (size_t) b.count * K * sizeof(int32_t));
-                copy(w_ + row * K, v.w_, (size_t) b.count * K * sizeof(float));
+                cudaStream_t branch = batch_parallel_ ? v.cs_ : cs_;
+                if (batch_parallel_ && cudaStreamWaitEvent(branch, batch_fork_, 0) != cudaSuccess) {
+                    err = "batch verify: branch wait failed"; ok = false; break;
+                }
+                if (!(ok = v.record_window(b.count, branch, err, 1, l))) break;
+                copy(mixed_ + row * N, v.mixed_, (size_t) b.count * N * sizeof(float), branch);
+                copy(ids_ + row * K, v.ids_, (size_t) b.count * K * sizeof(int32_t), branch);
+                copy(w_ + row * K, v.w_, (size_t) b.count * K * sizeof(float), branch);
+                if (batch_parallel_ && cudaEventRecord(batch_join_[member], branch) != cudaSuccess) {
+                    err = "batch verify: branch join failed"; ok = false; break;
+                }
+                ++member;
                 row += b.count;
             }
+            if (batch_parallel_) for (int i = 0; i < member; ++i)
+                if (cudaStreamWaitEvent(cs_, batch_join_[i], 0) != cudaSuccess) {
+                    err = "batch verify: join wait failed"; ok = false;
+                }
             if (!ok) break;
+            if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + 28), cs_);
             doorbell_publish(mixed_, ids_, w_, total * N, total * K, m_x_, m_ids_, m_w_, m_seq_, cs_);
             if (strata::kernels::cpu::expert_layout().native)
                 quantize_q8_1_rows(mixed_, total, N, nat_xq_, cs_);
             else { err = "batch verify: requires native experts"; ok = false; break; }
             if (!(ok = record_window(total, cs_, err, 2, l))) break;
+            if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + 29), cs_);
             row = 0;
             for (const auto& b : batch) {
-                copy(b.verifier->parts_, parts_ + row * K * N, (size_t) b.count * K * N * sizeof(float));
+                copy(b.verifier->parts_, parts_ + row * K * N, (size_t) b.count * K * N * sizeof(float), cs_);
                 if (!ok || !(ok = b.verifier->record_window(b.count, cs_, err, 3, l))) break;
                 row += b.count;
             }
+            if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + 30), cs_);
         }
+        if (prof_on_) gpu_stamp(prof_, (int) (g_->n_layers * kProfPer + 2), cs_);
         for (const auto& b : batch) if (ok) ok = b.verifier->record_window(b.count, cs_, err, 4);
+        if (prof_on_) gpu_stamp(prof_, (int) (g_->n_layers * kProfPer + 3), cs_);
         cudaGraph_t graph = nullptr;
         const cudaError_t end = cudaStreamEndCapture(cs_, &graph);
         if (!ok || end != cudaSuccess) {
@@ -1216,17 +1257,44 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
             err = "batch verify: graph upload failed"; return false;
         }
         // Bound graph memory when confidence/suffix windows produce many layouts.
-        if (batch_graphs_.size() >= 8) {
+        size_t free_bytes = 0, total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+            cudaGraphExecDestroy(graph_exec);
+            err = "batch verify: cannot query free VRAM"; return false;
+        }
+        const auto reserve_bytes = (size_t) batch_reserve_mib_ * 1048576;
+        while (!batch_graphs_.empty() && (batch_graphs_.size() >= (size_t) batch_cache_limit_ || free_bytes < reserve_bytes)) {
             cudaGraphExecDestroy(batch_graphs_.front().graph);
             batch_graphs_.erase(batch_graphs_.begin());
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+                cudaGraphExecDestroy(graph_exec);
+                err = "batch verify: cannot query free VRAM"; return false;
+            }
+        }
+        if (free_bytes < reserve_bytes) {
+            cudaGraphExecDestroy(graph_exec);
+            err = "batch verify: graph leaves " + std::to_string(free_bytes >> 20) +
+                  " MiB free, below VRAM reserve; reduce expert cache/context";
+            return false;
         }
         batch_graphs_.push_back({std::move(shape), graph_exec});
+        ms_batch_capture += ms_since(capture_start);
+        ++batch_captures;
     }
     groups_[total] = 1;
     batch_replay_ = graph_exec;
     const bool ran = run(total, nullptr, 0, pool, user, nullptr, err);
     batch_replay_ = nullptr;
     if (!ran) return false;
+    if (prof_on_) {
+        cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
+        for (int64_t l = 0; l < g_->n_layers; ++l)
+            for (int stage = 0; stage < 3; ++stage)
+                batch_gpu_ms[stage] += (double) (prof_h_[(size_t) l * kProfPer + 28 + stage] -
+                                                 prof_h_[(size_t) l * kProfPer + 27 + stage]) / 1e6;
+        batch_gpu_ms[3] += (double) (prof_h_[(size_t) g_->n_layers * kProfPer + 3] -
+                                     prof_h_[(size_t) g_->n_layers * kProfPer + 2]) / 1e6;
+    }
     for (const auto& b : batch) {
         Verifier& v = *b.verifier;
         if (v.head_sampling_ && ((!v.sampling_.greedy && v.sampling_.temperature > 0) || v.hist_d_)) {

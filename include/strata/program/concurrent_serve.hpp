@@ -8,6 +8,9 @@
 namespace strata::program {
 struct ConcurrentConfig {
     int requests = 1, rows = 8, window = 4, mtp_window_rows = 4, prefill_chunk = 256;
+    int graph_cache = 8;
+    bool pad_batch = false;
+    bool parallel_batch = false;
     bool depth = false;
     int64_t context = 32768, draft_context = 32768;
     int reserve_mib = 1536, suffix = 0;

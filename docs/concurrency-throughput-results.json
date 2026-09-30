@@ -1,0 +1,42 @@
+{
+  "perf-final-baseline-c1": {
+    "complete": true,
+    "sha256": "609b243b3375e413f565db2c25adfebbfa58a06e7981993c5bafb1d2d790dffa",
+    "requests": 8,
+    "tokens": 8192,
+    "wall_tps": 157.3473749524511,
+    "decode_tps": 162.83395680151264
+  },
+  "perf-final-new-c1": {
+    "complete": true,
+    "sha256": "4eca46ae4b31137a00845b44cf822d99cda34646ad411ab6da88ffe93b447dcc",
+    "requests": 8,
+    "tokens": 8192,
+    "wall_tps": 157.9731294652684,
+    "decode_tps": 162.95954045789028
+  },
+  "perf-final-baseline-c4": {
+    "complete": true,
+    "sha256": "609b243b3375e413f565db2c25adfebbfa58a06e7981993c5bafb1d2d790dffa",
+    "requests": 8,
+    "tokens": 8192,
+    "wall_tps": 106.64254837126767,
+    "decode_tps": 109.69929802984659
+  },
+  "perf-c4-parallel-padded": {
+    "complete": true,
+    "sha256": "256991e0ec951033c25af7a3f1b5976c23b19a04f54cd32698056294af66b010",
+    "requests": 8,
+    "tokens": 8192,
+    "wall_tps": 220.51075809747513,
+    "decode_tps": 235.26355758671903
+  },
+  "perf-final-c4-prefill1024": {
+    "complete": true,
+    "sha256": "4eca46ae4b31137a00845b44cf822d99cda34646ad411ab6da88ffe93b447dcc",
+    "requests": 8,
+    "tokens": 8192,
+    "wall_tps": 217.67943013579455,
+    "decode_tps": 231.18916372298935
+  }
+}

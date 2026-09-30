@@ -409,6 +409,45 @@ int main(int argc, char** argv) {
         if (mismatches || guards || fma_diff == 0) ++bad;
     }
 
+    // Batch row transfers must preserve every bit, including unaligned tails,
+    // for both mapped host and device sources under graph replay.
+    {
+        int mismatches = 0;
+        cudaStream_t stream;
+        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "copy stream");
+        for (int n : {1, 10, 127, 128, 129, 8193, 51200, 256001}) {
+            int32_t *host = nullptr, *mapped = nullptr, *device = nullptr, *out = nullptr;
+            check(cudaHostAlloc(&host, (size_t) n * 4, cudaHostAllocMapped), "copy host");
+            check(cudaHostGetDevicePointer(&mapped, host, 0), "copy mapped");
+            check(cudaMalloc(&device, (size_t) n * 4), "copy device");
+            check(cudaMalloc(&out, (size_t) (n + 2) * 4), "copy output");
+            for (bool from_host : {true, false}) {
+                cudaGraph_t graph;
+                cudaGraphExec_t exec;
+                check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "copy capture");
+                strata::kernels::copy_i32_from_mapped(out + 1, from_host ? mapped : device, n, stream);
+                check(cudaStreamEndCapture(stream, &graph), "copy end capture");
+                check(cudaGraphInstantiate(&exec, graph, 0), "copy instantiate");
+                for (int replay = 0; replay < 2; ++replay) {
+                    for (int i = 0; i < n; ++i) host[i] = (int32_t) ((uint32_t) i * 2654435761u + replay);
+                    check(cudaMemcpy(device, host, (size_t) n * 4, cudaMemcpyHostToDevice), "copy input");
+                    check(cudaMemset(out, 0xA5, (size_t) (n + 2) * 4), "copy guards");
+                    check(cudaGraphLaunch(exec, stream), "copy replay");
+                    check(cudaStreamSynchronize(stream), "copy sync");
+                    std::vector<int32_t> got((size_t) n + 2);
+                    check(cudaMemcpy(got.data(), out, got.size() * 4, cudaMemcpyDeviceToHost), "copy result");
+                    mismatches += (uint32_t) got.front() != 0xA5A5A5A5u;
+                    mismatches += (uint32_t) got.back() != 0xA5A5A5A5u;
+                    for (int i = 0; i < n; ++i) mismatches += got[(size_t) i + 1] != host[i];
+                }
+                cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
+            }
+            cudaFreeHost(host); cudaFree(device); cudaFree(out);
+        }
+        cudaStreamDestroy(stream);
+        std::printf("  batch copies: %d mismatches\n", mismatches);
+        if (mismatches) ++bad;
+    }
     std::printf("\nelementwise: %d failures\n", bad);
     if (bad) return 1;
     if (selftest) std::printf("elementwise_parity OK\n");
