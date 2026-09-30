@@ -5,7 +5,30 @@ from pathlib import Path
 
 
 def requests(report):
-    return {key: item['tokens'] for run in report['runs'] for key, item in run['requests'].items()}
+    return {key: item for run in report['runs'] for key, item in run['requests'].items()}
+
+
+def finish_reason(item):
+    fields = item.get('done', '').split()
+    return fields[5] if len(fields) > 5 and fields[0] == 'DONE' else None
+
+
+def compare(actual, reference):
+    differences = []
+    for key in sorted(actual.keys() | reference.keys()):
+        a, b = actual.get(key), reference.get(key)
+        if a is None or b is None:
+            differences.append(dict(request=key, error='missing request'))
+            continue
+        left, right = a['tokens'], b['tokens']
+        first = next((i for i, (x, y) in enumerate(zip(left, right)) if x != y), None)
+        if first is None and len(left) != len(right):
+            first = min(len(left), len(right))
+        if first is not None or finish_reason(a) != finish_reason(b) or finish_reason(a) is None:
+            differences.append(dict(request=key, first_token_mismatch=first,
+                                    actual_length=len(left), reference_length=len(right),
+                                    actual_finish=finish_reason(a), reference_finish=finish_reason(b)))
+    return differences
 
 
 def main():
@@ -21,7 +44,7 @@ def main():
         report = json.loads(path.read_text())
         rows = report['runs']
         actual = requests(report)
-        total = sum(map(len, actual.values()))
+        total = sum(len(item['tokens']) for item in actual.values())
         wall = sum(row['wall_s'] for row in rows)
         span = sum(row['common_decode_s'] for row in rows)
         overlap = sum((row['aggregate_common_decode_tps'] or 0) * row['common_decode_s'] for row in rows)
@@ -30,8 +53,9 @@ def main():
                       wall_tps=total / wall if wall else None,
                       decode_tps=overlap / span if span else None)
         if reference is not None:
-            differing = sorted(key for key in actual.keys() | reference.keys() if actual.get(key) != reference.get(key))
-            result.update(exact_match=not differing, differing_requests=differing)
+            differences = compare(actual, reference)
+            differing = [item['request'] for item in differences]
+            result.update(exact_match=not differing, differing_requests=differing, differences=differences)
             success &= not differing
         success &= result['complete']
         results[path.stem] = result

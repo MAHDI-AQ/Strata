@@ -1292,8 +1292,35 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
             for (int stage = 0; stage < 3; ++stage)
                 batch_gpu_ms[stage] += (double) (prof_h_[(size_t) l * kProfPer + 28 + stage] -
                                                  prof_h_[(size_t) l * kProfPer + 27 + stage]) / 1e6;
+        constexpr int expert_begin[6] = {28, 19, 20, 21, 22, 23};
+        constexpr int expert_end[6] = {19, 20, 21, 22, 23, 29};
+        for (int64_t l = 0; l < g_->n_layers; ++l)
+            for (int stage = 0; stage < 6; ++stage)
+                batch_expert_ms[stage] += (double) (prof_h_[(size_t) l * kProfPer + expert_end[stage]] -
+                                                    prof_h_[(size_t) l * kProfPer + expert_begin[stage]]) / 1e6;
         batch_gpu_ms[3] += (double) (prof_h_[(size_t) g_->n_layers * kProfPer + 3] -
                                      prof_h_[(size_t) g_->n_layers * kProfPer + 2]) / 1e6;
+        // Inspect one member's already-recorded stamps. Summing all members would
+        // double-count overlapping streams and misrepresent the critical path.
+        auto& member = *batch.front().verifier;
+        if (member.prof_on_) {
+            cudaMemcpy(member.prof_h_.data(), member.prof_, member.prof_h_.size() * 8, cudaMemcpyDeviceToHost);
+            for (int64_t l = 0; l < g_->n_layers; ++l) {
+                const int kind = is_qsa_layer(*g_, l) ? 1 : 0;
+                const auto* stamps = member.prof_h_.data() + l * kProfPer;
+                const int gdn[] = {1, 2, 3, 4, 5, 6, 16, 17, 18};
+                const int qsa[] = {1, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18};
+                auto previous = stamps[0];
+                const int* indices = kind ? qsa : gdn;
+                const int count = kind ? 12 : 9;
+                for (int i = 0; i < count; ++i) {
+                    const int end = indices[i];
+                    if (stamps[end] >= previous)
+                        batch_member_pre_ms[kind][end] += (double) (stamps[end] - previous) / 1e6;
+                    previous = stamps[end];
+                }
+            }
+        }
     }
     for (const auto& b : batch) {
         Verifier& v = *b.verifier;

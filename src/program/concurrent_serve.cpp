@@ -244,6 +244,9 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     int64_t rounds = 0;
     int64_t batch_sizes[5]{};
     const bool profiling = std::getenv("STRATA_CONCURRENT_PROFILE") != nullptr;
+    const char* draft_batch_env = std::getenv("STRATA_BATCH_DRAFT");
+    const bool parallel_drafts = draft_batch_env && std::atoi(draft_batch_env) != 0;
+    const bool trace_rounds = std::getenv("STRATA_CONCURRENT_TRACE") != nullptr;
     double target_ms = 0, draft_ms = 0, commit_ms = 0, adapt_ms = 0, prefill_ms = 0;
     int64_t produced = 0, target_rows = 0;
     auto report_profile = [&]() {
@@ -262,6 +265,26 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                      "gpu_experts_ms=%.1f gpu_post_ms=%.1f gpu_head_ms=%.1f\n",
                      (long long) batch.batch_captures, batch.ms_batch_capture, batch.batch_gpu_ms[0],
                      batch.batch_gpu_ms[1], batch.batch_gpu_ms[2], batch.batch_gpu_ms[3]);
+        if (std::getenv("STRATA_VERIFY_PROFILE"))
+            std::fprintf(stderr, "strata concurrent experts: plan_wait_ms=%.1f resident_ms=%.1f fetch_ms=%.1f pcie_ms=%.1f cpu_wait_ms=%.1f combine_ms=%.1f\n",
+                         batch.batch_expert_ms[0], batch.batch_expert_ms[1], batch.batch_expert_ms[2],
+                         batch.batch_expert_ms[3], batch.batch_expert_ms[4], batch.batch_expert_ms[5]);
+        if (std::getenv("STRATA_EXPERT_PROFILE")) {
+            std::fprintf(stderr, "strata concurrent routing: layers=%lld all_hit=%lld distinct=%lld misses=%lld resident_groups=",
+                         (long long) dispatch.profile_layers, (long long) dispatch.profile_all_hit,
+                         (long long) dispatch.profile_distinct, (long long) dispatch.profile_misses);
+            for (int i = 1; i <= 16; ++i) std::fprintf(stderr, "%s%d:%lld", i == 1 ? "" : ",", i, (long long) dispatch.profile_groups[i]);
+            std::fprintf(stderr, "\n");
+        }
+        if (std::getenv("STRATA_VERIFY_PROFILE")) {
+            for (int kind = 0; kind < 2; ++kind) {
+                std::fprintf(stderr, "strata concurrent first-member pre: kind=%s", kind ? "QSA" : "GDN");
+                for (int i = 1; i <= 18; ++i)
+                    if (batch.batch_member_pre_ms[kind][i] > 0)
+                        std::fprintf(stderr, " stage%d_ms=%.1f", i, batch.batch_member_pre_ms[kind][i]);
+                std::fprintf(stderr, "\n");
+            }
+        }
     };
     auto adapt = [&]() -> bool {
         // All target, commit, prefill and draft work has finished at this boundary. Updating both
@@ -473,11 +496,30 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                     for (auto& w : windows)
                         w.count = (int) std::min<int64_t>(std::max(w.count, c.mtp_window_rows), c.context - w.position);
             }
-            // Stable packing order avoids recapturing a graph merely because fairness rotated the request order.
-            std::sort(windows.begin(), windows.end(), [](const auto& a, const auto& b) {
-                return std::less<core::Verifier*>{}(a.verifier, b.verifier);
+            // Logical slot order is stable across launches. Heap-address order can
+            // change which missed experts run on CPU versus GPU and hence rounding.
+            // Fairness still rotates admission; packing must not rotate with it.
+            auto slot_index = [&](const core::Verifier* verifier) {
+                for (size_t i = 0; i < m.slots.size(); ++i)
+                    if (&m.slots[i]->verify == verifier) return i;
+                return m.slots.size();
+            };
+            std::sort(windows.begin(), windows.end(), [&](const auto& a, const auto& b) {
+                return slot_index(a.verifier) < slot_index(b.verifier);
             });
             const auto start = Clock::now();
+            if (trace_rounds) {
+                std::fprintf(stderr, "round-order %lld", (long long) rounds);
+                for (const auto& w : windows) for (auto* s : ready) if (&s->verify == w.verifier)
+                    std::fprintf(stderr, " %llu:%d", (unsigned long long) s->request.id, w.count);
+                std::fprintf(stderr, "\n");
+            }
+            if (trace_rounds) for (auto* s : ready) {
+                std::fprintf(stderr, "round-input %lld id=%llu pos=%lld count=%d lookup=%d tokens=",
+                             (long long) rounds, (unsigned long long) s->request.id, (long long) s->position, s->count, s->lookup);
+                for (int t = 0; t < s->count; ++t) std::fprintf(stderr, "%s%d", t ? "," : "", s->window[t]);
+                std::fprintf(stderr, "\n");
+            }
             dispatch.failed = false;
             bool ok;
             if (windows.size() == 1) {
@@ -493,7 +535,13 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                 return 1;
             }
             target_ms += elapsed(start);
+            if (trace_rounds) for (auto* s : ready) {
+                std::fprintf(stderr, "round-output %lld id=%llu tokens=", (long long) rounds, (unsigned long long) s->request.id);
+                for (int t = 0; t < s->count; ++t) std::fprintf(stderr, "%s%d", t ? "," : "", s->output[t]);
+                std::fprintf(stderr, "\n");
+            }
             for (const auto& w : windows) target_rows += w.count;
+            std::vector<core::MtpDrafter::DraftRound> draft_rounds;
             for (auto* ptr : ready) {
                 auto& s = *ptr; if (!s.count) continue;
                 int accepted = 0;
@@ -520,10 +568,20 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                 // Catch-up consumes the verified window; limit the extra speculative chain near the context boundary.
                 s.draft->set_max_drafts((int) std::min<int64_t>(c.mtp_window_rows - 1, c.context - (s.position + keep)));
                 const auto draft_start = Clock::now();
-                if (!s.draft->draft(s.count, s.output, s.position, keep - 1, s.drafts, err, s.probability, s.request.spec_min_p)) return 1;
+                if (parallel_drafts)
+                    draft_rounds.push_back({s.draft, s.count, s.output, s.position, keep - 1, s.drafts, s.probability, s.request.spec_min_p});
+                else if (!s.draft->draft(s.count, s.output, s.position, keep - 1, s.drafts, err, s.probability, s.request.spec_min_p)) return 1;
                 draft_ms += elapsed(draft_start);
-                s.policy.observe(s.lookup, s.count, keep - 1, s.match, elapsed(start));
+                if (!parallel_drafts) s.policy.observe(s.lookup, s.count, keep - 1, s.match, elapsed(start));
                 s.current = s.output[keep - 1]; s.position += keep; s.read = s.position;
+            }
+            if (!draft_rounds.empty()) {
+                const auto draft_start = Clock::now();
+                if (!core::MtpDrafter::draft_batch(draft_rounds, err)) return 1;
+                draft_ms += elapsed(draft_start);
+                // Include drafting in the policy's observed round cost in both modes.
+                for (const auto& r : draft_rounds) for (auto* s : ready) if (s->draft == r.drafter)
+                    s->policy.observe(s->lookup, r.count, r.accepted, s->match, elapsed(start));
             }
             ++rounds;
             if (adaptive && rounds % c.adapt_every == 0) {

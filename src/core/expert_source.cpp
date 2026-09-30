@@ -822,6 +822,21 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
+        static const bool profile_groups = std::getenv("STRATA_EXPERT_PROFILE") != nullptr;
+        if (profile_groups) {
+            ++d.profile_layers;
+            d.profile_all_hit += nmiss == 0;
+            d.profile_distinct += nd;
+            d.profile_misses += nmiss;
+            for (int q = 0; q < nd; ++q) {
+                const int64_t first = distinct[q];
+                const int32_t e = ids[first];
+                if (e < 0 || e >= d.n_expert || d.host_res[(size_t) d.layers * d.n_expert + e] < 0) continue;
+                int count = 0;
+                for (int64_t i = first; i < n; ++i) count += first_of[i] == first;
+                ++d.profile_groups[std::min(count, 16)];
+            }
+        }
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;

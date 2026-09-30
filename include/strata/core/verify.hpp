@@ -145,6 +145,8 @@ public:
     double ms_batch_capture = 0;
     int64_t batch_captures = 0;
     double batch_gpu_ms[4] = {}; // member pre, shared expert dispatch, member post, head
+    double batch_member_pre_ms[2][19] = {}; // first member only, not additive across concurrent streams
+    double batch_expert_ms[6] = {}; // wait-plan, resident, fetch, PCIe, wait-CPU, combine
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.

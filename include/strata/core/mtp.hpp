@@ -67,6 +67,19 @@ public:
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
+    struct DraftRound {
+        MtpDrafter* drafter;
+        int count;
+        const int32_t* tokens;
+        int64_t position;
+        int accepted;
+        int32_t* drafts;
+        float* probabilities;
+        float min_probability;
+    };
+    // Advance independent streams one draft depth at a time; no shared mutable state.
+    static bool draft_batch(const std::vector<DraftRound>& batch, std::string& err);
+
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
