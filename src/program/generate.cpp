@@ -1120,11 +1120,11 @@ int main(int argc, char** argv) {
 #if defined(STRATA_USE_HIP)
         std::fprintf(stderr, "strata: concurrent serving currently requires NVIDIA CUDA\n"); return 2;
 #endif
-        if (!o.serve || o.native_preset.empty() || o.mtp.empty() || o.spec < 2 || o.spec > 8 || o.kv != "int8" ||
+        if (!o.serve || o.native_preset.empty() || o.mtp.empty() || o.spec < 2 || o.spec > 8 || (o.kv != "int8" && o.kv != "k8v4" && o.kv != "q4_0") ||
             o.vision || !o.layer_split.empty() || !o.split_device.empty() || o.spec_split ||
             !o.cvec_files.empty() || o.kv_resident || o.expert_cache_remote[0] || o.expert_cache_remote[1] ||
             o.expert_cache_remote[2] || o.expert_profile.empty() || o.expert_cache == 0 || o.no_pool || o.no_capture) {
-            std::fprintf(stderr, "strata: concurrency requires --serve, native experts, MTP/spec, int8 resident KV and a profile-filled cache; vision, control vectors, split verify, KV streaming and multi-GPU are not supported\n");
+            std::fprintf(stderr, "strata: concurrency requires --serve, native experts, MTP/spec, resident int8/k8v4/q4_0 KV and a profile-filled cache; vision, control vectors, split verify, KV streaming and multi-GPU are not supported\n");
             return 2;
         }
     }
@@ -1778,7 +1778,7 @@ int main(int argc, char** argv) {
         config.window = o.spec; config.mtp_window_rows = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         config.prefill_chunk = o.concurrent_prefill; config.context = o.max_context; config.draft_context = o.mtp_window;
         config.reserve_mib = o.vram_reserve_mib; config.mtp_dir = o.mtp; config.spec_min_p = (float) o.spec_min_p;
-        config.suffix = o.suffix_draft; config.eos = o.eos_ids;
+        config.suffix = o.suffix_draft; config.eos = o.eos_ids; config.kv = o.kv;
         config.adapt_every = o.adapt_every; config.adapt_swaps = o.adapt_swaps;
         concurrent = std::make_unique<strata::program::ConcurrentServe>(config);
         if (!concurrent->prepare(g, ss, mtp, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
