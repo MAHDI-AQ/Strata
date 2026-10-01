@@ -8,6 +8,7 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"   // C4: kVerifyMaxT (hand-off buffer sizing)
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include <algorithm>
@@ -536,6 +537,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     std::fflush(stdout);
     auto input = std::make_shared<Input>();
     std::thread([input] {
+        strata::kernels::cpu::adopt_spawn_mask();   // STRATA_AUX_WIDE: not the host loop; do not inherit its core
         std::string line;
         while (std::getline(std::cin, line)) {
             std::unique_lock<std::mutex> lock(input->mutex);
@@ -592,6 +594,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             return v == nullptr || std::atoi(v) != 0;   // default ON; 0 = the pre-change A/B arm
         }();
         if (pump_on) pump = std::jthread([&](std::stop_token stop) {
+            strata::kernels::cpu::adopt_spawn_mask();   // STRATA_AUX_WIDE: the chunk pump is not the host loop
             // jthread's destructor requests stop without a notify; this callback wakes the wait.
             std::stop_callback wake(stop, [&] { m.pump_cv.notify_all(); });
             for (;;) {

@@ -84,6 +84,14 @@ std::vector<int> physical_cores(bool skip_first);
 /// Returns the PREVIOUS affinity mask, or -1 if the platform refused; pass it to `restore_thread_affinity`.
 long long pin_current_thread(int core);
 void restore_thread_affinity(long long previous);
+/// The allowed set as it stood BEFORE the first Strata pin (a `pin_current_thread` return value).
+/// `SessionLoopScratch::init` pins the session loop to ONE core for the engine's life, and a thread spawned
+/// afterwards inherits that single-core mask.  Auxiliary threads that must NOT live on the host's core (the
+/// prefill stagers, the chunk pump, the stdin reader) call `adopt_spawn_mask` at thread start and get the
+/// real allowed set back.  `remember_spawn_mask` is called once by the pin's owner; adoption is opt-in via
+/// `STRATA_AUX_WIDE=1`, so the default behaviour (inherit the host pin) is unchanged.
+void remember_spawn_mask(long long mask);
+void adopt_spawn_mask();
 
 class ExpertPool {
 public:
