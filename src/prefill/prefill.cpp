@@ -1585,6 +1585,75 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     std::vector<int> stage_of(order.size(), -1);
                     // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
                     std::vector<int> job_of(order.size(), -1);
+                    // the layer's staging ends with this scope; it must fire AFTER the stage worker is joined
+                    // (its finish() releases the stager's gates), so it is declared before the stage machinery
+                    StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
+                    // Host-pump lane: the routed non-resident experts' host copies + DMA issues run on a worker
+                    // thread - the D-5 issuer's pattern, applied to the <1024-token chunk path (where the issuer
+                    // is off and the pump used to run every stager->wait and DMA enqueue itself, inside its own
+                    // critical path).  The pump keeps enqueueing the layer's compute and only waits for the DMA
+                    // admission of the entries it consumes.  Same copies, same order, same ring slots: the
+                    // staged bytes are bit-identical to the inline path by construction.
+                    // STRATA_PREFILL_STAGE_THREAD=0 restores the inline (pre-change) path for the A/B.
+                    static const bool stage_thread_on = [] {
+                        const char* v = std::getenv("STRATA_PREFILL_STAGE_THREAD");
+                        return v == nullptr || std::atoi(v) != 0;
+                    }();
+                    std::atomic<size_t> a_staged{0}, a_consumed{0};
+                    std::atomic<bool> a_stop{false}, a_failed{false};
+                    std::string a_err;
+                    double worker_ms = 0;
+                    size_t worker_streamed = 0, worker_dma = 0;
+                    std::thread stage_worker;
+                    struct StageJoin {
+                        std::atomic<bool>* stop;
+                        std::thread* t;
+                        ~StageJoin() { if (t->joinable()) { stop->store(true); t->join(); } }
+                    } stage_join{&a_stop, &stage_worker};
+                    auto stage_worker_fn = [&]() {
+                        strata::kernels::cpu::adopt_spawn_mask();   // STRATA_AUX_WIDE: not the host loop's core
+                        int sn = 0;
+                        for (size_t j = 0; j < order.size(); ++j) {
+                            // the same one-slot-of-headroom the inline lookahead gave the copy stream
+                            while (j >= a_consumed.load(std::memory_order_acquire) + (size_t) STAGE) {
+                                if (a_stop.load(std::memory_order_acquire)) return;
+                                std::this_thread::yield();
+                            }
+                            const int32_t e = order[j];
+                            const bool resident = m.host_res && m.cache &&
+                                                  m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            if (resident) { a_staged.store(j + 1, std::memory_order_release); continue; }
+                            const int sl = sn;
+                            sn = (sn + 1) % STAGE;
+                            const auto th = Clock::now();
+                            const uint8_t* b = m.src->blob(l, e);
+                            if (!b) {
+                                a_err = "prefill: expert source has no blob";
+                                a_failed.store(true, std::memory_order_release);
+                                a_staged.store(order.size(), std::memory_order_release);
+                                return;
+                            }
+                            if (m.src->pinned(l, e)) {
+                                // DMA straight from the page-locked arena: the copy stream only waits for the slot
+                                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+                                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                                ++worker_dma;
+                            } else {
+                                // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
+                                const uint8_t* hb = m.stager->wait(job_of[j]);
+                                if (a_stop.load(std::memory_order_acquire)) return;
+                                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+                                cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                                m.stager->issued_one(job_of[j], m.copy);
+                            }
+                            cudaEventRecord(m.copied[sl], m.copy);
+                            m.stage_live[sl] = true;
+                            stage_of[j] = sl;   // published to the pump with the a_staged release below
+                            worker_ms += ms_since(th);
+                            ++worker_streamed;
+                            a_staged.store(j + 1, std::memory_order_release);
+                        }
+                    };
                     if (!stream_all) {
                         std::vector<Stager::Job> js;
                         for (size_t j = 0; j < order.size(); ++j) {
@@ -1598,7 +1667,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                         m.stager->start(std::move(js));
                     }
-                    StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
+                    if (stage_thread_on && !stream_all && !order.empty()) stage_worker = std::thread(stage_worker_fn);
                     auto stage_one = [&](size_t j) -> bool {
                         const int32_t e = order[j];
                         const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
@@ -1689,7 +1758,31 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                         return true;
                     };
-                    if (!stream_all) {
+                    if (!stream_all && stage_worker.joinable()) {
+                        // the worker stages the layer in order; the pump waits for each entry's admission
+                        // (published after its DMA event is recorded) and enqueues the compute
+                        for (size_t j = 0; j < order.size(); ++j) {
+                            while (a_staged.load(std::memory_order_acquire) <= j) {
+                                if (a_failed.load(std::memory_order_acquire)) break;
+                                std::this_thread::yield();
+                            }
+                            if (a_failed.load(std::memory_order_acquire)) { err = a_err; return false; }
+                            const int32_t e = order[j];
+                            if (stage_of[j] < 0) {
+                                ++stats_.experts_resident;
+                                if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
+                            } else {
+                                pt.mark(kPfWaitCopy, cs);
+                                cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
+                                if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;
+                            }
+                            a_consumed.store(j + 1, std::memory_order_release);
+                        }
+                        if (stage_worker.joinable()) stage_worker.join();
+                        stats_.ms_experts_host += worker_ms;
+                        stats_.experts_streamed += worker_streamed;
+                        stats_.experts_dma += worker_dma;
+                    } else if (!stream_all) {
                         size_t staged = 0;
                         const size_t lookahead = STAGE - 1;
                         for (size_t j = 0; j < order.size(); ++j) {
