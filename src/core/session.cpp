@@ -568,6 +568,8 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
     if (!cores.empty()) {
         pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
         pinned = true;
+        // The pre-pin allowed set, for the auxiliary threads that must not inherit this pin (see pool.hpp).
+        strata::kernels::cpu::remember_spawn_mask(pinned_core);
     }
     return true;
 }

@@ -142,6 +142,21 @@ void restore_thread_affinity(long long previous) {
 }
 
 namespace {
+// The allowed set the process had BEFORE the first Strata pin (`SessionLoopScratch::init`).  A thread
+// spawned after that pin inherits the host's single core; an auxiliary thread adopts this set instead.
+// Opt-in: unset STRATA_AUX_WIDE keeps today's behaviour (the host pin is inherited).
+std::atomic<long long> g_spawn_mask{-1};
+}  // namespace
+
+void remember_spawn_mask(long long mask) { g_spawn_mask.store(mask, std::memory_order_relaxed); }
+
+void adopt_spawn_mask() {
+    if (std::getenv("STRATA_AUX_WIDE") == nullptr) return;   // opt-in A/B arm (see the header)
+    const long long m = g_spawn_mask.load(std::memory_order_relaxed);
+    if (m > 0) restore_thread_affinity(m);
+}
+
+namespace {
 std::atomic<const ExpertPool*> g_diag_pool{nullptr};
 void diag_active_pool(std::FILE* f) {
     if (const ExpertPool* p = g_diag_pool.load()) p->diag(f);
