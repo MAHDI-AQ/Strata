@@ -124,6 +124,7 @@ struct ConcurrentServe::Impl {
             core::SessionState owned;
             core::SessionState* state = nullptr;
             void* arena = nullptr;
+            bool carved = false;      // STRATA_SLOT_LAZY: the arena lives inside the stage cache's allocation
             core::Verifier verify;
             prefill::Prefill prompt;
             void* ple_scratch = nullptr;   // only the stage that holds layer 1 (stage 0 for any legal split)
@@ -147,6 +148,7 @@ struct ConcurrentServe::Impl {
         // is ready.  `read` is the release/acquire hand-off between the two (see the pump).
         std::atomic<bool> active{false};
         bool first = true, lookup = false;
+        bool brought_up = false;   // STRATA_SLOT_LAZY: false until its first admission initializes it
         // P4 live retention: `consumed` is ALSO the conversation this slot's sessions hold. At idle the
         // sessions are exactly the sequence state for those tokens - the invariant every writer keeps:
         // run_chunk appends each read token as prefill consumes it, retire_unit commits the window's kept
@@ -197,16 +199,22 @@ struct ConcurrentServe::Impl {
         cudaStream_t prompt_stream = nullptr;
     };
     std::vector<StageRt> stage_rt;
+    // STRATA_SLOT_LAZY (prepare reads the env; run()'s bringup_slot uses these members).
+    bool lazy_slots = false;
+    int64_t session_k = 0;
+    core::SessionState* primary_state = nullptr;
+    core::MtpDrafter* shared_draft = nullptr;
+    std::vector<int64_t> deferred_bytes;   // session bytes per stage, recorded in prepare()
     ~Impl() {
         // Graphs and draft state must die before the sessions they reference. Slot 0's sessions are borrowed
         // from the CLI; the own per-(slot, stage) arenas are collected first and freed after slots.clear().
-        struct OwnedArena { void* base; core::QsaState* qsa; int device; };
+        struct OwnedArena { void* base; core::QsaState* qsa; int device; bool carved; };
         std::vector<OwnedArena> allocations;
         for (const auto& s : slots)
             for (size_t st = 0; st < s->stages.size(); ++st) {
                 auto& gs = s->stages[st];
                 if (gs.arena) allocations.push_back({gs.arena, gs.owned.qsa_states,
-                                                     st < stages.size() ? stages[st].device : 0});
+                                                     st < stages.size() ? stages[st].device : 0, gs.carved});
             }
         slots.clear();
         for (const auto& a : allocations) {
@@ -216,7 +224,7 @@ struct ConcurrentServe::Impl {
             }
             delete[] a.qsa;
             const core::OnDevice on(a.device);   // the arena was allocated on its stage's device
-            cudaFree(a.base);
+            if (!a.carved) cudaFree(a.base);     // a carved arena is inside the expert cache's allocation
         }
         for (auto& rt : stage_rt) {
             const core::OnDevice on(rt.device);  // the stream/workspace were created on that stage's device
@@ -236,6 +244,26 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
     m.geometry = &g;
     m.stages = stages;   // C4: stage devices and borrowed sessions are read here; run() re-reads the rest
     const auto& c = m.config;
+    // LANE alloc-empty: STRATA_SLOT_LAZY defers an owned slot's stage sessions and its drafter to the
+    // slot's FIRST admission, and carves each session arena from its stage cache's tail.  A boot whose
+    // extra slots stay empty then does not displace expert-cache slots (measured at 5x87.5K: the c8 boot's
+    // three empty slots cost the whole 1.73x prefill wall through the expert cache they shrink).  The
+    // carve makes the released pairs stream, and the residency updates before the next plan keep the
+    // captured graphs safe (adapt()'s doctrine); the round discipline stays serial, so the overlap and
+    // per-member-stream modes are refused.  Default off: unset, every allocation below is the boot-time
+    // one it always was and the engine is byte-identical.
+    m.lazy_slots = [] { const char* v = std::getenv("STRATA_SLOT_LAZY"); return v != nullptr && std::atoi(v) != 0; }();
+    if (m.lazy_slots) {
+        const char* ov = std::getenv("STRATA_STAGE_OVERLAP_CROSSDEV");
+        if (c.parallel_batch || (ov != nullptr && std::atoi(ov) != 0)) {
+            err = "concurrency: STRATA_SLOT_LAZY needs the serial round discipline (unset --batch-parallel and STRATA_STAGE_OVERLAP_CROSSDEV)";
+            return false;
+        }
+        m.deferred_bytes.assign(stages.size(), 0);
+    }
+    m.primary_state = &primary;
+    m.shared_draft = &draft;
+    m.session_k = primary.k;
     static const core::ModelGeometry draft_geometry{};
     for (int i = 0; i < c.requests; ++i) {
         // Register ownership before any allocation that can fail partway through initialization.
@@ -248,6 +276,12 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
             if (i == 0) {
                 // Slot 0 borrows the CLI's chain: the primary on stage 0, the CLI stage sessions beyond it.
                 gs.state = st == 0 ? &primary : stages[st].session;
+            } else if (m.lazy_slots) {
+                // STRATA_SLOT_LAZY: the arena is carved from this stage's expert-cache tail at the slot's
+                // first admission (run()'s bringup_slot).  Record the byte count here, where `primary` is
+                // in scope; `gs.state` is the same owned state the eager branch points at.
+                gs.state = &gs.owned;
+                m.deferred_bytes[st] = (int64_t) core::session_bytes(g, c.context, primary.k, stages[st].lb, stages[st].le);
             } else {
                 // C4 follow-up (C5 reconciliation): an owned stage session carves ONLY its stage's layers -
                 // same range convention as the CLI's per-stage carve (le == -1 resolves to the end).
@@ -270,15 +304,15 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
                 }
             }
         }
-        if (i == 0) s->draft = &draft;
-        else {
+        if (i == 0) { s->draft = &draft; s->brought_up = true; }
+        else if (!m.lazy_slots) {
             s->draft_owner = std::make_unique<core::MtpDrafter>();
             s->draft = s->draft_owner.get();
             // The drafter reads the LAST stage's residual and weights, so it lives on that stage's device.
             const core::OnDevice on(stages.back().device);
             if (!s->draft->load(c.mtp_dir, draft_geometry, *s->stages.back().state, c.window, err, c.draft_context, &draft)) return false;
         }
-        s->draft->set_max_drafts(c.mtp_window_rows - 1);
+        if (!m.lazy_slots || i == 0) s->draft->set_max_drafts(c.mtp_window_rows - 1);
     }
     // C4: stage-owned prompt path, one entry per stage, sized like the stage list.  For a 1-entry list this is
     // C1-B's single workspace/stream (same allocations, same order as before).
@@ -384,6 +418,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // paths chain the same way, and the drafter, the history and on_chunk belong to the LAST stage.
     for (auto& ptr : m.slots) {
         auto& s = *ptr;
+        if (m.lazy_slots && !s.brought_up) continue;   // STRATA_SLOT_LAZY: its first admission initializes it
         for (size_t st = 0; st < m.stages.size(); ++st) {
             const auto& sg = m.stages[st];
             const core::OnDevice on(sg.device);
@@ -954,7 +989,98 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         if (overlap && prev.valid &&
             std::find(prev.ready.begin(), prev.ready.end(), &s) != prev.ready.end()) return false;
         if (s.position.load() >= c.context) return false;
-        if (s.generated >= s.request.max_new) return false;
+        if (s.generated >= s.request.max_new) return false;        return true;
+    };
+    // LANE alloc-empty: STRATA_SLOT_LAZY's deferred per-slot bring-up.  Same calls in the same order as
+    // the boot-time creation (prepare()'s per-slot block, then run()'s), so an on-demand slot is
+    // initialized exactly like a boot-time one; the difference is WHEN and WHERE the memory comes from -
+    // each stage session is carved from that stage cache's tail (the released pairs fall back to
+    // streaming; both residency tables are updated before the next plan, which is what keeps the captured
+    // graphs safe - the adapt() doctrine), and the drafter/verifier allocations draw on the reserve the
+    // auto cache sizing kept for them.  Runs at the safe point: the caller holds the pump fence and the
+    // serial loop has no pass in flight.
+    static constexpr int64_t kLazySlotFloorSlots = 128;   // the caches' shared floor (the lend plan's 128)
+    auto bringup_slot = [&](Impl::Slot& s, std::string& err) -> bool {
+        for (size_t st = 0; st < m.stages.size(); ++st) {
+            const auto& sg = m.stages[st];
+            const core::OnDevice on(sg.device);
+            auto& gs = s.stages[st];
+            uint8_t* base = nullptr;
+            const int64_t first = sg.cache->release_tail_bytes(m.deferred_bytes[st], kLazySlotFloorSlots, &base);
+            if (first < 0) {
+                err = "concurrency: STRATA_SLOT_LAZY: the expert cache's tail cannot hold this slot's session (stage " +
+                      std::to_string(st) + ")";
+                return false;
+            }
+            if (sg.host_res != nullptr) {
+                const int64_t cells = g.n_layers * g.n_expert;
+                for (int64_t i = 0; i < cells; ++i) if (sg.host_res[i] >= first) sg.host_res[i] = core::kNotResident;
+                if (sg.hits.d_res != nullptr &&
+                    cudaMemcpy((void*) sg.hits.d_res, sg.host_res, (size_t) cells * sizeof(int32_t),
+                               cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "concurrency: STRATA_SLOT_LAZY: residency upload failed";
+                    return false;
+                }
+            }
+            if (!core::session_init(g, c.context, m.session_k, base, gs.owned, sg.lb, sg.le)) {
+                err = "concurrency: STRATA_SLOT_LAZY: session initialization failed";
+                return false;
+            }
+            gs.arena = base;
+            gs.carved = true;
+            if (st == 0) {
+                // The PLE is a layer-1 module: only the stage that holds layer 1 wires it (prepare's note).
+                gs.owned.ple = m.primary_state->ple;
+                gs.owned.ple.hist = gs.owned.ple_hist;
+                gs.owned.ple.prev = gs.owned.ple_prev;
+                gs.owned.ple.token = &gs.owned.ple_token;
+                // --batch-parallel is refused for this mode (prepare), so the member-stream scratch stays absent.
+            }
+        }
+        // The drafter: prepare()'s block, including the shared head on the first owned slot that loads it.
+        s.draft_owner = std::make_unique<core::MtpDrafter>();
+        s.draft = s.draft_owner.get();
+        static const core::ModelGeometry draft_geometry{};
+        {
+            const core::OnDevice on(m.stages.back().device);
+            if (!s.draft->load(c.mtp_dir, draft_geometry, *s.stages.back().state, c.window, err, c.draft_context, m.shared_draft)) return false;
+        }
+        s.draft->set_max_drafts(c.mtp_window_rows - 1);
+        // run()'s per-slot block: the verifiers, the prompt chain, the bind and the history.
+        for (size_t st = 0; st < m.stages.size(); ++st) {
+            const auto& sg = m.stages[st];
+            const core::OnDevice on(sg.device);
+            const bool last = st + 1 == m.stages.size();
+            s.stages[st].verify.set_stage_pingpong(sg.lb, last ? -1 : sg.le,
+                                                   st == 0 ? nullptr : m.hand[st - 1].dev[0],
+                                                   last ? nullptr : m.hand[st].dev[0],
+                                                   st == 0 ? nullptr : m.hand[st - 1].dev[1],
+                                                   last ? nullptr : m.hand[st].dev[1]);
+            if (!s.stages[st].verify.init(*sg.wt, g, *s.stages[st].state, sg.hits, sg.head, c.window, err)) return false;
+            s.stages[st].verify.set_pcie_mode(2);
+            if (!last) s.stages[st].verify.set_next(&s.stages[st + 1].verify, user);
+            s.stages[st].prompt.set_stage(sg.lb, last ? -1 : sg.le, last ? nullptr : &s.stages[st + 1].prompt);
+            if (!s.stages[st].prompt.init(*sg.wt, g, *s.stages[st].state, source, sg.cache, sg.host_res,
+                                          c.prefill_chunk, (void*) m.stage_rt[st].prompt_stream, err,
+                                          m.stage_rt[st].prompt_workspace, m.stage_rt[st].prompt_bytes)) return false;
+        }
+        if (!s.draft->bind(*m.stages.back().wt, m.stages.back().head, s.stages[0].verify.final_R_all(), err)) return false;
+        s.history.resize((size_t) c.window * 4096, -1);
+        {
+            const core::OnDevice on(m.stages.back().device);
+            if (cudaMalloc(&s.history_device, s.history.size() * sizeof(int32_t)) != cudaSuccess) {
+                err = "concurrency: STRATA_SLOT_LAZY: penalty buffer allocation failed";
+                return false;
+            }
+        }
+        auto* slot = &s;
+        s.stages.back().prompt.on_chunk = [slot](const float* residual, int64_t n, int64_t position, std::string& e) {
+            std::vector<int32_t> next((size_t) n);
+            for (int64_t j = 0; j < n; ++j) next[(size_t) j] = (int32_t) slot->request.tokens[(size_t) (position + j + 1)];
+            return slot->draft->prefill(residual, next.data(), n, position, e);
+        };
+        s.brought_up = true;
+        std::fprintf(stderr, "strata concurrent: slot-lazy: slot sessions carved from the expert caches' tails\n");
         return true;
     };
     // P4: one slot's admission - the exact sequence the loop always ran (bookkeeping, per-stage reset
@@ -962,6 +1088,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // request the slot's sessions already hold (0 = fresh: zero every stage, today's path). The caller
     // has moved the request in and holds the pump fence; the pump only sees the slot after pump_resume.
     auto admit_slot = [&](Impl::Slot& s, int64_t reused) -> bool {
+        if (m.lazy_slots && !s.brought_up && !bringup_slot(s, err)) return false;
         s.read.store(reused); s.generated = s.offered = s.accepted = 0;
         s.prompt_ms.store(0); s.first = true; s.active.store(true);
         s.position.store((int64_t) s.request.tokens.size() - 1);

@@ -2511,7 +2511,14 @@ int main(int argc, char** argv) {
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         // Concurrent session/prompt storage is already allocated. Reserve for verifiers, graph metadata,
         // draft heads and per-slot prompt host/device staging created after the cache.
-        const int64_t concurrent_mib = concurrent ? 512 + (int64_t) o.concurrency * 256 +
+        // STRATA_SLOT_LAZY (lane alloc-empty): per-slot resources are created at a slot's first admission,
+        // so their spend arrives with the slot; keeping only 2 slots' worth re-credits the empty slots'
+        // share to the expert cache (the sessions themselves are carved from the caches' tails; the fixed
+        // items - graph metadata, the first slots' verifiers, the draft head - stay covered at full
+        // occupancy: measured need 7x(104+149)+890 = 2661 MiB against 2844 MiB reserved at c8).
+        const bool lazy_slots = [] { const char* v = std::getenv("STRATA_SLOT_LAZY"); return v != nullptr && std::atoi(v) != 0; }();
+        const int64_t conc_slot_mib = (int64_t) (lazy_slots ? std::max(2, o.concurrency - 3) : o.concurrency) * 256;
+        const int64_t concurrent_mib = concurrent ? 512 + conc_slot_mib +
             (int64_t) o.batch_rows * 8 + (int64_t) o.batch_graphs * 16 : 0;
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
