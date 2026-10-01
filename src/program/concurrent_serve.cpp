@@ -790,25 +790,42 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // The serial round loop's tail, once per retired unit: acceptance, commit, the printed tokens
     // and the next window's drafts.  Both paths run exactly this.
     auto retire_unit = [&](Unit& u) -> bool {
-        for (auto* ptr : u.ready) {
-            auto& s = *ptr;
-            if (!s.count) continue;
-            // LANE hostloop: a CSTOP processed by an intervening service_input - or by the epilogue
-            // reorder below - has already finished this slot; never finish (DONE) it twice.
-            if (!s.active.load()) continue;
-            // A CSTOP can arrive while this unit's window is in flight (the serial loop only ever
-            // saw CSTOP with nothing in flight): the request was already erased from `live`, so
-            // finish it as cancelled instead of committing its window.
-            if (!live.count(s.request.id)) { finish(s, "cancel"); continue; }
-            int accepted = 0;
-            while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
-            int keep = accepted + 1;
-            bool eos = false;
-            for (int t = 0; t < keep; ++t) if (std::find(c.eos.begin(), c.eos.end(), s.output[t]) != c.eos.end()) {
-                keep = t + 1; eos = true; break;
-            }
+        // LANE hostloop (commit batch): phase 1 decides acceptance and LAUNCHES every slot's commit
+        // chain; phase 2 waits each chain and finishes that slot's epilogue (prints, drafts).  The
+        // per-slot order (commit -> its own draft) and the print order are unchanged; the commit
+        // kernels of different slots now overlap instead of running one-slot-at-a-time.
+        struct Trail { Impl::Slot* s; int keep; bool eos; };
+        std::vector<Trail> trail;
+        trail.reserve(u.ready.size());
+        {
             const auto commit_start = Clock::now();
-            if (!s.stages[0].verify.commit(keep, err)) return false;
+            for (auto* ptr : u.ready) {
+                auto& s = *ptr;
+                if (!s.count) continue;
+                // LANE hostloop: a CSTOP processed by an intervening service_input - or by the epilogue
+                // reorder below - has already finished this slot; never finish (DONE) it twice.
+                if (!s.active.load()) continue;
+                // A CSTOP can arrive while this unit's window is in flight (the serial loop only ever
+                // saw CSTOP with nothing in flight): the request was already erased from `live`, so
+                // finish it as cancelled instead of committing its window.
+                if (!live.count(s.request.id)) { finish(s, "cancel"); continue; }
+                int accepted = 0;
+                while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
+                int keep = accepted + 1;
+                bool eos = false;
+                for (int t = 0; t < keep; ++t) if (std::find(c.eos.begin(), c.eos.end(), s.output[t]) != c.eos.end()) {
+                    keep = t + 1; eos = true; break;
+                }
+                if (!s.stages[0].verify.commit_launch(keep, err)) return false;
+                trail.push_back({&s, keep, eos});
+            }
+            commit_ms += elapsed(commit_start);
+        }
+        for (auto& p : trail) {
+            auto& s = *p.s;
+            const int keep = p.keep;
+            const auto commit_start = Clock::now();
+            if (!s.stages[0].verify.commit_wait(err)) return false;
             commit_ms += elapsed(commit_start);
             produced += keep;
             s.offered += s.count - 1; s.accepted += keep - 1;
@@ -818,8 +835,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             std::fflush(stdout);
             s.first = false;
-            if (eos || s.generated >= s.request.max_new || s.position.load() + keep >= c.context) {
-                finish(s, eos ? "stop" : "length"); continue;
+            if (p.eos || s.generated >= s.request.max_new || s.position.load() + keep >= c.context) {
+                finish(s, p.eos ? "stop" : "length"); continue;
             }
             // Catch-up consumes the verified window; limit the extra speculative chain near the context boundary.
             s.draft->set_max_drafts((int) std::min<int64_t>(c.mtp_window_rows - 1, c.context - (s.position.load() + keep)));

@@ -183,7 +183,9 @@ public:
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
-    bool commit(int n_keep, std::string& err);
+    bool commit(int n_keep, std::string& err);          ///< launch the chain and wait its tail (the pair below)
+    bool commit_launch(int n_keep, std::string& err);   ///< fill + launch this stage's commit and chain on (no wait)
+    bool commit_wait(std::string& err);                 ///< wait the CHAIN TAIL's stream (commit_launch's pair)
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
