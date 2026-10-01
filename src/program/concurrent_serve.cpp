@@ -647,6 +647,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                              watchdog_seconds, progress.where.load());
                 if (auto diag = core::diag_verify_fn().load()) diag(stderr);
                 if (auto diag = core::diag_pool_fn().load()) diag(stderr);
+                core::release_gpu_waits(stderr);   // #267: no spin kernel outlives the process
                 std::fflush(stderr);
                 std::abort();
             }
