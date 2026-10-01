@@ -574,7 +574,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
-                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
+                // R2-revive: the batched tail is open under Q4_0 KV too. kv_append and the
+                // indexer append stay per-token (their batch entry points take host-side
+                // positions, which would go stale on graph replay: batch graphs are keyed
+                // by shape, not position). The q rotation MUST stay under kv_q4 (added to
+                // the qb path below): without it <Hq,Hk> misaligns.
+                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled();
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                 else for (int t = tb; t < te; ++t)
@@ -624,6 +629,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                         return false;
                     }
                     norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
+                    if (st.kv_q4) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) (n * NH), cs);   // <Hq, Hk> = <q, k> (mirrors the per-token path)
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                               N, IQ * ID, n, cs);
                     norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
