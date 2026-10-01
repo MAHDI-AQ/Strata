@@ -1173,8 +1173,8 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const bool chained = le_ < g_->n_layers;   // this stage hands its rows to a next stage
-    if (batch.empty() || batch.size() > 4 || split_) {
-        err = "batch verify: requires 1..4 member windows"; return false;
+    if (batch.empty() || batch.size() > 8 || split_) {
+        err = "batch verify: requires 1..8 member windows"; return false;
     }
     // C2-A1: the chain must be CONTIGUOUS: the next stage starts exactly at this stage's le_,
     // same geometry, and only a last stage may be chained-free.  A missing/mis-ranged next
@@ -1205,12 +1205,12 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
         shape.emplace_back(v, b.count);
     }
     // C2-A6: max_t_ = max(2, c.rows) <= 16 (verify.cpp:149: batch_workspace caps at 16; kVerifyMaxT = 8,
-    // verify_kernels.hpp:21), but the POOL refuses any single call with n_tok * k > kMaxWindowEntries
-    // (128; src/core/expert_source.cpp:974, guards at :982 and :988) and n_tok > MAXT (16;
-    // include/strata/kernels/cpu/expert.hpp:131).  This model: k = ss.k = 10 (verify.cpp:163)
-    // => <= 12 rows/round.  The acceptance configs keep --batch-rows 8.  The split hand-off buffer is
-    // kVerifyMaxT = 8 rows per boundary (generate.cpp:3696-3708) - batch-rows 8 fits EXACTLY; C3
-    // re-sizes it max(kVerifyMaxT, batch_rows).  13+ rows abort the engine LOUDLY at layer 0
+    // verify_kernels.hpp:21), and the POOL accepts any call whose n_tok * k fits kMaxWindowEntries
+    // (160; src/core/expert_source.cpp:974, guards at :982 and :988) and n_tok <= MAXT (16;
+    // include/strata/kernels/cpu/expert.hpp:131).  This model: k = ss.k = 10 (verify.cpp:164)
+    // => the full 16-row workspace envelope is legal; the 8-agent configs run --batch-rows 12..16.
+    // The split hand-off buffer is max(kVerifyMaxT, batch_rows) rows per boundary (generate.cpp:3781) -
+    // a 16-row round fits EXACTLY.  Rows beyond the envelope abort the engine LOUDLY at layer 0
     // (dispatch.failed -> exit 1).  A7's census prints rows= for every capture.
     if (total > max_t_) { err = "batch verify: row budget exceeded"; return false; }
     for (const auto& b : batch)

@@ -188,7 +188,7 @@ private:
     std::vector<BatchGraph> batch_graphs_;
     int batch_cache_limit_ = 8, batch_reserve_mib_ = 0;
     bool batch_parallel_ = false;
-    cudaEvent_t batch_fork_ = nullptr, batch_join_[4] = {};
+    cudaEvent_t batch_fork_ = nullptr, batch_join_[8] = {};
     cudaGraphExec_t batch_replay_ = nullptr;
     static constexpr int kProfPer = 32;              // stamps per layer
     bool prof_on_ = false;

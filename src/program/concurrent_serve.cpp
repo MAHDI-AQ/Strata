@@ -386,7 +386,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     const bool adaptive = c.adapt_every > 0 && c.adapt_swaps > 0;
     if (adaptive) dispatch.usage.assign((size_t) g.n_layers * g.n_expert, 0.0f);
     int64_t rounds = 0;
-    int64_t batch_sizes[5]{};
+    int64_t batch_sizes[9]{};   // one slot per member count 1..8 (pair-combine raise)
     const bool profiling = std::getenv("STRATA_CONCURRENT_PROFILE") != nullptr;
     double target_ms = 0, draft_ms = 0, commit_ms = 0, adapt_ms = 0, prefill_ms = 0;
     int64_t produced = 0, target_rows = 0;
@@ -724,8 +724,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     for (auto& s : m.slots) if (s->active) finish(*s, "cancel");
     for (const auto& r : pending) error(r.id, "server shutting down");
     report_profile();
-    std::fprintf(stderr, "strata concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld\n",
-                 (long long) batch_sizes[1], (long long) batch_sizes[2], (long long) batch_sizes[3], (long long) batch_sizes[4]);
+    std::fprintf(stderr, "strata concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
+                 (long long) batch_sizes[1], (long long) batch_sizes[2], (long long) batch_sizes[3], (long long) batch_sizes[4],
+                 (long long) batch_sizes[5], (long long) batch_sizes[6], (long long) batch_sizes[7], (long long) batch_sizes[8]);
     return 0;
 }
 }

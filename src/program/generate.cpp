@@ -457,7 +457,7 @@ void usage() {
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
-                 "  --concurrency N      experimental shared-model serving, 1..4 requests (default 1)\n"
+                 "  --concurrency N      experimental shared-model serving, 1..8 requests (default 1)\n"
                  "  --batch-rows N       target rows across requests, 1..16 (default 8)\n"
                  "  --batch-graphs N     cached batch layouts, 1..64 (default 8; respects VRAM reserve)\n"
                  "  --batch-padding N    stabilize verification shapes with discarded padding, 0|1 (default 0)\n"
@@ -1212,12 +1212,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata serve: conversation parking does not yet support --layer-split; disable parking with --conversation-cache-mib 0\n");
         return 2;
     }
-    if (o.concurrency < 1 || o.concurrency > 4 || o.batch_rows < 1 || o.batch_rows > 16 ||
+    if (o.concurrency < 1 || o.concurrency > 8 || o.batch_rows < 1 || o.batch_rows > 16 ||
         o.batch_graphs < 1 || o.batch_graphs > 64 ||
         o.batch_padding < 0 || o.batch_padding > 1 ||
         o.batch_parallel < 0 || o.batch_parallel > 1 ||
         (o.batch_policy != "fair" && o.batch_policy != "depth") || o.concurrent_prefill < 256 || o.concurrent_prefill > 1024) {
-        std::fprintf(stderr, "strata: --concurrency 1..4, --batch-rows 1..16, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..1024\n");
+        std::fprintf(stderr, "strata: --concurrency 1..8, --batch-rows 1..16, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..1024\n");
         return 2;
     }
     if (o.concurrency > 1) {
@@ -2479,8 +2479,18 @@ int main(int argc, char** argv) {
         uint64_t used = 0;
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
+        // `auto` sized `o.expert_cache` slots of the LARGEST blob against free-minus-reserve, so that
+        // reserve holds only while the count does not grow: with per-pair sizes the same byte budget
+        // packs MORE pairs (the ladder-B boot packed 7921 into 6082 slots' budget; the fill left 683 MiB
+        // free, below the 700 MiB the batch path needs, and every batch round refused).  Under `auto` the
+        // count is capped at min(auto slots, profile size); an explicit --expert-cache keeps the
+        // byte-budget-only packing.
+        const size_t pair_cap = auto_cache
+            ? (size_t) std::min<int64_t>((int64_t) o.expert_cache, (int64_t) profile.size())
+            : profile.size();
         for (const auto& pr : profile) {
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
+            if (sized_slots.size() >= pair_cap) break;
             if (used + b > cap) break;
             used += b;
             sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
@@ -3593,6 +3603,20 @@ int main(int argc, char** argv) {
         // round waits on: silent wrong tokens, no hang).
     }
     if (concurrent) {
+        if (n_stages > 1) {
+            // C3 follow-up: the stage map is a split boot's durable identity line.  The CLI/serve path
+            // prints it at its verifier setup below, but this path returns before that, so a c>=2 split
+            // boot carried no "layer split" marker at all (the acceptance kit deferred identity to the
+            // node census).  Same text and format here, once; each later stage's device comes from the
+            // stage list (split_same: CUDA0 twice).
+            std::string plan_s = "0-" + std::to_string(split_at[0] - 1) + " (CUDA0)";
+            for (int st = 1; st < n_stages; ++st)
+                plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" +
+                          std::to_string(split_drive.end[st] - 1) +
+                          " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
+            std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window\n",
+                         plan_s.c_str());
+        }
         const int result = concurrent->run(serve_stages, srcp,
                                            n_stages > 1 ? &drive_pool_split : &drive_pool_multi,
                                            n_stages > 1 ? (void*) &split_drive : (void*) &drive,
