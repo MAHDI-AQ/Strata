@@ -1224,11 +1224,20 @@ int main(int argc, char** argv) {
 #if defined(STRATA_USE_HIP)
         std::fprintf(stderr, "strata: concurrent serving currently requires NVIDIA CUDA\n"); return 2;
 #endif
+        // C3: a --layer-split across GPUs is supported by the concurrent path now (the stage list is passed to
+        // both prepare and run); the split's own validation below is concurrency-independent.  --no-token-graph
+        // and the per-layer dumps are refused because they reroute the d_res/host_res staging the concurrent
+        // rounds index (the staging guard lives with the token graph; concurrency never uses that graph).
         if (!o.serve || o.native_preset.empty() || o.mtp.empty() || o.spec < 2 || o.spec > 8 || (o.kv != "int8" && o.kv != "k8v4" && o.kv != "q4_0") ||
-            o.vision || !o.layer_split.empty() || !o.split_device.empty() || o.spec_split ||
+            o.vision || o.spec_split ||
             !o.cvec_files.empty() || o.kv_resident || o.expert_cache_remote[0] || o.expert_cache_remote[1] ||
-            o.expert_cache_remote[2] || o.expert_profile.empty() || o.expert_cache == 0 || o.no_pool || o.no_capture) {
-            std::fprintf(stderr, "strata: concurrency requires --serve, native experts, MTP/spec, resident int8/k8v4/q4_0 KV and a profile-filled cache; vision, control vectors, split verify, KV streaming and multi-GPU are not supported\n");
+            o.expert_cache_remote[2] || o.expert_profile.empty() || o.expert_cache == 0 || o.no_pool || o.no_capture ||
+            o.no_token_graph || !o.dump_layers.empty() || !o.dump_halves.empty()) {
+            std::fprintf(stderr, "strata: concurrency requires --serve, native experts, MTP/spec, resident "
+                                 "int8/k8v4/q4_0 KV and a profile-filled cache; vision, control vectors, split "
+                                 "verify, KV streaming, the helper-GPU expert caches, --no-token-graph and the "
+                                 "layer/half dumps are not supported (a --layer-split across GPUs IS supported; "
+                                 "pass it explicitly)\n");
             return 2;
         }
     }
@@ -2062,8 +2071,13 @@ int main(int argc, char** argv) {
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
+        // C4 integration (design IN-3 / M6): the later stages run their own batch coordinators and
+        // per-stage graph caches after this sizing; mirror the CUDA0 concurrency term so their caches
+        // leave the same room the single-GPU path reserves (else run_batch refuses loudly at first use).
+        const int64_t concurrency_mib = (later && o.concurrency > 1) ? 512 + (int64_t) o.concurrency * 256 +
+            (int64_t) o.batch_rows * 8 + (int64_t) o.batch_graphs * 16 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib : 0) +
-                                 (drafter ? kDrafterMib : 0)) << 20;
+                                 (drafter ? kDrafterMib : 0) + concurrency_mib) << 20;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     if (multi_gpu && split_auto) {
@@ -2261,6 +2275,27 @@ int main(int argc, char** argv) {
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     }
 
+    // ---- C3: THE STAGE DESCRIPTOR LIST (phase A).  Each stage's device and the session slot 0 borrows must
+    // exist BEFORE `prepare` (C4 sizes and allocates the other slots' per-stage sessions from them; stage 0 is
+    // CUDA0 and carries the CLI's primary objects).  The rest of the descriptor -- the layer ranges, the head,
+    // the cache, the residency table and the per-stage hits -- is filled once the caches and the d_res tables
+    // exist (phase B, just above the serve/concurrent branch).  `--split-device 0` (split_same) pushes a second
+    // view of stage 0: the same device, weights and session (the bit-exact A/B).
+    std::vector<strata::program::ServeStage> serve_stages;
+    serve_stages.reserve(split_devs.size() + 2);
+    serve_stages.emplace_back();
+    serve_stages[0].device = 0;
+    serve_stages[0].wt = &wt;
+    serve_stages[0].session = &ss;
+    for (size_t i = 0; i < stages.size(); ++i) {
+        serve_stages.emplace_back();
+        strata::program::ServeStage& sg = serve_stages.back();
+        sg.device = stages[i]->dev;
+        sg.wt = &stages[i]->wt;
+        sg.session = &stages[i]->ss;
+    }
+    if (split_same) serve_stages.push_back(serve_stages[0]);
+
     std::unique_ptr<strata::program::ConcurrentServe> concurrent;
     if (o.concurrency > 1) {
         strata::program::ConcurrentConfig config;
@@ -2274,7 +2309,7 @@ int main(int argc, char** argv) {
         config.suffix = o.suffix_draft; config.eos = o.eos_ids; config.kv = o.kv;
         config.adapt_every = o.adapt_every; config.adapt_swaps = o.adapt_swaps;
         concurrent = std::make_unique<strata::program::ConcurrentServe>(config);
-        if (!concurrent->prepare(g, ss, mtp, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (!concurrent->prepare(g, ss, mtp, serve_stages, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     }
     // Create the additional contexts after MTP has secured CUDA0 memory, but
     // before the host arena maps its expert pages into their address spaces.
@@ -3493,23 +3528,75 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    // ---- C3: THE SPLIT WIRING, SHARED BY THE SERVE PATH AND CONCURRENT MODE (phase B).
+    //
+    // Built once here, after the caches, the d_res staging and the resident-RAM mode are final and immediately
+    // before the branch that consumes it: the stage descriptors complete (ranges, head, cache, host_res, hits,
+    // dispatch), the per-stage VerifyHits (the serve path's vh/vs and the concurrent path's stages[st].hits)
+    // and SplitDrive -- the per-stage plan/cache/pcie view `drive_pool_split` publishes for the layer's stage.
+    // Stage 0 is always CUDA0; n_stages==1 leaves everything inert (the single-GPU engine).  Nothing here
+    // allocates or captures: pointer fills only (the token-path graphs must be captured before the branch).
+    const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
+    auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
+    std::vector<strata::core::VerifyHits> stage_hits((size_t) n_stages);
+    SplitDrive split_drive;
+    stage_hits[0].d_res = thits.d_res;
+    stage_hits[0].cache_base = thits.cache_base;
+    stage_hits[0].blob = thits.blob;
+    stage_hits[0].slot_off = xcache.slot_offsets();
+    stage_hits[0].n_slots = xcache.slots();
+    serve_stages[0].lb = 0;
+    serve_stages[0].le = n_stages > 1 ? split_at[0] : g.n_layers;
+    serve_stages[0].head = (native_head.loaded() && !multi_gpu) ? &native_head : nullptr;
+    serve_stages[0].cache = &xcache;
+    serve_stages[0].host_res = host_res.data();
+    serve_stages[0].hits = stage_hits[0];
+    serve_stages[0].dispatch = &drive.d;
+    for (size_t i = 0; i < stages.size(); ++i) {
+        const size_t st = i + 1;
+        stage_hits[st].d_res = stages[i]->d_res;
+        stage_hits[st].cache_base = stages[i]->cache.device_slot(0);
+        stage_hits[st].blob = thits.blob;
+        stage_hits[st].slot_off = stages[i]->cache.slot_offsets();
+        stage_hits[st].n_slots = stages[i]->cache.slots();
+        serve_stages[st].lb = stages[i]->lb;
+        serve_stages[st].le = stages[i]->le;
+        serve_stages[st].head = stages[i]->head.loaded() ? &stages[i]->head : nullptr;
+        serve_stages[st].cache = &stages[i]->cache;
+        serve_stages[st].host_res = host_res.data();
+        serve_stages[st].hits = stage_hits[st];
+        serve_stages[st].dispatch = &drive.d;
+    }
+    if (split_same) {   // the second view of CUDA0: same session/weights/cache/hits, its own layer range
+        stage_hits[1] = stage_hits[0];
+        serve_stages[1].lb = split_at[0];
+        serve_stages[1].le = g.n_layers;
+        serve_stages[1].head = serve_stages[0].head;
+        serve_stages[1].cache = serve_stages[0].cache;
+        serve_stages[1].host_res = host_res.data();
+        serve_stages[1].hits = stage_hits[1];
+        serve_stages[1].dispatch = &drive.d;
+    }
+    if (n_stages > 1) {
+        split_drive.base = &drive;
+        split_drive.n = n_stages;
+        for (int st = 0; st < n_stages; ++st) {
+            const bool same_view = st == 0 || split_same;
+            split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
+            split_drive.cache_base[st] = same_view ? drive.d.cache_base : stages[(size_t) st - 1]->cache.device_slot(0);
+            split_drive.cache_slot_off[st] = same_view ? drive.d.cache_slot_off : stages[(size_t) st - 1]->cache.slot_offsets();
+            split_drive.pcie_num[st] = pcie_num_of(same_view ? o.pcie_frac : stages[(size_t) st - 1]->pcie_frac);
+        }
+        // split_drive.plan[] keeps its zero-initialized boot state: the serve path fills it from its own
+        // verifiers below, and the concurrent path hands the array to run() as `stage_plans` -- the C4 loops
+        // refresh every entry before each round's dispatch (a stale entry would publish onto a verifier no
+        // round waits on: silent wrong tokens, no hang).
+    }
     if (concurrent) {
-        strata::core::VerifyHits hits;
-        hits.d_res = d_res; hits.cache_base = drive.d.cache_base; hits.blob = drive.d.cache_blob;
-        hits.slot_off = xcache.slot_offsets(); hits.n_slots = xcache.slots();
-        // C1: one stage on CUDA0 carries the CLI's primary objects (single-GPU engine, unchanged).
-        std::vector<strata::program::ServeStage> serve_stages(1);
-        serve_stages[0].device = 0;
-        serve_stages[0].wt = &wt;
-        serve_stages[0].head = &native_head;
-        serve_stages[0].lb = 0;
-        serve_stages[0].le = g.n_layers;
-        serve_stages[0].session = &ss;
-        serve_stages[0].cache = &xcache;
-        serve_stages[0].host_res = host_res.data();
-        serve_stages[0].hits = hits;
-        serve_stages[0].dispatch = &drive.d;
-        const int result = concurrent->run(serve_stages, srcp, &drive_pool_multi, &drive, nullptr, err);
+        const int result = concurrent->run(serve_stages, srcp,
+                                           n_stages > 1 ? &drive_pool_split : &drive_pool_multi,
+                                           n_stages > 1 ? (void*) &split_drive : (void*) &drive,
+                                           n_stages > 1 ? split_drive.plan : nullptr, err);
         if (result) std::fprintf(stderr, "strata concurrent serve: %s\n", err.c_str());
         return result;
     }
@@ -3677,24 +3764,22 @@ int main(int argc, char** argv) {
             return 1;
         }
         strata::core::Verifier ver;
-        strata::core::VerifyHits vh;
-        vh.d_res = thits.d_res;
-        vh.cache_base = thits.cache_base;
-        vh.blob = thits.blob;
-        vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
-        vh.n_slots = xcache.slots();
+        strata::core::VerifyHits vh = stage_hits[0];   // C3: built once in the shared split block (same fields)
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
         strata::core::Verifier ver_same;
-        SplitDrive split_drive;
+        // C3: `split_drive`, `stage_hits`, `n_stages` and `pcie_num_of` are built once in the shared split
+        // block above the branch; both paths consume it.
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
         };
-        auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
-        const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
         if (n_stages > 1) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+            // C3: the row budget is `max(kVerifyMaxT, --batch-rows)` - the one uniform rule for a hand-off
+            // allocation (a batch round carries up to `--batch-rows` rows; the single-request path only ever
+            // reads/writes `T <= kVerifyMaxT` rows from index 0, so oversizing is inert).
+            const int64_t hand_rows = std::max<int64_t>(strata::kernels::kVerifyMaxT, o.batch_rows);
+            const size_t hb = (size_t) hand_rows *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
             for (float*& h : hand) {
@@ -3706,15 +3791,11 @@ int main(int argc, char** argv) {
                 }
                 std::memset(hh, 0, hb);
             }
-            split_drive.base = &drive;
-            split_drive.n = n_stages;
             for (int st = 0; st < n_stages; ++st) {
+                // C3: the ranges and the store stay as they were; `split_drive`'s end/cache/pcie entries are
+                // filled once in the shared split block above the branch.
                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
                                         st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
-                split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
-                split_drive.cache_base[st] = drive.d.cache_base;
-                split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
-                split_drive.pcie_num[st] = pcie_num_of(o.pcie_frac);
             }
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
@@ -3723,16 +3804,8 @@ int main(int argc, char** argv) {
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
-                    strata::core::VerifyHits vs;
-                    vs.d_res = gs.d_res;
-                    vs.cache_base = gs.cache.device_slot(0);
-                    vs.blob = thits.blob;
-                    vs.slot_off = gs.cache.slot_offsets();
-                    vs.n_slots = gs.cache.slots();
+                    strata::core::VerifyHits vs = stage_hits[st];   // C3: built with the descriptor (phase B)
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.spec, err);
-                    split_drive.cache_base[st] = gs.cache.device_slot(0);
-                    split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
-                    split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
                 }
                 if (!ok_s) {
                     std::fprintf(stderr, "strata serve: layer split, stage %d: %s\n", st + 1, err.c_str());
