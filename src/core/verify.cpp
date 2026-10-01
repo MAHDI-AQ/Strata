@@ -1631,14 +1631,33 @@ int Verifier::pass_step(std::string& err) {
 }
 
 bool Verifier::drive_passes(Verifier* a, Verifier* b, std::string& err) {
+    // LANE sched-impl P3 (host-loop O3 counter-only): count consecutive no-progress iterations per
+    // call. Default off (STRATA_DRIVE_HISTO unset = old path, one getenv per call); when on, two ALU
+    // ops per idle iteration plus one stderr line per 512 calls. No wait-posture or logic change.
+    Verifier* acct = a != nullptr ? a : b;
+    const bool counting = acct != nullptr && std::getenv("STRATA_DRIVE_HISTO") != nullptr;
+    uint64_t burst = 0;
+    if (counting) ++acct->drive_calls;
     for (;;) {
         const bool done_a = a == nullptr || a->pass_finished();
         const bool done_b = b == nullptr || b->pass_finished();
-        if (done_a && done_b) return true;
+        if (done_a && done_b) {
+            if (counting && acct->drive_calls % 512 == 0)
+                std::fprintf(stderr, "strata drive idle: calls=%llu iters=%llu maxburst=%llu (STRATA_DRIVE_HISTO)\n",
+                             (unsigned long long) acct->drive_calls, (unsigned long long) acct->drive_idle_iters,
+                             (unsigned long long) acct->drive_idle_maxburst);
+            return true;
+        }
         int progressed = 0;
         if (!done_a) { const int r = a->pass_step(err); if (r < 0) return false; progressed += r; }
         if (!done_b) { const int r = b->pass_step(err); if (r < 0) return false; progressed += r; }
-        if (!progressed) _mm_pause();
+        if (!progressed) {
+            if (counting) {
+                ++acct->drive_idle_iters;
+                if (++burst > acct->drive_idle_maxburst) acct->drive_idle_maxburst = burst;
+            }
+            _mm_pause();
+        } else if (counting) burst = 0;
     }
 }
 
