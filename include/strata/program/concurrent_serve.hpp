@@ -16,6 +16,14 @@ struct ConcurrentConfig {
     int64_t context = 32768, draft_context = 32768;
     int reserve_mib = 1536, suffix = 0;
     int adapt_every = 4, adapt_swaps = 96;
+    // P1-cache-revive: prefix-cache surface for the concurrent path. Off by default
+    // (0 = disabled, mirrors --conversation-cache-mib on the serial path). The #189 core
+    // is in-tree since 0.1.30 but the concurrent/split save/restore lift is not landed, so
+    // any nonzero value is refused at startup; the fields exist so the flag surface is stable
+    // when the lift lands. Kill-switch: 0 (flag or STRATA_CONCURRENT_CACHE_MIB=0).
+    int64_t conversation_cache_mib = 0;
+    int conversation_cache_slots = 4;
+    int64_t conversation_cache_min_free_mib = 2560;
     float spec_min_p = 0.5f;
     std::string mtp_dir;
     std::string kv = "int8";   // resident KV mode (int8, k8v4, q4_0); reported in INFO
