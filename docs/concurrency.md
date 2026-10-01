@@ -1,6 +1,6 @@
 # Experimental concurrent serving
 
-This branch adds configurable shared-model serving for **1–4 requests**. It is based on upstream 0.1.27, commit `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`. Native Windows qualification on an RTX 5090 established exact token parity at c=1, 2, 3 and 4 under the matched numerical settings below. This remains a single-GPU experimental implementation; the qualification is specific to Swift IQ2_XS and the tested configuration, not a guarantee across all models and settings.
+This branch adds configurable shared-model serving for **1–4 requests**, raised to **1–8 requests** in the pair-combine build (the qualification tables below were established at c=1–4). It is based on upstream 0.1.27, commit `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`. Native Windows qualification on an RTX 5090 established exact token parity at c=1, 2, 3 and 4 under the matched numerical settings below. This remains a single-GPU experimental implementation; the qualification is specific to Swift IQ2_XS and the tested configuration, not a guarantee across all models and settings.
 
 The subsequent throughput work adds up to sixteen shared expert rows, optional padded verification and parallel request projections. See [the throughput study](concurrency-throughput.md) for matched measurements, current qualification and recommended settings. The qualification tables later in this document describe the original implementation.
 
@@ -14,7 +14,7 @@ Add these engine arguments to the usual server JSON `args`:
 
 | Option | Values | Meaning |
 | --- | --- | --- |
-| `--concurrency` | 1–4, default 1 | Maximum active sequences; 1 retains the existing serving path |
+| `--concurrency` | 1–8 in the pair-combine build, default 1 | Maximum active sequences; 1 retains the existing serving path |
 | `--batch-rows` | 1–16, default 8 | Total target-verification rows in a scheduling round |
 | `--batch-graphs` | 1–64, default 8 | LRU cache of graph layouts, bounded by available VRAM |
 | `--batch-padding` | 0 or 1, default 0 | Pad short windows to the MTP width when the row budget permits; extra outputs are discarded |

@@ -9,6 +9,8 @@ using strata::program::schedule_rows;
 int main() {
     assert((schedule_rows({4,4,4,4}, 8, false) == std::vector<int>{2,2,2,2}));
     assert((schedule_rows({4,4,4,4}, 16, false) == std::vector<int>{4,4,4,4}));
+    assert((schedule_rows({4,4,4,4,4,4,4,4}, 12, false) == std::vector<int>{2,2,2,2,1,1,1,1}));
+    assert((schedule_rows({4,4,4,4,4,4,4,8}, 16, false) == std::vector<int>{2,2,2,2,2,2,2,2}));
     assert((schedule_rows({4,4,4,4}, 8, true) == std::vector<int>{4,4,0,0}));
     assert((schedule_rows({1,6,2}, 8, false) == std::vector<int>{1,5,2}));
     assert(schedule_rows({}, 8, false).empty());
@@ -35,6 +37,12 @@ int main() {
     for (int invalid : {0,17,32}) {
         bool rejected = false;
         try { schedule_rows({4,4}, invalid, false); } catch (const std::invalid_argument&) { rejected = true; }
+        assert(rejected);
+    }
+    {
+        // The pair-combine raise: 8 requests are accepted, 9 are not.
+        bool rejected = false;
+        try { schedule_rows(std::vector<int>(9, 1), 16, false); } catch (const std::invalid_argument&) { rejected = true; }
         assert(rejected);
     }
     std::cout << checks << " schedule cases passed\n";
