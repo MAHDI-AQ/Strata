@@ -11,6 +11,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -139,13 +140,19 @@ struct ConcurrentServe::Impl {
         spec::SuffixDrafter suffix;
         spec::DraftPolicy policy{8};
         Request request;
-        bool active = false, first = true, lookup = false;
-        int64_t read = 0, position = 0, generated = 0, offered = 0, accepted = 0;
+        // Lane prefill: `active`/`read`/`position`/`prompt_ms` are touched by the pump thread as well as by
+        // the loop.  The gate that keeps them disjoint is `read < position`: only the pump advances `read`
+        // during prompt processing, and the loop only decodes (and re-sets `read = position`) once the slot
+        // is ready.  `read` is the release/acquire hand-off between the two (see the pump).
+        std::atomic<bool> active{false};
+        bool first = true, lookup = false;
+        std::atomic<int64_t> read{0}, position{0};
+        int64_t generated = 0, offered = 0, accepted = 0;
         int32_t current = 0;
         int count = 0, match = 0;
         int32_t drafts[8]{}, lookup_tokens[8]{}, window[8]{}, output[8]{};
         float probability[8]{};
-        double prompt_ms = 0;
+        std::atomic<double> prompt_ms{0};
         Clock::time_point decode_start{};
         ~Slot() {
             // TODO(C4 run-side): free under OnDevice(last stage / stage device) once stages can be non-zero.
@@ -161,8 +168,19 @@ struct ConcurrentServe::Impl {
     // C4: one hand-off buffer per stage boundary (n_stages - 1), mapped pinned and portable: the stages on
     // either side read it from different devices.  All of a stage's slot verifiers and batch coordinators
     // point at the same buffer (C2's packed row0/phase-5 hand-off writes consume it there).
-    struct Boundary { float* host = nullptr; float* dev = nullptr; };
+    struct Boundary { float* host[2] = {}; float* dev[2] = {}; };   // lane overlap: parity A/B
     std::vector<Boundary> hand;
+    // Lane prefill: the chunk pump.  One thread owns every Prefill::run call; the loop thread keeps running
+    // decode rounds while a chunk is in flight (different streams, disjoint slot state).  `pump_paused`
+    // holds it at a chunk boundary for the fences (admission, CSTOP, adapt, exit); `pump_busy` is the
+    // chunk-in-flight flag the fences wait on; `pump_failed`/`pump_err` carry a chunk failure back to the
+    // loop (the loop returns 1 exactly where the inline call used to).
+    std::mutex pump_mutex;
+    std::condition_variable pump_cv;
+    bool pump_paused = false, pump_busy = false;
+    std::atomic<bool> pump_failed{false};
+    std::string pump_err;
+    size_t prompt_rotation = 0;   // pump-owned: which slot's chunk is next (the same fair rotation as before)
     // C1-B/C4: the prompt path is stage-owned, one entry per stage; N=1 keeps exactly one (same resources).
     struct StageRt {
         int device = 0;
@@ -197,7 +215,8 @@ struct ConcurrentServe::Impl {
             if (rt.prompt_stream) cudaStreamDestroy(rt.prompt_stream);
             if (rt.prompt_workspace) cudaFree(rt.prompt_workspace);
         }
-        for (auto& h : hand) if (h.host) cudaFreeHost(h.host);   // C4: the per-boundary mapped hand-off buffers
+        for (auto& h : hand) for (int p = 0; p < 2; ++p)   // C4 + lane overlap: the per-boundary mapped hand-off buffers
+            if (h.host[p]) cudaFreeHost(h.host[p]);
     }
 };
 ConcurrentServe::ConcurrentServe(ConcurrentConfig c) : impl_(std::make_unique<Impl>(std::move(c))) {}
@@ -272,19 +291,27 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
     const size_t hand_bytes = hand_rows * (size_t) core::Verifier::handoff_floats(g) * sizeof(float);
     m.hand.clear();
     for (size_t b = 0; b + 1 < stages.size(); ++b) {
-        float* host = nullptr;
-        if (cudaHostAlloc((void**) &host, hand_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
-            err = "concurrency: the layer-split hand-off allocation failed";
-            return false;
+        // LANE OVERLAP: TWO buffers per boundary (parity A/B).  stage0[N+1] writes one parity while
+        // stage1[N] still reads the other; the captured graphs bake the ACTIVE pointers, so every
+        // verifier's captures are keyed by the parity too (verify.hpp set_stage_pingpong).
+        m.hand.push_back(Impl::Boundary{});
+        auto& boundary = m.hand.back();
+        for (int p = 0; p < 2; ++p) {
+            float* host = nullptr;
+            if (cudaHostAlloc((void**) &host, hand_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                err = "concurrency: the layer-split hand-off allocation failed";
+                return false;
+            }
+            std::memset(host, 0, hand_bytes);
+            float* dev = nullptr;
+            if (cudaHostGetDevicePointer((void**) &dev, host, 0) != cudaSuccess) {
+                cudaFreeHost(host);
+                err = "concurrency: the layer-split hand-off mapping failed";
+                return false;
+            }
+            boundary.host[p] = host;
+            boundary.dev[p] = dev;
         }
-        std::memset(host, 0, hand_bytes);
-        float* dev = nullptr;
-        if (cudaHostGetDevicePointer((void**) &dev, host, 0) != cudaSuccess) {
-            cudaFreeHost(host);
-            err = "concurrency: the layer-split hand-off mapping failed";
-            return false;
-        }
-        m.hand.push_back({host, dev});
     }
     return true;
 }
@@ -331,8 +358,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         auto& b = batch[st];
         b.set_batch_cache(c.graph_cache, c.reserve_mib);
         b.set_batch_parallel(c.parallel_batch);
-        b.set_stage(sg.lb, last ? -1 : sg.le, st == 0 ? nullptr : m.hand[st - 1].dev,
-                    last ? nullptr : m.hand[st].dev);
+        b.set_stage_pingpong(sg.lb, last ? -1 : sg.le,
+                             st == 0 ? nullptr : m.hand[st - 1].dev[0], last ? nullptr : m.hand[st].dev[0],
+                             st == 0 ? nullptr : m.hand[st - 1].dev[1], last ? nullptr : m.hand[st].dev[1]);
         if (!b.init(*sg.wt, g, *m.slots[0]->stages[st].state, sg.hits, sg.head, std::max(2, c.rows), err, true)) return 1;
         b.set_pcie_mode(2); // Match the stock Windows-safe kernel-copy path.
         if (!last) b.set_next(&batch[st + 1], user);
@@ -346,9 +374,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             const auto& sg = m.stages[st];
             const core::OnDevice on(sg.device);
             const bool last = st + 1 == m.stages.size();
-            s.stages[st].verify.set_stage(sg.lb, last ? -1 : sg.le,   // set_stage BEFORE init (verify.hpp:114)
-                                          st == 0 ? nullptr : m.hand[st - 1].dev,
-                                          last ? nullptr : m.hand[st].dev);
+            s.stages[st].verify.set_stage_pingpong(sg.lb, last ? -1 : sg.le,   // set_stage BEFORE init
+                                                   st == 0 ? nullptr : m.hand[st - 1].dev[0],
+                                                   last ? nullptr : m.hand[st].dev[0],
+                                                   st == 0 ? nullptr : m.hand[st - 1].dev[1],
+                                                   last ? nullptr : m.hand[st].dev[1]);
             if (!s.stages[st].verify.init(*sg.wt, g, *s.stages[st].state, sg.hits, sg.head, c.window, err)) return 1;
             s.stages[st].verify.set_pcie_mode(2);
             if (!last) s.stages[st].verify.set_next(&s.stages[st + 1].verify, user);   // user = &split_drive
@@ -388,7 +418,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     int64_t rounds = 0;
     int64_t batch_sizes[9]{};   // one slot per member count 1..8 (pair-combine raise)
     const bool profiling = std::getenv("STRATA_CONCURRENT_PROFILE") != nullptr;
-    double target_ms = 0, draft_ms = 0, commit_ms = 0, adapt_ms = 0, prefill_ms = 0;
+    double target_ms = 0, draft_ms = 0, commit_ms = 0, adapt_ms = 0;
+    std::atomic<double> prefill_ms{0};   // written by the pump thread, read by the profile (lane prefill)
     int64_t produced = 0, target_rows = 0;
     auto report_profile = [&]() {
         if (!profiling || !rounds) return;
@@ -403,7 +434,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                      "draft_ms=%.1f commit_ms=%.1f adapt_ms=%.1f prefill_ms=%.1f "
                      "target_wait_ms=%.1f target_pool_ms=%.1f target_host_ms=%.1f\n",
                      (long long) rounds, (long long) produced, (long long) target_rows, target_ms,
-                     draft_ms, commit_ms, adapt_ms, prefill_ms, wait, pool_ms, host);
+                     draft_ms, commit_ms, adapt_ms, prefill_ms.load(), wait, pool_ms, host);
         std::fflush(stderr);
         std::fprintf(stderr, "strata concurrent detail: captures=%lld capture_ms=%.1f gpu_pre_ms=%.1f "
                      "gpu_experts_ms=%.1f gpu_post_ms=%.1f gpu_head_ms=%.1f\n",
@@ -483,9 +514,113 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         input->cv.notify_all();
     }).detach();
     struct InputGuard { std::shared_ptr<Input> input; ~InputGuard() { std::lock_guard<std::mutex> l(input->mutex); input->closed = true; input->cv.notify_all(); } } guard{input};
+    // ---- lane prefill: the chunk pump -------------------------------------------------------------------
+    // A prompt chunk is a bounded, host-synchronized unit of work (Prefill::run syncs the stage stream at
+    // every MoE layer's routing group, waits on the expert staging, gathers the PLE rows).  Running it on
+    // this loop thread between decode rounds serializes the two: prefill_ms was 26-31% of the mixed-load
+    // wall at c=8.  The pump moves every chunk onto its own thread, so the chunk's host-bound phases
+    // overlap the decode rounds' GPU work instead of alternating with them.  Invariants:
+    //   * ONE chunk in flight (the per-stage prompt workspace/stream are shared by all slots) - the pump
+    //     is serial by construction, in the same fair rotation the loop used;
+    //   * a slot is decodable only when read == position, and only the pump advances `read` during prompt
+    //     processing, so the loop can never observe a half-read prompt (release store in run_chunk);
+    //   * fences (pump_fence/pump_resume) hold the pump at a chunk boundary around admission (session_zero
+    //     runs on the same stage prompt streams), CSTOP (finish of a slot with a chunk in flight), adapt()
+    //     (cache swaps) and exit.  Decode rounds need NO fence: they touch other slots' state only.
+    // STRATA_PREFILL_PUMP=0 keeps the pre-change inline path below for the A/B.
+    auto run_chunk = [&](size_t i, std::string& chunk_err) -> bool {
+        // One bounded prompt chunk for one slot: the same call and the same bookkeeping, whichever thread
+        // runs it (the pump, or this loop when the pump is off).
+        auto& s = *m.slots[i];
+        const int64_t read0 = s.read.load(std::memory_order_acquire);
+        const int64_t n = std::min<int64_t>(c.prefill_chunk, s.position.load(std::memory_order_relaxed) - read0);
+        const auto start = Clock::now();
+        if (!s.stages[0].prompt.run(s.request.tokens.data() + read0, n, read0, chunk_err)) return false;
+        for (int64_t t = 0; t < n; ++t) s.consumed.push_back((int32_t) s.request.tokens[(size_t) (read0 + t)]);
+        const double chunk_ms = elapsed(start);
+        s.prompt_ms.fetch_add(chunk_ms);
+        prefill_ms.fetch_add(chunk_ms);
+        // Release: the consumed rows, prompt_ms and the session state are visible to this loop the moment
+        // its ready check (acquire) sees read == position; the fences order it for the other readers.
+        s.read.store(read0 + n, std::memory_order_release);
+        std::printf("R %llu PP %lld %zu\n", (unsigned long long) s.request.id, (long long) (read0 + n),
+                    s.request.tokens.size());
+        std::fflush(stdout);
+        return true;
+    };
+    std::jthread pump;
+    {
+        const bool pump_on = [] {
+            const char* v = std::getenv("STRATA_PREFILL_PUMP");
+            return v == nullptr || std::atoi(v) != 0;   // default ON; 0 = the pre-change A/B arm
+        }();
+        if (pump_on) pump = std::jthread([&](std::stop_token stop) {
+            // jthread's destructor requests stop without a notify; this callback wakes the wait.
+            std::stop_callback wake(stop, [&] { m.pump_cv.notify_all(); });
+            for (;;) {
+                std::unique_lock<std::mutex> lock(m.pump_mutex);
+                m.pump_cv.wait(lock, [&] {
+                    if (stop.stop_requested()) return true;
+                    if (m.pump_paused) return false;
+                    for (const auto& ptr : m.slots) {
+                        const auto& s = *ptr;
+                        if (s.active.load() && s.read.load(std::memory_order_acquire) < s.position.load(std::memory_order_relaxed))
+                            return true;
+                    }
+                    return false;
+                });
+                if (stop.stop_requested()) return;
+                size_t pick = m.slots.size();
+                for (size_t j = 0; j < m.slots.size(); ++j) {
+                    const size_t i = (m.prompt_rotation + j) % m.slots.size();
+                    const auto& s = *m.slots[i];
+                    if (s.active.load() && s.read.load(std::memory_order_acquire) < s.position.load(std::memory_order_relaxed)) {
+                        pick = i;
+                        break;
+                    }
+                }
+                if (pick == m.slots.size()) continue;   // raced away (cancel/exit); the wait re-checks
+                m.prompt_rotation = (pick + 1) % m.slots.size();
+                m.pump_busy = true;
+                lock.unlock();
+                std::string chunk_err;
+                const bool ok = run_chunk(pick, chunk_err);
+                lock.lock();
+                m.pump_busy = false;
+                if (!ok) {
+                    m.pump_err = chunk_err;
+                    m.pump_failed.store(true, std::memory_order_release);
+                }
+                m.pump_cv.notify_all();
+                if (m.pump_failed.load(std::memory_order_acquire)) return;
+            }
+        });
+    }
+    // Hold the pump at a chunk boundary: it may not START another chunk; one already in flight finishes.
+    auto pump_fence = [&]() -> bool {
+        if (!pump.joinable()) return true;
+        std::unique_lock<std::mutex> lock(m.pump_mutex);
+        m.pump_paused = true;
+        m.pump_cv.notify_all();
+        m.pump_cv.wait(lock, [&] { return !m.pump_busy || m.pump_failed.load(std::memory_order_acquire); });
+        if (m.pump_failed.load(std::memory_order_acquire)) { err = m.pump_err; return false; }
+        return true;
+    };
+    auto pump_resume = [&]() {
+        if (!pump.joinable()) return;
+        std::lock_guard<std::mutex> lock(m.pump_mutex);
+        m.pump_paused = false;
+        m.pump_cv.notify_all();
+    };
+    auto pump_check = [&]() -> bool {   // a chunk failure is reported exactly where the inline call failed
+        if (!m.pump_failed.load(std::memory_order_acquire)) return true;
+        std::lock_guard<std::mutex> lock(m.pump_mutex);
+        err = m.pump_err;
+        return false;
+    };
     std::deque<Request> pending;
     std::unordered_set<uint64_t> live;
-    size_t rotation = 0, prompt_rotation = 0;
+    size_t rotation = 0;   // prompt_rotation is pump-owned (Impl::prompt_rotation)
     const char* watchdog_env = std::getenv("STRATA_WATCHDOG_S");
     const int watchdog_seconds = watchdog_env ? std::max(0, std::atoi(watchdog_env)) : 60;
     watchdog = std::jthread([watchdog_seconds](std::stop_token stop) {
@@ -510,32 +645,162 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     auto finish = [&](Impl::Slot& s, const char* reason) {
         const double decode = s.first ? 0 : elapsed(s.decode_start);
         std::printf("R %llu DONE %lld %zu %.1f %.1f %s %lld %lld 0\n", (unsigned long long) s.request.id,
-                    (long long) s.generated, s.request.tokens.size(), s.prompt_ms, decode, reason,
+                    (long long) s.generated, s.request.tokens.size(), s.prompt_ms.load(), decode, reason,
                     (long long) s.accepted, (long long) s.offered);
         std::fflush(stdout);
         live.erase(s.request.id);
-        s.active = false;
+        s.active.store(false);
     };
-    bool quitting = false;
-    while (!quitting) {
+    // ============================ STAGE-PIPELINE OVERLAP (lane overlap) ============================
+    // stage0[N+1] || stage1[N]: with the hand-off DOUBLE-BUFFERED by parity, stage0 of the next
+    // unit runs on CUDA0 while stage1 of the current unit still reads the other parity on CUDA1.
+    // The two passes in flight own DISJOINT slots (a slot whose window is in flight is excluded
+    // from the next unit until its epilogue drafted the following window), and every mapped-input
+    // write / flag reset / capture happens only after the pass it belongs to has completed (the
+    // driver waits its completion event).  STRATA_STAGE_OVERLAP=0 restores the serial loop; a
+    // single-stage engine or a 3+-stage split never takes this path.
+    // LANE lane-fix-split1: same-device-only until the two-device stage-1
+    // drive stall is root-caused (ladder-D: the stage-1 pass is launched on
+    // the second device but never serviced; the serial loop is proven healthy
+    // on both).  A cross-device split keeps the proven serial loop;
+    // split_same keeps the overlap path below byte-for-byte.
+    const bool same_device = m.stages.size() == 2 && m.stages[0].device == m.stages[1].device;
+    const bool overlap = same_device && [] {
+        const char* v = std::getenv("STRATA_STAGE_OVERLAP");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    cudaEvent_t ev0[2] = {}, ev1[2] = {};
+    bool ev1_valid[2] = {false, false};
+    struct OverlapEventsGuard {   // every exit path of run() destroys them
+        cudaEvent_t* ev0; cudaEvent_t* ev1;
+        ~OverlapEventsGuard() {
+            for (int q = 0; q < 2; ++q) {
+                if (ev0[q]) cudaEventDestroy(ev0[q]);
+                if (ev1[q]) cudaEventDestroy(ev1[q]);
+            }
+        }
+    } overlap_events_guard{ev0, ev1};
+    if (overlap) {
+        for (int q = 0; q < 2; ++q)
+            if (cudaEventCreateWithFlags(&ev0[q], cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&ev1[q], cudaEventDisableTiming) != cudaSuccess) {
+                err = "concurrency: the stage-overlap events failed";
+                return 1;
+            }
+        std::fprintf(stderr, "strata concurrent: stage overlap on: stage0[N+1] runs with stage1[N] "
+                             "(ping-pong hand-off, per-parity captures)\n");
+    }
+    // One round unit: the windows of one iteration, their stage-0 and stage-1 pass owners, and the
+    // slots whose epilogue (acceptance, commit, drafts) is still pending.
+    struct Unit {
+        bool valid = false;
+        bool single = false;                                  // one window vs a batch round
+        int parity = 0;
+        Impl::Slot* slot = nullptr;                           // single: the window's slot
+        int T = 0;
+        const int32_t* tokens = nullptr;
+        int64_t pos0 = 0;
+        int32_t* out = nullptr;
+        std::vector<core::Verifier::BatchWindow> windows;     // batch: the stage-0 members
+        std::vector<core::Verifier::BatchWindow> chain;       // batch: the stage-1 members
+        std::vector<Impl::Slot*> ready;                       // slots whose epilogue is pending
+        core::Verifier* lane0 = nullptr;
+        core::Verifier* lane1 = nullptr;
+        Clock::time_point t_start{};
+    } prev;
+    int unit_parity = 0;
+    auto unit_lane = [&](Unit& u, size_t st) -> core::Verifier* {
+        return u.single ? &u.slot->stages[st].verify : &batch[st];
+    };
+    // Every verifier of a unit runs on the unit's parity: the coordinator (batch) or the slot's
+    // stage chain (single), and the batch members (their phase-5/phase-0 copies bake the pointers).
+    auto unit_parity_set = [&](Unit& u, int q) {
+        if (u.single) {
+            for (size_t st = 0; st < m.stages.size(); ++st) u.slot->stages[st].verify.set_hand_parity(q);
+            return;
+        }
+        for (size_t st = 0; st < m.stages.size(); ++st) {
+            batch[st].set_hand_parity(q);
+            for (const auto& w : u.windows) w.verifier->set_hand_parity(q);
+            for (const auto& w : u.chain) w.verifier->set_hand_parity(q);
+        }
+    };
+    // The serial round loop's tail, once per retired unit: acceptance, commit, the printed tokens
+    // and the next window's drafts.  Both paths run exactly this.
+    auto retire_unit = [&](Unit& u) -> bool {
+        for (auto* ptr : u.ready) {
+            auto& s = *ptr;
+            if (!s.count) continue;
+            // A CSTOP can arrive while this unit's window is in flight (the serial loop only ever
+            // saw CSTOP with nothing in flight): the request was already erased from `live`, so
+            // finish it as cancelled instead of committing its window.
+            if (!live.count(s.request.id)) { finish(s, "cancel"); continue; }
+            int accepted = 0;
+            while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
+            int keep = accepted + 1;
+            bool eos = false;
+            for (int t = 0; t < keep; ++t) if (std::find(c.eos.begin(), c.eos.end(), s.output[t]) != c.eos.end()) {
+                keep = t + 1; eos = true; break;
+            }
+            const auto commit_start = Clock::now();
+            if (!s.stages[0].verify.commit(keep, err)) return false;
+            commit_ms += elapsed(commit_start);
+            produced += keep;
+            s.offered += s.count - 1; s.accepted += keep - 1;
+            for (int t = 0; t < keep; ++t) {
+                s.consumed.push_back(s.window[t]); s.suffix.append(s.output[t]); ++s.generated;
+                std::printf("R %llu T %d\n", (unsigned long long) s.request.id, s.output[t]);
+            }
+            std::fflush(stdout);
+            s.first = false;
+            if (eos || s.generated >= s.request.max_new || s.position.load() + keep >= c.context) {
+                finish(s, eos ? "stop" : "length"); continue;
+            }
+            // Catch-up consumes the verified window; limit the extra speculative chain near the context boundary.
+            s.draft->set_max_drafts((int) std::min<int64_t>(c.mtp_window_rows - 1, c.context - (s.position.load() + keep)));
+            const auto draft_start = Clock::now();
+            if (!s.draft->draft(s.count, s.output, s.position.load(), keep - 1, s.drafts, err, s.probability, s.request.spec_min_p)) return false;
+            draft_ms += elapsed(draft_start);
+            s.policy.observe(s.lookup, s.count, keep - 1, s.match, elapsed(u.t_start));
+            s.current = s.output[keep - 1];
+            s.position.store(s.position.load() + keep);
+            s.read.store(s.position.load());   // prompt done; read tracks position until the next turn
+        }
+        if (overlap)
+            // The drafts are asynchronous on the drafter's stream.  The serial round had a whole
+            // stage-0 pass between them and the next stage-1 pass that overwrites the residual R
+            // they read; the pipeline does not, so the next pass is gated on the drafters' idle.
+            for (auto* ptr : u.ready) if (!ptr->draft->idle(err)) return false;
+        return true;
+    };
+    // The input side: commands, admission and ONE bounded prompt chunk.  In the overlapped loop it
+    // runs at the SAFE POINT (no pass in flight) because the prompt path touches the expert caches
+    // and the drafter state and must never race a decode pass.  Returns 1 on a hard error.
+    auto service_input = [&](bool& quit) -> int {
+        quit = false;
         core::progress().busy.store(!live.empty());
         std::deque<std::string> commands;
         {
             std::unique_lock<std::mutex> lock(input->mutex);
             if (live.empty() && pending.empty()) input->cv.wait(lock, [&] { return !input->lines.empty() || input->eof; });
             commands.swap(input->lines);
-            if (input->eof && commands.empty()) quitting = true;
+            if (input->eof && commands.empty()) quit = true;
             input->cv.notify_all();
         }
+        if (!pump_check()) return 1;   // a chunk failed while this loop was in a round
         for (const auto& line : commands) {
-            if (line == "QUIT") { quitting = true; break; }
+            if (line == "QUIT") { quit = true; break; }
             if (line.rfind("CSTOP ", 0) == 0) {
+                // Fence: a chunk in flight for the cancelled slot must not race finish(); the pump resumes
+                // below with the slot inactive, so it will not pick it again.
+                if (!pump_fence()) return 1;
                 uint64_t id = 0; std::istringstream(line.substr(6)) >> id;
-                for (auto& s : m.slots) if (s->active && s->request.id == id) finish(*s, "cancel");
+                for (auto& s : m.slots) if (s->active.load() && s->request.id == id) finish(*s, "cancel");
                 for (auto p = pending.begin(); p != pending.end();) {
                     if (p->id == id) { error(id, "cancelled before admission"); live.erase(id); p = pending.erase(p); }
                     else ++p;
                 }
+                pump_resume();
                 continue;
             }
             Request request;
@@ -546,14 +811,20 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             live.insert(request.id);
             pending.push_back(std::move(request));
         }
-        if (quitting) break;
+
+        if (quit) return 0;
         core::progress().busy.store(!live.empty());
-        for (auto& ptr : m.slots) if (!ptr->active && !pending.empty()) {
+        // Fence: session_zero and its stream sync run on the stage prompt streams the pump shares.  Only
+        // when a request will actually be admitted - with every slot busy there is nothing to reset.
+        const bool admitting = !pending.empty() &&
+            std::any_of(m.slots.begin(), m.slots.end(), [](const auto& ptr) { return !ptr->active.load(); });
+        if (admitting && !pump_fence()) return 1;
+        for (auto& ptr : m.slots) if (!ptr->active.load() && !pending.empty()) {
             auto& s = *ptr;
             s.request = std::move(pending.front()); pending.pop_front();
-            s.read = s.generated = s.offered = s.accepted = 0;
-            s.prompt_ms = 0; s.first = true; s.active = true;
-            s.position = (int64_t) s.request.tokens.size() - 1;
+            s.read.store(0); s.generated = s.offered = s.accepted = 0;
+            s.prompt_ms.store(0); s.first = true; s.active.store(true);
+            s.position.store((int64_t) s.request.tokens.size() - 1);
             s.current = (int32_t) s.request.tokens.back();
             s.consumed.clear();
             std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
@@ -570,29 +841,45 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             s.draft->reset(); s.draft->set_prompt_len((int64_t) s.request.tokens.size());
             s.stages[0].verify.set_sampling(s.request.sampling);
         }
-        // At most ONE bounded prompt chunk before returning to ready decoders.
+
+        pump_resume();   // new prefillable slots are announced here (a no-op when the pump is off)
         core::progress().busy.store(!live.empty());
-        for (size_t j = 0; j < m.slots.size(); ++j) {
-            const size_t i = (prompt_rotation + j) % m.slots.size();
-            auto& s = *m.slots[i];
-            if (!s.active || s.read >= s.position) continue;
-            const auto start = Clock::now();
-            const auto n = std::min<int64_t>(c.prefill_chunk, s.position - s.read);
-            if (!s.stages[0].prompt.run(s.request.tokens.data() + s.read, n, s.read, err)) return 1;
-            for (int64_t t = 0; t < n; ++t) s.consumed.push_back((int32_t) s.request.tokens[(size_t) (s.read + t)]);
-            s.read += n; s.prompt_ms += elapsed(start);
-            prefill_ms += elapsed(start);
-            std::printf("R %llu PP %lld %zu\n", (unsigned long long) s.request.id, (long long) s.read, s.request.tokens.size());
-            std::fflush(stdout);
-            prompt_rotation = (i + 1) % m.slots.size();
-            break;
+        if (!pump.joinable()) {
+            // A/B arm (STRATA_PREFILL_PUMP=0): the pre-change inline path - at most ONE bounded prompt chunk
+            // before returning to ready decoders, on this thread.
+            for (size_t j = 0; j < m.slots.size(); ++j) {
+                const size_t i = (m.prompt_rotation + j) % m.slots.size();
+                const auto& s = *m.slots[i];
+                if (!s.active.load() || s.read.load() >= s.position.load()) continue;
+                m.prompt_rotation = (i + 1) % m.slots.size();
+                if (!run_chunk(i, err)) return 1;
+                break;
+            }
+        }
+
+        return 0;
+    };
+    bool quitting = false;
+    while (!quitting) {
+        bool quit = false, input_done = false;
+        core::progress().busy.store(!live.empty());
+        if (!(overlap && prev.valid)) {   // nothing in flight: the input side runs now (the original position)
+            if (service_input(quit)) return 1;
+            input_done = true;
+            if (quit) break;
         }
         std::vector<Impl::Slot*> ready;
         std::vector<int> wanted;
         for (size_t j = 0; j < m.slots.size(); ++j) {
             auto& s = *m.slots[(rotation + j) % m.slots.size()];
-            if (!s.active || s.read < s.position) continue;
-            if (s.position >= c.context) { finish(s, "length"); continue; }
+            // Acquire: the pump's release store of `read` publishes its consumed rows and session writes.
+            if (!s.active.load() || s.read.load(std::memory_order_acquire) < s.position.load()) continue;
+            // lane overlap: a slot whose window is still in flight in the previous unit is NOT ready -
+            // its next window's tokens are that unit's epilogue's drafts.  Including it would replay
+            // the in-flight window (a double-generated token).
+            if (overlap && prev.valid &&
+                std::find(prev.ready.begin(), prev.ready.end(), &s) != prev.ready.end()) continue;
+            if (s.position.load() >= c.context) { finish(s, "length"); continue; }
             int n = s.first ? 1 : c.mtp_window_rows;
             if (!s.first && s.request.spec_min_p > 0) {
                 n = 1;
@@ -607,7 +894,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     if (pick.lookup) { n = pick.t; s.lookup = true; }
                 }
             }
-            n = (int) std::min<int64_t>(n, std::min(c.context - s.position, s.request.max_new - s.generated));
+            n = (int) std::min<int64_t>(n, std::min(c.context - s.position.load(), s.request.max_new - s.generated));
             if (n < 1) { finish(s, "length"); continue; }
             ready.push_back(&s); wanted.push_back(n);
         }
@@ -631,9 +918,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
             }
             s.stages[0].verify.set_history(history ? s.history_device : nullptr, history);
-            windows.push_back({&s.stages[0].verify, s.count, s.window, s.position, s.output});
+            windows.push_back({&s.stages[0].verify, s.count, s.window, s.position.load(), s.output});
             win_slots.push_back(&s);
         }
+
         if (!windows.empty()) {
             ++batch_sizes[windows.size()];
             if (c.pad_batch && windows.size() > 1) {
@@ -654,10 +942,16 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             // A stale sink is not a hang: the empty-plan fallback silently drops the resident experts'
             // contribution (verify.cpp:1073-1081), and round parity is the only detector.  A single-window
             // round publishes through the window's slot chain, a batch round through its stage coordinators.
-            for (size_t st = 0; st < m.stages.size(); ++st)
-                if (stage_plans)
-                    stage_plans[st] = windows.size() == 1 ? win_slots.front()->stages[st].verify.plan_sink()
-                                                          : batch[st].plan_sink();
+            for (size_t st = 0; st < m.stages.size(); ++st) {
+                if (!stage_plans) continue;
+                // lane overlap: stage >= 1 belongs to the stage-1 pass STILL IN FLIGHT from the
+                // previous unit; it was refreshed when that pass was launched.  Refreshing it here
+                // would point the in-flight pass's pool at the wrong sink (empty-plan fallback ->
+                // silently wrong tokens).
+                if (overlap && st > 0) continue;
+                stage_plans[st] = windows.size() == 1 ? win_slots.front()->stages[st].verify.plan_sink()
+                                                      : batch[st].plan_sink();
+            }
             dispatch.plan = windows.size() == 1 ? win_slots.front()->stages[0].verify.plan_sink()
                                                 : batch[0].plan_sink();
             // N1 (C2 acceptance kit, env-gated, default off): the stale-sink negative control.  Point stage
@@ -668,7 +962,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 const int stale = std::abs(std::atoi(v)) % (int) m.stages.size();
                 stage_plans[stale] = stage_plans[(stale + 1) % (int) m.stages.size()];
             }
-            bool ok;
+            bool ok = true;
+
+            if (!overlap) {
+                Unit u;   // the serial path: one unit, run to completion (the original loop's shape)
+                u.single = windows.size() == 1;
+                u.ready = ready;
+                u.t_start = start;
             if (windows.size() == 1) {
                 const auto& w = windows.front();
                 ok = win_slots.front()->stages[0].verify.run(w.count, w.tokens, w.position, pool, user, w.output, err);
@@ -679,52 +979,169 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             if (!ok || dispatch.failed) {
                 if (dispatch.failed) err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
+                // K1b: a refused batch capture (free VRAM below the reserve) fails THIS round, not
+                // the engine.  The Verifier destroys the refused graph and caches nothing, so the
+                // next round recaptures cleanly; error the round's requests and stay up for it.
+                // Any other failure (wiring, dispatch, pool) keeps fail-stop semantics.
+                // L3-rebase: serial path only (run_batch lives here); the overlap path below keeps
+                // fail-stop - see lane-l3-rebase/report.md (D1).
+                if (!dispatch.failed && err.find("below VRAM reserve") != std::string::npos) {
+                    for (auto* ptr : ready) {
+                        auto& rs = *ptr;
+                        if (!rs.count) continue;
+                        error(rs.request.id, err);
+                        live.erase(rs.request.id);
+                        rs.active.store(false);
+                        rs.count = 0;
+                    }
+                    std::fprintf(stderr, "strata concurrent: batch round refused (%s); requests errored, engine up\n",
+                                 err.c_str());
+                    rotation = (rotation + 1) % m.slots.size();
+                    continue;
+                }
                 return 1;
             }
+
             target_ms += elapsed(start);
             for (const auto& w : windows) target_rows += w.count;
-            for (auto* ptr : ready) {
-                auto& s = *ptr; if (!s.count) continue;
-                int accepted = 0;
-                while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
-                int keep = accepted + 1;
-                bool eos = false;
-                for (int t = 0; t < keep; ++t) if (std::find(c.eos.begin(), c.eos.end(), s.output[t]) != c.eos.end()) {
-                    keep = t + 1; eos = true; break;
-                }
-                const auto commit_start = Clock::now();
-                if (!s.stages[0].verify.commit(keep, err)) return 1;
-                commit_ms += elapsed(commit_start);
-                produced += keep;
-                s.offered += s.count - 1; s.accepted += keep - 1;
-                for (int t = 0; t < keep; ++t) {
-                    s.consumed.push_back(s.window[t]); s.suffix.append(s.output[t]); ++s.generated;
-                    std::printf("R %llu T %d\n", (unsigned long long) s.request.id, s.output[t]);
-                }
-                std::fflush(stdout);
-                s.first = false;
-                if (eos || s.generated >= s.request.max_new || s.position + keep >= c.context) {
-                    finish(s, eos ? "stop" : "length"); continue;
-                }
-                // Catch-up consumes the verified window; limit the extra speculative chain near the context boundary.
-                s.draft->set_max_drafts((int) std::min<int64_t>(c.mtp_window_rows - 1, c.context - (s.position + keep)));
-                const auto draft_start = Clock::now();
-                if (!s.draft->draft(s.count, s.output, s.position, keep - 1, s.drafts, err, s.probability, s.request.spec_min_p)) return 1;
-                draft_ms += elapsed(draft_start);
-                s.policy.observe(s.lookup, s.count, keep - 1, s.match, elapsed(start));
-                s.current = s.output[keep - 1]; s.position += keep; s.read = s.position;
-            }
+
+                if (!retire_unit(u)) return 1;
             ++rounds;
             if (adaptive && rounds % c.adapt_every == 0) {
+                // Fence: a swap rewrites the residency table and the cache slots the pump reads for chunks.
+                if (!pump_fence()) return 1;
                 const auto adapt_start = Clock::now();
-                if (!adapt()) return 1;
+                const bool adapted = adapt();
                 adapt_ms += elapsed(adapt_start);
+                pump_resume();
+                if (!adapted) return 1;
+            }
+
+                if (rounds % 64 == 0) report_profile();
+            } else {
+                // Unit U_i: launch its stage-0 pass on this unit's parity, drive it together with the
+                // PREVIOUS unit's stage-1 pass (which still reads the other parity), then close both
+                // and run the previous unit's epilogue.  U_i's stage-1 pass is launched at the safe
+                // point below and runs during the NEXT iteration - that is the overlap.
+                Unit u;
+                u.single = windows.size() == 1;
+                u.parity = unit_parity;
+                u.ready = ready;
+                u.t_start = Clock::now();
+                if (u.single) {
+                    Impl::Slot* s0 = win_slots.front();
+                    u.slot = s0;
+                    u.T = s0->count;
+                    u.tokens = s0->window;
+                    u.pos0 = s0->position;
+                    u.out = s0->output;
+                } else {
+                    u.windows = windows;
+                    u.chain.reserve(windows.size());
+                    for (const auto& w : windows)
+                        u.chain.push_back({w.verifier->next(), w.count, w.tokens, w.position, w.output});
+                }
+                u.lane0 = unit_lane(u, 0);
+                u.lane1 = unit_lane(u, 1);
+                unit_parity_set(u, u.parity);
+                // The stage-1 pass of the unit TWO back read this parity's buffers; its completion
+                // event gates the overwrite (the ping-pong's WAR edge).
+                if (ev1_valid[u.parity] &&
+                    cudaStreamWaitEvent(u.lane0->stream(), ev1[u.parity], 0) != cudaSuccess) {
+                    err = "concurrency: the stage-overlap buffer gate failed";
+                    return 1;
+                }
+                ok = u.single ? u.lane0->begin_pass_window(u.T, u.tokens, u.pos0, pool, user, ev0[u.parity], err)
+                              : u.lane0->begin_pass_batch(u.windows, pool, user, ev0[u.parity], err);
+                if (!ok) return 1;
+                if (!core::Verifier::drive_passes(u.lane0, prev.valid ? prev.lane1 : nullptr, err)) return 1;
+                if (u.single) { if (!u.lane0->end_pass_window(u.T, nullptr, err)) return 1; }
+                else { if (!u.lane0->end_pass_batch(u.windows, err)) return 1; }
+                if (prev.valid) {
+                    if (prev.single) { if (!prev.lane1->end_pass_window(prev.T, prev.out, err)) return 1; }
+                    else { if (!prev.lane1->end_pass_batch(prev.chain, err)) return 1; }
+                    target_ms += elapsed(prev.t_start);
+                    target_rows += prev.single ? prev.T : [&] { int64_t r = 0; for (const auto& w : prev.windows) r += w.count; return r; }();
+                    if (!retire_unit(prev)) return 1;
+                    prev.valid = false;
+                }
+                if (dispatch.failed) {
+                    err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
+                    return 1;
+                }
+                if (!input_done) { if (service_input(quit)) return 1; input_done = true; }
+                if (!quit) {
+                    // Launch U_i's stage-1 pass, gated on ITS stage-0 completion event ONLY.  The
+                    // stage>=1 plan sinks are refreshed here: the pool routes by layer through
+                    // split_drive.plan, so the two units in flight publish to their own stage's sink.
+                    if (cudaStreamWaitEvent(u.lane1->stream(), ev0[u.parity], 0) != cudaSuccess) {
+                        err = "concurrency: the stage-overlap gate failed";
+                        return 1;
+                    }
+                    unit_parity_set(u, u.parity);
+                    for (size_t st = 1; st < m.stages.size(); ++st)
+                        if (stage_plans)
+                            stage_plans[st] = u.single ? u.slot->stages[st].verify.plan_sink() : batch[st].plan_sink();
+                    ok = u.single ? u.lane1->begin_pass_window(u.T, u.tokens, u.pos0, pool, user, ev1[u.parity], err)
+                                  : u.lane1->begin_pass_batch(u.chain, pool, user, ev1[u.parity], err);
+                    if (!ok) return 1;
+                    ev1_valid[u.parity] = true;
+                    prev = std::move(u);
+                    prev.valid = true;
+                } else {
+                    prev.valid = false;
+                }
+                unit_parity ^= 1;
+                ++rounds;
+                if (adaptive && rounds % c.adapt_every == 0) {
+                    // Fence: a swap rewrites the residency table and the cache slots the pump reads for chunks.
+                    if (!pump_fence()) return 1;
+                    const auto adapt_start = Clock::now();
+                    const bool adapted = adapt();
+                    adapt_ms += elapsed(adapt_start);
+                    pump_resume();
+                    if (!adapted) return 1;
+                }
+                if (rounds % 64 == 0) report_profile();
+            }
+        } else if (overlap && prev.valid) {
+            // Nothing to launch: finish the previous unit (its stage-1 pass is the only thing in flight).
+            if (!core::Verifier::drive_passes(nullptr, prev.lane1, err)) return 1;
+            if (prev.single) { if (!prev.lane1->end_pass_window(prev.T, prev.out, err)) return 1; }
+            else { if (!prev.lane1->end_pass_batch(prev.chain, err)) return 1; }
+            target_ms += elapsed(prev.t_start);
+            target_rows += prev.single ? prev.T : [&] { int64_t r = 0; for (const auto& w : prev.windows) r += w.count; return r; }();
+            if (!retire_unit(prev)) return 1;
+            prev.valid = false;
+            if (dispatch.failed) {
+                err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
+                return 1;
+            }
+            if (!input_done) { if (service_input(quit)) return 1; input_done = true; }
+            ++rounds;
+            if (adaptive && rounds % c.adapt_every == 0) {
+                // Fence: a swap rewrites the residency table and the cache slots the pump reads for chunks.
+                if (!pump_fence()) return 1;
+                const auto adapt_start = Clock::now();
+                const bool adapted = adapt();
+                adapt_ms += elapsed(adapt_start);
+                pump_resume();
+                if (!adapted) return 1;
             }
             if (rounds % 64 == 0) report_profile();
         }
+        if (pump.joinable() && windows.empty() && !prev.valid && !quit) {
+            // Nothing to parse and no ready window: the pump is the only producer.  Wait for input (or a
+            // 2 ms tick) instead of spinning; the next round starts as soon as a chunk completes a prompt.
+            std::unique_lock<std::mutex> lock(input->mutex);
+            input->cv.wait_for(lock, std::chrono::milliseconds(2), [&] { return !input->lines.empty() || input->eof; });
+        }
+        if (quit) break;
         rotation = (rotation + 1) % m.slots.size();
     }
-    for (auto& s : m.slots) if (s->active) finish(*s, "cancel");
+    if (pump.joinable()) { pump.request_stop(); m.pump_cv.notify_all(); pump.join(); }   // the stop_callback also wakes it
+    if (!pump_check()) return 1;
+    for (auto& s : m.slots) if (s->active.load()) finish(*s, "cancel");
     for (const auto& r : pending) error(r.id, "server shutting down");
     report_profile();
     std::fprintf(stderr, "strata concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
