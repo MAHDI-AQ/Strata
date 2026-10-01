@@ -496,6 +496,16 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s\n",
                 c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.kv.c_str(), c.suffix, adaptive ? "adaptive" : "static");
     std::printf("READY %lld stop multiplex\n", (long long) c.context);
+    // LANE sched-impl P2 (host-loop O1/O2 surface): echo the effective spin posture so the primary's
+    // A/B reads off this log line. Zero wait-posture change: the knobs are honored where they already
+    // were (STRATA_REMOTE_SPIN in remote_experts.cpp, STRATA_POOL_SPIN_US in pool.cpp); unset = old path.
+    {
+        const char* remote_spin = std::getenv("STRATA_REMOTE_SPIN");
+        const char* pool_spin = std::getenv("STRATA_POOL_SPIN_US");
+        std::fprintf(stderr, "strata concurrent: spin posture remote_spin=%s pool_spin_us=%s (defaults: spin|maphost, 20000us)\n",
+                     (remote_spin && remote_spin[0]) ? remote_spin : "(unset:spin)",
+                     (pool_spin && pool_spin[0]) ? pool_spin : "(unset:20ms)");
+    }
     std::fflush(stdout);
     auto input = std::make_shared<Input>();
     std::thread([input] {
