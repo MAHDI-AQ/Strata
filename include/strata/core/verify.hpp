@@ -295,6 +295,9 @@ private:
     std::chrono::steady_clock::time_point pass_wait_start_{};   ///< when the CURRENT layer's wait began
     std::chrono::steady_clock::time_point pass_last_flush_{};   ///< the last cudaStreamQuery of the stall check
     bool pass_wait_reported_ = false;
+    cudaEvent_t deferred_done_ = nullptr; ///< R2 (split1): a pass's completion event, recorded at
+                                          ///< the pass-end sync (end_pass_window/end_pass_batch);
+                                          ///< launch_pass documents why it is not recorded at launch.
     uint32_t pass_fetches_at_launch_ = 0; ///< sync invariant (rebase): fetches_ as seen by
                                        ///< launch_pass; end_pass_* syncs copy_ only when a
                                        ///< fetch_dma(n > 0) landed after it        ///< progress_at was published for this layer's wait
