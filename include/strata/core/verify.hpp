@@ -31,6 +31,7 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -84,6 +85,30 @@ public:
     // Row packing: member i's rows start at row0 = sum of counts[j], j < i — identical rows land at
     // identical offsets in every stage by construction. Attention, recurrence and commit stay per member.
     bool run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user, std::string& err);
+
+    // ============================ STAGE-PIPELINE OVERLAP (lane overlap) ============================
+    // A PASS is one stage's graph execution for one round unit: begin_pass_* stages the inputs,
+    // captures/replays this stage's graph for (shape, parity), launches it on cs_ and records `done`
+    // after the launch (it fires when the graph, hand-off copies included, has completed).  NO host
+    // loop runs inside begin_pass_*: pass_step() services one doorbell at a time, so TWO passes on
+    // two stages can be driven interleaved by drive_passes() - stage0[N+1] on CUDA0 while stage1[N]
+    // on CUDA1 still reads the OTHER parity's hand-off.  end_pass_* closes a pass (syncs, counters,
+    // prof; a last stage also samples and copies its outputs).  The serial run()/run_batch() paths
+    // are unchanged and do not use this API.
+    bool begin_pass_window(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user,
+                           cudaEvent_t done, std::string& err);
+    bool begin_pass_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user,
+                          cudaEvent_t done, std::string& err);
+    /// Poll one doorbell of a begun pass: 1 = one layer/group serviced, 0 = not ready yet (the
+    /// stall check and the 20 s bound run inside), -1 = the pass failed (err set).
+    int pass_step(std::string& err);
+    bool pass_finished() const { return !pass_live_ || pass_k_ >= pass_total_; }
+    bool end_pass_window(int T, int32_t* out, std::string& err);
+    bool end_pass_batch(const std::vector<BatchWindow>& batch, std::string& err);
+    /// Service two begun passes' doorbells, interleaved, until both are finished.  Either may be null.
+    static bool drive_passes(Verifier* a, Verifier* b, std::string& err);
+    /// The stream a pass runs on (the overlap driver gates cross-stream event waits on it).
+    cudaStream_t stream() const { return cs_; }
     // Configure before init; CLI validation supplies a positive bounded cache limit.
     void set_batch_cache(int limit, int reserve_mib) { batch_cache_limit_ = limit; batch_reserve_mib_ = reserve_mib; }
     void set_batch_parallel(bool enabled) { batch_parallel_ = enabled; }
@@ -119,11 +144,35 @@ public:
     /// Both pointers must be device-visible (mapped pinned memory, portable when the stages are on two devices).
     /// Set before `init`.  Default: the whole model, no hand-off.
     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
-        lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
+        lb_ = layer_begin; le_ = layer_end;
+        hand_in_pairs_[0] = hand_in_pairs_[1] = handoff_in;
+        hand_out_pairs_[0] = hand_out_pairs_[1] = handoff_out;
+        hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
+    /// STAGE-PIPELINE OVERLAP (lane overlap): a PING-PONG hand-off.  Two buffer pairs (parities A/B) are
+    /// installed; `set_hand_parity` selects the ACTIVE pair before a pass begins.  stage0[N+1] writes parity
+    /// (N+1)&1 while stage1[N] still reads parity N&1, so the two passes can be in flight at once.  The
+    /// captured graphs bake the active pointers, so captures are keyed by the parity as well.  The serial
+    /// engine keeps `set_stage` (both parities hold the same pointers).
+    void set_stage_pingpong(int64_t layer_begin, int64_t layer_end,
+                            const float* in_a, float* out_a, const float* in_b, float* out_b) {
+        lb_ = layer_begin; le_ = layer_end;
+        hand_in_pairs_[0] = in_a; hand_out_pairs_[0] = out_a;
+        hand_in_pairs_[1] = in_b; hand_out_pairs_[1] = out_b;
+        hand_in_ = in_a; hand_out_ = out_a; parity_ = 0;
+    }
+    void set_hand_parity(int p) {
+        parity_ = p & 1;
+        hand_in_ = hand_in_pairs_[parity_];
+        hand_out_ = hand_out_pairs_[parity_];
+    }
+    int hand_parity() const { return parity_; }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    /// The next stage of the chain (null on a last stage): the stage-pipeline driver derives a batch
+    /// unit's stage-1 member list from it (the serial chain derives the same list in run_batch).
+    Verifier* next() const { return next_; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -176,8 +225,11 @@ private:
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
-    const float* hand_in_ = nullptr;
+    const float* hand_in_ = nullptr;     ///< the ACTIVE hand-off pair (set_hand_parity selects)
     float* hand_out_ = nullptr;
+    const float* hand_in_pairs_[2] = {}; ///< the ping-pong pairs (set_stage: both the same pointers)
+    float* hand_out_pairs_[2] = {};
+    int parity_ = 0;                     ///< the active parity; the captures are keyed by it
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
@@ -189,7 +241,12 @@ private:
     bool record_window(int T, cudaStream_t cs, std::string& err, int phase = -1, int64_t layer = 0,
                        int64_t row0 = 0);
     bool stage_inputs(int T, const int32_t* tokens, int64_t pos0, std::string& err);
-    struct BatchGraph { std::vector<std::pair<Verifier*, int>> shape; cudaGraphExec_t graph = nullptr; };
+    /// C2: the shared batch-round preparation (validation, per-member staging, graph lookup and
+    /// capture) - run_batch (serial) and begin_pass_batch (stage-pipeline overlap) both call it.
+    bool prepare_batch(const std::vector<BatchWindow>& batch, int& total,
+                       std::vector<std::pair<Verifier*, int>>& shape, cudaGraphExec_t& graph_exec,
+                       std::string& err);
+    struct BatchGraph { std::vector<std::pair<Verifier*, int>> shape; int parity = 0; cudaGraphExec_t graph = nullptr; };
     std::vector<BatchGraph> batch_graphs_;
     int batch_cache_limit_ = 8, batch_reserve_mib_ = 0;
     bool batch_parallel_ = false;
@@ -213,8 +270,28 @@ private:
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t exec_[9] = {};
+    cudaGraphExec_t exec_[2][9] = {};   ///< [parity][T]: the hand-off pointers are baked into the capture
     cudaGraphExec_t commit_exec_ = nullptr;
+
+    // ---- stage-pipeline overlap: the pass begun by begin_pass_* and serviced by pass_step ----
+    bool pass_live_ = false;            ///< a pass is begun and not yet finished
+    int64_t pass_k_ = 0;                ///< doorbells serviced in this pass
+    int64_t pass_total_ = 0;            ///< (le_-lb_) * G of this pass
+    PoolMultiFn pass_pool_ = nullptr;   ///< the pool of this pass (its stage's dispatch)
+    void* pass_user_ = nullptr;
+    std::chrono::steady_clock::time_point pass_wait_start_{};   ///< when the CURRENT layer's wait began
+    std::chrono::steady_clock::time_point pass_last_flush_{};   ///< the last cudaStreamQuery of the stall check
+    bool pass_wait_reported_ = false;
+    uint32_t pass_fetches_at_launch_ = 0; ///< sync invariant (rebase): fetches_ as seen by
+                                       ///< launch_pass; end_pass_* syncs copy_ only when a
+                                       ///< fetch_dma(n > 0) landed after it        ///< progress_at was published for this layer's wait
+    bool launch_pass(int T, cudaEvent_t done, std::string& err);
+    bool service_one(int64_t k, PoolMultiFn pool, void* user, std::string& err);
+    bool pass_doorbell(uint32_t want) const { return *(volatile uint32_t*) h_seq_ >= want; }
+    bool pass_stall(uint32_t want, int64_t l, std::chrono::steady_clock::time_point wait_start,
+                    std::chrono::steady_clock::time_point& last_flush, std::string& err);
+    void pass_prof_dump();
+    bool pass_finish_outputs(int T, int32_t* out, std::string& err);
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T

@@ -122,8 +122,9 @@ Verifier::~Verifier() {
     for (auto& b : batch_graphs_) if (b.graph) cudaGraphExecDestroy(b.graph);
     if (batch_fork_) cudaEventDestroy(batch_fork_);
     for (auto e : batch_join_) if (e) cudaEventDestroy(e);
-    for (auto& e : exec_)
-        if (e) cudaGraphExecDestroy(e);
+    for (auto& row : exec_)
+        for (auto& e : row)
+            if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
     if (cs_) cudaStreamDestroy(cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
@@ -856,7 +857,7 @@ std::string Verifier::profile_report() {
 }
 
 bool Verifier::capture(int T, std::string& err) {
-    if (exec_[T] != nullptr) return true;
+    if (exec_[parity_][T] != nullptr) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;
@@ -905,13 +906,13 @@ bool Verifier::capture(int T, std::string& err) {
         std::fprintf(stderr, "\n");
     }
 #endif
-    const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
+    const cudaError_t ie = cudaGraphInstantiate(&exec_[parity_][T], graph, 0);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
         err = std::string("verify: instantiate: ") + cudaGetErrorString(ie);
         return false;
     }
-    const cudaError_t ue = cudaGraphUpload(exec_[T], cs_);
+    const cudaError_t ue = cudaGraphUpload(exec_[parity_][T], cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
                  cudaGetErrorString(ue), cudaGetErrorString(us));
@@ -1025,131 +1026,50 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const OnDevice on_device(device_);
     g_diag_verifier.store(this);
     const ModelGeometry& g = *g_;
-    SessionState& ss = *ss_;
     const Clock::time_point t0 = Clock::now();
     if (T < 1 || T > max_t_ || (!batch_replay_ && T > strata::kernels::kVerifyMaxT)) {
         err = "verify: window size out of range"; return false;
     }
     if (!batch_replay_ && (!capture(T, err) || !capture_commit(err) || !stage_inputs(T, tokens, pos0, err))) return false;
-    *(volatile uint32_t*) h_seq_ = 0;
-    *(volatile uint32_t*) h_flag_ = 0;
-    *(volatile uint32_t*) h_flagA_ = 0;
-    *(volatile uint32_t*) h_flagB_ = 0;
-    std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
     if (!batch_replay_) for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
-    VDBG("staged; launching\n");
-    const uint32_t fetches_at_launch = fetches_.load(std::memory_order_relaxed);
-    const cudaError_t le = cudaGraphLaunch(batch_replay_ ? batch_replay_ : exec_[T], cs_);
-    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs_);
-    VDBG("launched\n");
-    volatile uint32_t* const seq = h_seq_;
-    volatile uint32_t* const flag = h_flag_;
+    if (!launch_pass(T, nullptr, err)) return false;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
-    const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     for (int64_t k = 0; k < (le_ - lb_) * G; ++k) {
         const int64_t l = lb_ + k / G;
-        const int grp = (int) (k % G);
         const uint32_t want = (uint32_t) (k + 1);
         const Clock::time_point a = Clock::now();
         auto last_flush = a;
         uint32_t spins = 0;
         progress_at("verify window: waiting for the GPU to reach layer", l);
-        while (*seq < want) {
+        while (!pass_doorbell(want)) {
             _mm_pause();
             if ((++spins & 1023u) != 0) continue;
-            const auto now = Clock::now();
-            if (now - last_flush > std::chrono::microseconds(2000)) {
-                last_flush = now;
-                const cudaError_t q = cudaStreamQuery(cs_);
-                if (q != cudaErrorNotReady && *seq < want) {
-                    err = "verify: layer " + std::to_string(l) + " never rang (" +
-                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
-                    return false;
-                }
-            }
-            if (now - a > std::chrono::seconds(20)) { err = "verify: timed out at layer " + std::to_string(l); return false; }
+            if (!pass_stall(want, l, a, last_flush, err)) return false;
         }
         const Clock::time_point b = Clock::now();
-        VDBG("layer %lld rang\n", (long long) l);
-        cur_layer_ = want - 1;
-        set_plan_slot(grp);
-        const int tb = gtb[grp], n = gte[grp] - gtb[grp];
-        progress_at("verify window: the CPU experts of layer", l);
-        if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
-        VDBG("layer %lld served\n", (long long) l);
-        progress_tick();
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
-            sink_.counts[0] = 0;
-            sink_.counts[1] = 0;
-            sink_.counts[2] = 0;
-            sink_.start[0] = 0;
-            sink_.start2[0] = 0;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
-        }
-        *flag = want;
+        if (!service_one(k, pool, user, err)) return false;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
-        ms_pool += ms_since(b);
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
-    // no host function of this window may raise flag B in the next one - and only a fetch_dma(n > 0)
-    // of THIS window can queue one, so a window that queued none leaves the copy stream drained.
-    if (fetches_.load(std::memory_order_relaxed) != fetches_at_launch)
+    // (sync invariant, rebased onto the pass API): only a fetch_dma(n > 0) of THIS
+    // window can queue a copy-stream host function, so a window that queued none
+    // leaves the copy stream drained.  launch_pass captured fetches_ at launch.
+    if (fetches_.load(std::memory_order_relaxed) != pass_fetches_at_launch_)
         cudaStreamSynchronize(copy_);
     if (batch_replay_) { ++windows; progress_beat(); return true; }
-    if (prof_on_ && G == 1) {       // the window's GPU stage stamps
-        cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
-        const int64_t L = g.n_layers;
-        auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
-        for (int64_t l = 0; l < L; ++l) {
-            const int kind = is_qsa_layer(g, l) ? 1 : 0;
-            unsigned long long prev = at(l, 0);
-            for (int i = 1; i <= 24; ++i) {
-                const unsigned long long x = at(l, i);
-                if (x == 0 || x < prev) continue;
-                prof_sum_[kind][i] += (double) (x - prev);
-                prev = x;
-            }
-            if (l + 1 < L) prof_sum_[kind][25] += (double) (at(l + 1, 0) - at(l, 24));
-            prof_sum_[kind][27] += (double) (at(l, 27) - at(l, 0));    // hc-read0: norm
-            prof_sum_[kind][28] += (double) (at(l, 28) - at(l, 27));   //           down
-            prof_sum_[kind][29] += (double) (at(l, 1) - at(l, 28));    //           up
-            prof_sum_[kind][1] -= (double) (at(l, 1) - at(l, 0));      // (hc-read0 shown split)
-        }
-        prof_sum_[0][26] += (double) (at(L, 1) - at(L, 0));
-        ++prof_windows_;
-    }
-    // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
-    // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
-    // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
-    // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
+    pass_prof_dump();
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
-    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
-        SamplerParams sp = sampling_;
-        sp.counter = (uint64_t) pos0;
-        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
-            err = "verify: the head sampling failed";
-            return false;
-        }
-    }
-    for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    VDBG("window done\n");
+    if (!pass_finish_outputs(T, out, err)) return false;
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {
@@ -1161,19 +1081,21 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 if (bad) {
                     reported = true;
                     std::fprintf(stderr, "strata dbg: verify window at position %lld, row %d: %lld of %lld logits non-finite "
-                                         "(token out %d)\n", (long long) pos0, t, (long long) bad, (long long) n_vocab_, out[t]);
+                                         "(token out %d)\n", (long long) last_pos0_, t, (long long) bad, (long long) n_vocab_, out[t]);
                 }
             }
         }
     }
-    VDBG("window done\n");
-    ++windows;
-    progress_at("decode");
-    progress_beat();
     return true;
 }
 
-bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user, std::string& err) {
+// C2: the shared batch-round preparation - validation, per-member staging and the graph
+// lookup/capture.  run_batch (serial) and begin_pass_batch (stage-pipeline overlap) both call
+// it; they differ only in what they do with the captured graph (run it here, or launch it as a
+// pass and service it from drive_passes).
+bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
+                             std::vector<std::pair<Verifier*, int>>& shape, cudaGraphExec_t& graph_exec,
+                             std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const bool chained = le_ < g_->n_layers;   // this stage hands its rows to a next stage
@@ -1188,8 +1110,8 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
         err = "batch verify: the stage chain is not contiguous"; return false;
     }
     assert(!chained || (next_->lb_ == le_ && next_->le_ <= g_->n_layers));   // belt; A1 above is operative
-    int total = 0;
-    std::vector<std::pair<Verifier*, int>> shape;
+    total = 0;
+    shape.clear();
     for (const auto& b : batch) {
         Verifier* v = b.verifier;
         const bool member_chained = v != nullptr && v->next_ != nullptr;
@@ -1221,8 +1143,8 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
         if (!b.verifier->stage_inputs(b.count, b.tokens, b.position, err) || !b.verifier->capture_commit(err)) return false;
     // Expert-only coordinator always uses the host plan. Member graphs never publish doorbells.
     device_plan_ = false;
-    cudaGraphExec_t graph_exec = nullptr;
-    for (auto it = batch_graphs_.begin(); it != batch_graphs_.end(); ++it) if (it->shape == shape) {
+    graph_exec = nullptr;
+    for (auto it = batch_graphs_.begin(); it != batch_graphs_.end(); ++it) if (it->shape == shape && it->parity == parity_) {
         graph_exec = it->graph;
         std::rotate(it, it + 1, batch_graphs_.end()); // bounded LRU, not creation-order eviction
         break;
@@ -1395,10 +1317,21 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
                   " MiB free, below VRAM reserve; reduce expert cache/context";
             return false;
         }
-        batch_graphs_.push_back({std::move(shape), graph_exec});
+        batch_graphs_.push_back({std::move(shape), parity_, graph_exec});
         ms_batch_capture += ms_since(capture_start);
         ++batch_captures;
     }
+    return true;
+}
+
+bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user, std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    const bool chained = le_ < g_->n_layers;   // this stage hands its rows to a next stage
+    int total = 0;
+    std::vector<std::pair<Verifier*, int>> shape;
+    cudaGraphExec_t graph_exec = nullptr;
+    if (!prepare_batch(batch, total, shape, graph_exec, err)) return false;
     groups_[total] = 1;
     batch_replay_ = graph_exec;
     const bool ran = run(total, nullptr, 0, pool, user, nullptr, err);
@@ -1528,5 +1461,290 @@ bool Verifier::commit(int n_keep, std::string& err) {
     ms_commit += ms_since(t0);
     return true;
 }
+
+
+// ============================ STAGE-PIPELINE OVERLAP (lane overlap) ============================
+//
+// The serial round runs stage0's pass to completion (host loop, cs_ sync), then stage1's, and the
+// two stages of a round are therefore ~serial: with the round split 24/24 the two halves each cost
+// ~half the verify phase.  With the hand-off DOUBLE-BUFFERED BY PARITY the two passes of
+// CONSECUTIVE units can be in flight at once: stage0[N+1] writes parity (N+1)&1 while stage1[N]
+// still reads parity N&1, and stage1[N]'s launch is gated on stage0[N]'s completion event only.
+// The host services BOTH passes' doorbells (drive_passes) because each pass's expert dispatch runs
+// on the host thread; everything else - captures, plan publication, flags, the stall check - is the
+// same machinery the serial path uses (service_one, pass_stall).  Correctness notes:
+//   * a slot is eligible for the next unit only once its previous unit's EPILOGUE ran (its window
+//     tokens are the epilogue's drafts), so the two units in flight own disjoint slots;
+//   * the host must not stage a verifier's mapped inputs or reset its flags while that verifier's
+//     graph is still executing, so begin_pass_* follows the pass's completion event (the driver
+//     waits it) - see concurrent_serve.cpp's pipeline loop;
+//   * the captured graphs bake the ACTIVE hand-off pointers, hence exec_[parity][T] and the
+//     parity key of batch_graphs_.
+bool Verifier::launch_pass(int T, cudaEvent_t done, std::string& err) {
+    *(volatile uint32_t*) h_seq_ = 0;
+    *(volatile uint32_t*) h_flag_ = 0;
+    *(volatile uint32_t*) h_flagA_ = 0;
+    *(volatile uint32_t*) h_flagB_ = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    VDBG("staged; launching\n");
+    // (sync invariant, rebased): the launch-time fetch count; end_pass_* syncs copy_
+    // only when this pass queued a fetch_dma(n > 0) after it.
+    pass_fetches_at_launch_ = fetches_.load(std::memory_order_relaxed);
+    const cudaError_t le = cudaGraphLaunch(batch_replay_ ? batch_replay_ : exec_[parity_][T], cs_);
+    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
+    if (done != nullptr && cudaEventRecord(done, cs_) != cudaSuccess) {
+        err = "verify: the pass completion event failed";
+        return false;
+    }
+    VDBG("launched\n");
+    return true;
+}
+
+bool Verifier::service_one(int64_t k, PoolMultiFn pool, void* user, std::string& err) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const Clock::time_point b = Clock::now();
+    const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
+    const int64_t l = lb_ + k / G;
+    const int grp = (int) (k % G);
+    const uint32_t want = (uint32_t) (k + 1);
+    const int T = last_t_;
+    const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    VDBG("layer %lld rang\n", (long long) l);
+    cur_layer_ = want - 1;
+    set_plan_slot(grp);
+    const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+    progress_at("verify window: the CPU experts of layer", l);
+    if (pool != nullptr)
+        pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+             h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+    VDBG("layer %lld served\n", (long long) l);
+    progress_tick();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+        sink_.counts[0] = 0;
+        sink_.counts[1] = 0;
+        sink_.counts[2] = 0;
+        sink_.start[0] = 0;
+        sink_.start2[0] = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        *(volatile uint32_t*) h_flagA_ = want;
+        raise_flag(h_flagB_, want);
+    }
+    *(volatile uint32_t*) h_flag_ = want;
+    ms_pool += ms_since(b);
+    (void) err;
+    return true;
+}
+
+bool Verifier::pass_stall(uint32_t want, int64_t l, Clock::time_point wait_start, Clock::time_point& last_flush,
+                          std::string& err) {
+    const auto now = Clock::now();
+    if (now - last_flush > std::chrono::microseconds(2000)) {
+        last_flush = now;
+        const cudaError_t q = cudaStreamQuery(cs_);
+        if (q != cudaErrorNotReady && !pass_doorbell(want)) {
+            err = "verify: layer " + std::to_string(l) + " never rang (" +
+                  (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+            return false;
+        }
+    }
+    if (now - wait_start > std::chrono::seconds(20)) { err = "verify: timed out at layer " + std::to_string(l); return false; }
+    return true;
+}
+
+bool Verifier::begin_pass_window(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user,
+                                 cudaEvent_t done, std::string& err) {
+    const OnDevice on_device(device_);
+    g_diag_verifier.store(this);
+    const Clock::time_point t0 = Clock::now();
+    if (T < 1 || T > max_t_ || T > strata::kernels::kVerifyMaxT) {
+        err = "verify: window size out of range"; return false;
+    }
+    if (!capture(T, err) || !capture_commit(err) || !stage_inputs(T, tokens, pos0, err)) return false;
+    last_t_ = T;
+    last_pos0_ = pos0;
+    for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
+    ms_host += ms_since(t0);
+    if (!launch_pass(T, done, err)) return false;
+    pass_live_ = true;
+    pass_k_ = 0;
+    const int G = groups_[T] > 0 ? groups_[T] : 1;
+    pass_total_ = (le_ - lb_) * G;
+    pass_pool_ = pool;
+    pass_user_ = user;
+    pass_wait_start_ = Clock::now();
+    pass_last_flush_ = pass_wait_start_;
+    pass_wait_reported_ = false;
+    return true;
+}
+
+bool Verifier::begin_pass_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user,
+                                cudaEvent_t done, std::string& err) {
+    const OnDevice on_device(device_);
+    int total = 0;
+    std::vector<std::pair<Verifier*, int>> shape;
+    cudaGraphExec_t graph_exec = nullptr;
+    if (!prepare_batch(batch, total, shape, graph_exec, err)) return false;
+    groups_[total] = 1;
+    batch_replay_ = graph_exec;
+    last_t_ = total;
+    last_pos0_ = 0;
+    const bool ok = launch_pass(total, done, err);
+    batch_replay_ = nullptr;
+    if (!ok) return false;
+    pass_live_ = true;
+    pass_k_ = 0;
+    pass_total_ = le_ - lb_;                 // a batch pass runs one group (groups_[total] = 1)
+    pass_pool_ = pool;
+    pass_user_ = user;
+    pass_wait_start_ = Clock::now();
+    pass_last_flush_ = pass_wait_start_;
+    pass_wait_reported_ = false;
+    return true;
+}
+
+int Verifier::pass_step(std::string& err) {
+    if (!pass_live_ || pass_k_ >= pass_total_) return 0;
+    const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
+    const int64_t l = lb_ + pass_k_ / G;
+    const uint32_t want = (uint32_t) (pass_k_ + 1);
+    if (!pass_doorbell(want)) {
+        if (!pass_wait_reported_) {
+            progress_at("verify window: waiting for the GPU to reach layer", l);
+            pass_wait_reported_ = true;
+        }
+        if (!pass_stall(want, l, pass_wait_start_, pass_last_flush_, err)) return -1;
+        return 0;
+    }
+    const Clock::time_point b = Clock::now();
+    if (!service_one(pass_k_, pass_pool_, pass_user_, err)) return -1;
+    ms_wait += std::chrono::duration<double, std::milli>(b - pass_wait_start_).count();
+    ++pass_k_;
+    pass_wait_start_ = Clock::now();
+    pass_last_flush_ = pass_wait_start_;
+    pass_wait_reported_ = false;
+    return 1;
+}
+
+bool Verifier::drive_passes(Verifier* a, Verifier* b, std::string& err) {
+    for (;;) {
+        const bool done_a = a == nullptr || a->pass_finished();
+        const bool done_b = b == nullptr || b->pass_finished();
+        if (done_a && done_b) return true;
+        int progressed = 0;
+        if (!done_a) { const int r = a->pass_step(err); if (r < 0) return false; progressed += r; }
+        if (!done_b) { const int r = b->pass_step(err); if (r < 0) return false; progressed += r; }
+        if (!progressed) _mm_pause();
+    }
+}
+
+void Verifier::pass_prof_dump() {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
+    if (!prof_on_ || G != 1) return;
+    cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
+    const int64_t L = g.n_layers;
+    auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
+    for (int64_t l = 0; l < L; ++l) {
+        const int kind = is_qsa_layer(g, l) ? 1 : 0;
+        unsigned long long prev = at(l, 0);
+        for (int i = 1; i <= 24; ++i) {
+            const unsigned long long x = at(l, i);
+            if (x == 0 || x < prev) continue;
+            prof_sum_[kind][i] += (double) (x - prev);
+            prev = x;
+        }
+        if (l + 1 < L) prof_sum_[kind][25] += (double) (at(l + 1, 0) - at(l, 24));
+        prof_sum_[kind][27] += (double) (at(l, 27) - at(l, 0));    // hc-read0: norm
+        prof_sum_[kind][28] += (double) (at(l, 28) - at(l, 27));   //           down
+        prof_sum_[kind][29] += (double) (at(l, 1) - at(l, 28));    //           up
+        prof_sum_[kind][1] -= (double) (at(l, 1) - at(l, 0));      // (hc-read0 shown split)
+    }
+    prof_sum_[0][26] += (double) (at(L, 1) - at(L, 0));
+    ++prof_windows_;
+}
+
+bool Verifier::pass_finish_outputs(int T, int32_t* out, std::string& err) {
+    using namespace strata::kernels;
+    // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
+    // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
+    // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
+    // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
+    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
+        SamplerParams sp = sampling_;
+        sp.counter = (uint64_t) last_pos0_;
+        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
+            err = "verify: the head sampling failed";
+            return false;
+        }
+    }
+    if (out != nullptr) for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    ++windows;
+    progress_at("decode");
+    progress_beat();
+    return true;
+}
+
+bool Verifier::end_pass_window(int T, int32_t* out, std::string& err) {
+    const OnDevice on_device(device_);
+    pass_live_ = false;
+    progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
+    const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    progress_at("verify window: waiting for the expert copies", (int64_t) T);
+    // (sync invariant, rebased): see run() tail - same verifier, same comparison.
+    if (fetches_.load(std::memory_order_relaxed) != pass_fetches_at_launch_)
+        cudaStreamSynchronize(copy_);
+    pass_prof_dump();
+    if (le_ < g_->n_layers) {   // a layer split's earlier stage: the hand-off is written; the chain is the driver's
+        ++windows;
+        return true;
+    }
+    return pass_finish_outputs(T, out, err);
+}
+
+bool Verifier::end_pass_batch(const std::vector<BatchWindow>& batch, std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    pass_live_ = false;
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "batch verify: the pass stream failed"; return false; }
+    // (sync invariant, rebased): serial run_batch funnels through run() batch_replay_,
+    // which skips this sync when no fetch_dma(n > 0) was queued - same comparison here.
+    if (fetches_.load(std::memory_order_relaxed) != pass_fetches_at_launch_)
+        cudaStreamSynchronize(copy_);
+    for (const auto& b : batch) ++b.verifier->windows;                   // this stage's members ran
+    if (prof_on_) {
+        cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
+        for (int64_t l = 0; l < g_->n_layers; ++l)
+            for (int stage = 0; stage < 3; ++stage)
+                batch_gpu_ms[stage] += (double) (prof_h_[(size_t) l * kProfPer + 28 + stage] -
+                                                 prof_h_[(size_t) l * kProfPer + 27 + stage]) / 1e6;
+        batch_gpu_ms[3] += (double) (prof_h_[(size_t) g_->n_layers * kProfPer + 3] -
+                                     prof_h_[(size_t) g_->n_layers * kProfPer + 2]) / 1e6;
+    }
+    if (le_ < g_->n_layers) return true;   // the next stage's pass is the driver's business
+    // ---- the last stage: the head ran here (members' phase 4) - sampling and outputs
+    for (const auto& b : batch) {
+        Verifier& v = *b.verifier;
+        if (v.head_sampling_ && ((!v.sampling_.greedy && v.sampling_.temperature > 0) || v.hist_d_)) {
+            auto sp = v.sampling_;
+            sp.counter = (uint64_t) b.position;
+            sample_tokens(v.head_logits_, b.count, (int) v.n_vocab_, v.hist_d_, v.hist_len_, sp, v.m_out_, cs_);
+        }
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "batch verify: sampling failed"; return false; }
+    for (const auto& b : batch)
+        for (int t = 0; t < b.count; ++t) b.output[t] = b.verifier->h_out_[t];
+    return true;
+}
+
+
 
 }  // namespace strata::core

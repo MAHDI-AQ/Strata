@@ -2496,11 +2496,12 @@ int main(int argc, char** argv) {
         // reserve holds only while the count does not grow: with per-pair sizes the same byte budget
         // packs MORE pairs (the ladder-B boot packed 7921 into 6082 slots' budget; the fill left 683 MiB
         // free, below the 700 MiB the batch path needs, and every batch round refused).  Under `auto` the
-        // count is capped at min(auto slots, profile size); an explicit --expert-cache keeps the
-        // byte-budget-only packing.
-        const size_t pair_cap = auto_cache
-            ? (size_t) std::min<int64_t>((int64_t) o.expert_cache, (int64_t) profile.size())
-            : profile.size();
+        // count is capped at min(slots, profile size): per-pair blobs pack MORE pairs into the same
+        // byte budget (the ladder-B boot packed 7921 into 6082 slots' budget; the fill left 683 MiB
+        // free, below the 700 MiB the batch path needs, and every batch round refused), so an
+        // explicit --expert-cache N keeps at most N pairs too.
+        const size_t pair_cap =
+            (size_t) std::min<int64_t>((int64_t) o.expert_cache, (int64_t) profile.size());
         for (const auto& pr : profile) {
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (sized_slots.size() >= pair_cap) break;
@@ -2511,6 +2512,7 @@ int main(int argc, char** argv) {
         o.expert_cache = (int) sized_slots.size();
     }
     if (o.expert_cache > 0) {
+        const int requested_cache = o.expert_cache;   // K1b: an explicit N shrinks the same way `auto` does
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
         auto shrink_to = [&](int64_t keep_bytes) -> bool {
             if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
@@ -2533,7 +2535,7 @@ int main(int argc, char** argv) {
             for (const int64_t s : sized_slots) b += (s + 255) / 256 * 256;
             return b;
         };
-        // With `--expert-cache auto` the reserve must still be free once the slots are WRITTEN: under WDDM an
+        // Whatever sized the cache, the reserve must still be free once the slots are WRITTEN: under WDDM an
         // allocation is not resident until it is touched, and the free figure read before it can be ~1 GB too
         // high.  A cache sized from it filled the card to 0 MiB, the driver then paged, and a request that needed a
         // page back while the verify graph spun on a host flag never finished.  So the slots are zeroed and the
@@ -2578,7 +2580,7 @@ int main(int argc, char** argv) {
 #endif
                 return 1;
             }
-            if (!auto_cache || attempt - failed >= 6) break;
+            if (attempt - failed >= 6) break;   // K1b: explicit sizes shrink on refill too, not just `auto`
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
@@ -2596,6 +2598,9 @@ int main(int argc, char** argv) {
             xcache.close();
             if (!shrink_to(keep_bytes)) break;
         }
+        if (!auto_cache && o.expert_cache < requested_cache)
+            std::fprintf(stderr, "strata generate: explicit --expert-cache %d shrunk to %d slots to keep the %d MiB VRAM reserve free\n",
+                         requested_cache, o.expert_cache, o.vram_reserve_mib);
         if (failed > 0 && o.expert_cache > 0)
             std::fprintf(stderr, "strata generate: expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
                                  "page file lets it use more of the free VRAM\n",
