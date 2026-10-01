@@ -169,6 +169,7 @@ class StrataEngine:
         self._write_lock = threading.Lock()
         self._channels_lock = threading.Lock()
         self._channels = {}
+        self._shared_progress = {}       # request number -> (read, total) prompt tokens, for /metrics
         self._request_number = 0
         self.multiplex = False
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
@@ -233,7 +234,16 @@ class StrataEngine:
 
     @property
     def progress(self):
-        return getattr(self._request_local, "progress", None) if self.multiplex else getattr(self, "_progress_value", None)
+        if not self.multiplex:
+            return getattr(self, "_progress_value", None)
+        # Concurrent mode: the request readers are not the metrics thread, so a thread-local reads
+        # as None over there.  Report what the readers recorded: the furthest-along read count and
+        # the sum of the totals (surfaces as live.prompt_read / live.prompt_total in /metrics).
+        with self._channels_lock:
+            vals = [v for v in self._shared_progress.values() if v and v[1]]
+        if not vals:
+            return None
+        return (max(v[0] for v in vals), sum(v[1] for v in vals))
 
     @progress.setter
     def progress(self, value):
@@ -321,6 +331,8 @@ class StrataEngine:
                 elif line.startswith("PP "):
                     fields = line.split()
                     self.progress = (int(fields[1]), int(fields[2]))
+                    with self._channels_lock:            # visible to /metrics (see the progress property)
+                        self._shared_progress[number] = self.progress
                     yield None
                 elif line.startswith("DONE "):
                     self._parse_done(line)
@@ -332,6 +344,7 @@ class StrataEngine:
         finally:
             with self._channels_lock:
                 self._channels.pop(number, None)
+                self._shared_progress.pop(number, None)
             if sent and not done:
                 try:
                     self._send(f"CSTOP {number}")
@@ -980,7 +993,7 @@ class Service:
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
-        if state == "reading" and progress:
+        if progress:                             # also while a mixed batch still reads (state may be "generating")
             live["prompt_read"], live["prompt_total"] = progress
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
