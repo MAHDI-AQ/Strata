@@ -729,9 +729,18 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // LANE split1-r2fix-v3: the v2 build's record refusal is fixed at the object - a completion
     // event lives in the context it is recorded in, so ev0/ev1 are created (and destroyed) on
     // their own stage's device in the event setup below; the launch span stays as v2 left it.
-    const bool overlap = m.stages.size() == 2 && [] {
+    // 2026-10-01 measurement: the corrected two-device overlap is functionally sound but costs ~30%
+    // decode at the 5x87.5K shape (23 vs 32-37 tok/s; prefill flat) - serial is the best-known default
+    // for two-DEVICE splits; cross-device overlap stays available as an explicit experiment
+    // (STRATA_STAGE_OVERLAP_CROSSDEV=1).  Same-device keeps its historic default-on behavior.
+    const bool overlap = m.stages.size() == 2 && [&] {
         const char* v = std::getenv("STRATA_STAGE_OVERLAP");
-        return v == nullptr || std::atoi(v) != 0;
+        if (v != nullptr && std::atoi(v) == 0) return false;              // explicit serial
+        if (m.stages[0].device != m.stages[1].device) {                   // two-device: opt-in
+            const char* x = std::getenv("STRATA_STAGE_OVERLAP_CROSSDEV");
+            return x != nullptr && std::atoi(x) != 0;
+        }
+        return true;                                                       // same-device: default on
     }();
     // R2 (split1-v3): a completion event is a CUDA object of the device whose pass it times - ev0 is
     // recorded on stage 0's stream, ev1 on stage 1's - so each is created (and destroyed, on every
