@@ -793,6 +793,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         for (auto* ptr : u.ready) {
             auto& s = *ptr;
             if (!s.count) continue;
+            // LANE hostloop: a CSTOP processed by an intervening service_input - or by the epilogue
+            // reorder below - has already finished this slot; never finish (DONE) it twice.
+            if (!s.active.load()) continue;
             // A CSTOP can arrive while this unit's window is in flight (the serial loop only ever
             // saw CSTOP with nothing in flight): the request was already erased from `live`, so
             // finish it as cancelled instead of committing its window.
@@ -1186,12 +1189,19 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 if (!core::Verifier::drive_passes(u.lane0, prev.valid ? prev.lane1 : nullptr, err)) return 1;
                 if (u.single) { if (!u.lane0->end_pass_window(u.T, nullptr, err)) return 1; }
                 else { if (!u.lane0->end_pass_batch(u.windows, err)) return 1; }
+                // LANE hostloop (epilogue-hide): freeze the previous unit's stage-1 outputs here, but
+                // run its epilogue (commit + drafts + prints) AFTER the new stage-1 launch below: the
+                // commit tail syncs and the draft chain's per-step syncs are host-bound and used to
+                // leave BOTH devices idle between the two drives.  Same calls, same per-object order,
+                // and the unit's slots are its own - the in-flight pass never touches them.
+                Unit ret;
                 if (prev.valid) {
                     if (prev.single) { if (!prev.lane1->end_pass_window(prev.T, prev.out, err)) return 1; }
                     else { if (!prev.lane1->end_pass_batch(prev.chain, err)) return 1; }
                     target_ms += elapsed(prev.t_start);
                     target_rows += prev.single ? prev.T : [&] { int64_t r = 0; for (const auto& w : prev.windows) r += w.count; return r; }();
-                    if (!retire_unit(prev)) return 1;
+                    ret = std::move(prev);
+                    ret.valid = true;
                     prev.valid = false;
                 }
                 if (dispatch.failed) {
@@ -1229,6 +1239,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 } else {
                     prev.valid = false;
                 }
+                // LANE hostloop: the previous unit's epilogue runs now - while u's stage-1 pass is in
+                // flight and the next stage-0 is being built - instead of idling both devices.
+                if (ret.valid && !retire_unit(ret)) return 1;
                 unit_parity ^= 1;
                 ++rounds;
                 if (adaptive && rounds % c.adapt_every == 0) {
