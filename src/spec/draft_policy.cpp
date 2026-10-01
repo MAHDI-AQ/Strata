@@ -15,7 +15,7 @@ constexpr double kTokAlpha = 0.05;    // EMA weight of a new MTP window outcome
 constexpr double kDecay = 0.97;       // lookup counts: older windows fade
 // Before a bucket has data: the longer the match, the likelier its continuation (llama.cpp's lookup decoding gates
 // on the same thing); worth 4 observations, so a few real windows override it
-constexpr double kPriorQ[DraftPolicy::kBuckets] = {0.75, 0.88, 0.93, 0.96};
+constexpr double kPriorQ[DraftPolicy::kBuckets] = {0.70, 0.88, 0.93, 0.96};
 constexpr double kPriorN = 4.0;
 constexpr int kProbes = 3;       // a lookup window size is tried this often before its guessed cost can veto it
 
@@ -74,7 +74,10 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would
     // need a size not measured yet, it is tried (verification keeps the output; only the one round's speed is at stake)
     const int t_full = std::min(lookup_k, max_t_ - 1) + 1;
-    if (t_full > p.t && cost_n_[t_full] < kProbes && q >= 0.85) {
+    // Stratified probe gate: short matches (ordinary text) need stronger evidence;
+    // long matches (code-repeat/tool JSON) probe wider sooner. Output unchanged.
+    const double probe_q = match < 6 ? 0.90 : 0.82;
+    if (t_full > p.t && cost_n_[t_full] < kProbes && q >= probe_q) {
         p.lookup = true;
         p.t = t_full;
     }
