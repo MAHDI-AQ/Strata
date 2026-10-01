@@ -146,6 +146,13 @@ struct ConcurrentServe::Impl {
         // is ready.  `read` is the release/acquire hand-off between the two (see the pump).
         std::atomic<bool> active{false};
         bool first = true, lookup = false;
+        // P4 live retention: `consumed` is ALSO the conversation this slot's sessions hold. At idle the
+        // sessions are exactly the sequence state for those tokens - the invariant every writer keeps:
+        // run_chunk appends each read token as prefill consumes it, retire_unit commits the window's kept
+        // tokens (commit() advances GDN/PLE with them; verify.hpp:185). So an admission that finds the
+        // full retained history as an exact prefix of its request continues the sequence with no copy and
+        // no session_zero. `reused_prefix` = tokens THIS request reused (the DONE trailer's field 9).
+        int64_t reused_prefix = 0;
         std::atomic<int64_t> read{0}, position{0};
         int64_t generated = 0, offered = 0, accepted = 0;
         int32_t current = 0;
@@ -498,9 +505,21 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         for (float& usage : dispatch.usage) usage *= 0.7f;
         return true;
     };
-    // P1-cache-revive: the concurrent path parks nothing yet, so the prefix cache is always
-    // off here; the DONE trailer field below stays 0. Banner states it so logs are greppable.
-    std::fprintf(stderr, "strata concurrent: shared expert batching; independent MTP; adaptive cache %s; prefix-cache off (parking not yet supported on this path)\n", adaptive ? "on" : "off");
+    // P4 live retention (STRATA_CONCURRENT_RETAIN, default 0 = off): a request whose prompt starts with
+    // the full token history a slot still holds resumes that slot's live sessions instead of zeroing
+    // them - the sustained-traffic lever (a 128K agent turn re-reads only its new tokens). Default off,
+    // so the loop below is byte-identical to the pre-P4 engine; the kill-switch is the same env.
+    const bool retain = [] {
+        const char* v = std::getenv("STRATA_CONCURRENT_RETAIN");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    // P1-cache-revive: the concurrent path parks nothing yet (host-RAM snapshots); live retention is
+    // separate from parking and the P1 refusal above stays in force for conversation_cache_mib > 0.
+    // The DONE trailer field now carries the live-retention reuse count (was hardcoded 0).
+    std::fprintf(stderr, "strata concurrent: shared expert batching; independent MTP; adaptive cache %s; %s\n",
+                 adaptive ? "on" : "off",
+                 retain ? "prefix-cache live-retention on (parking not yet supported on this path)"
+                        : "prefix-cache off (parking not yet supported on this path)");
     std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s\n",
                 c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.kv.c_str(), c.suffix, adaptive ? "adaptive" : "static");
     std::printf("READY %lld stop multiplex\n", (long long) c.context);
@@ -663,12 +682,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     });
     auto finish = [&](Impl::Slot& s, const char* reason) {
         const double decode = s.first ? 0 : elapsed(s.decode_start);
-        // P1-cache-revive: the trailing field is reused_prefix_tokens. The concurrent path parks
-        // nothing yet, so it is always 0; server.py already parses this position, so the wire
-        // format is stable for the future lift (which will fill it per request).
-        std::printf("R %llu DONE %lld %zu %.1f %.1f %s %lld %lld 0\n", (unsigned long long) s.request.id,
+        // P4: the trailing field is reused_prefix_tokens (server.py _parse_done maps it to
+        // `reused`/cached_tokens). Live retention fills it with the tokens this request resumed;
+        // 0 = the request read its whole prompt (fresh admission - all of today's traffic).
+        std::printf("R %llu DONE %lld %zu %.1f %.1f %s %lld %lld %lld\n", (unsigned long long) s.request.id,
                     (long long) s.generated, s.request.tokens.size(), s.prompt_ms.load(), decode, reason,
-                    (long long) s.accepted, (long long) s.offered);
+                    (long long) s.accepted, (long long) s.offered, (long long) s.reused_prefix);
         std::fflush(stdout);
         live.erase(s.request.id);
         s.active.store(false);
@@ -816,6 +835,52 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             for (auto* ptr : u.ready) if (!ptr->draft->idle(err)) return false;
         return true;
     };
+    // P4: one slot's admission - the exact sequence the loop always ran (bookkeeping, per-stage reset
+    // on each stage's device, drafter re-arm), plus the live-retention arm. `reused` = tokens of this
+    // request the slot's sessions already hold (0 = fresh: zero every stage, today's path). The caller
+    // has moved the request in and holds the pump fence; the pump only sees the slot after pump_resume.
+    auto admit_slot = [&](Impl::Slot& s, int64_t reused) -> bool {
+        s.read.store(reused); s.generated = s.offered = s.accepted = 0;
+        s.prompt_ms.store(0); s.first = true; s.active.store(true);
+        s.position.store((int64_t) s.request.tokens.size() - 1);
+        s.current = (int32_t) s.request.tokens.back();
+        s.reused_prefix = reused;
+        if (reused == 0) s.consumed.clear();
+        // reused > 0: `consumed` already IS request.tokens[0..reused) - the match proved it, and the
+        // pump appends [reused, n-1) to it as it reads, so penalty/suffix state see the same n-1
+        // tokens a fresh admission would have accumulated by the first window.
+        std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
+        s.suffix.reset(); s.policy = spec::DraftPolicy{c.window};
+        for (auto token : s.request.tokens) s.suffix.append((int32_t) token);
+        // P1-cache-revive hook note: the parking lift (host-RAM snapshots) attaches HERE, at the
+        // admission boundary only - never mid-round (a ~1-2 GiB memcpy at 100K q4_0 would stall
+        // decode). Per-slot per-stage sessions: capture/restore every stage's state on its device
+        // under OnDevice, stamp the carve (layer_lo/hi) and reject cross-carve restores, re-seed
+        // per-stage PLE scratch, invalidate on prefix divergence. Live retention (the `reused` arm
+        // below) is its first tier; parking adds the cross-slot/evicted cases.
+        if (reused == 0) {
+            for (size_t st = 0; st < m.stages.size(); ++st) {   // C4: every stage's state resets on its device
+                const core::OnDevice on(m.stages[st].device);
+                core::session_zero(*s.stages[st].state, g, nullptr, m.stage_rt[st].prompt_stream);
+            }
+            for (size_t st = 0; st < m.stage_rt.size(); ++st) {
+                core::progress_at("concurrency: resetting a stage", (int64_t) st);   // the watchdog's view
+                if (cudaStreamSynchronize(m.stage_rt[st].prompt_stream) != cudaSuccess) { err = "concurrency: reset failed"; return false; }
+            }
+            s.draft->reset();
+        } else {
+            // The drafter continues the same sequence: keep its state (reset() would zero the KV the
+            // retained cells live in) and tell it the valid length, exactly as the serial path does
+            // (generate.cpp:4702 mtp.kv_restore(resume); a no-op on resident K/V). set_prompt_len
+            // re-bases its window skip; cells past `reused` were speculative and are overwritten
+            // before any read (verify.hpp:18's own contract).
+            s.draft->kv_restore(reused);
+            std::fprintf(stderr, "strata concurrent: live retention: slot resumes %lld tokens\n", (long long) reused);
+        }
+        s.draft->set_prompt_len((int64_t) s.request.tokens.size());
+        s.stages[0].verify.set_sampling(s.request.sampling);
+        return true;
+    };
     // The input side: commands, admission and ONE bounded prompt chunk.  In the overlapped loop it
     // runs at the SAFE POINT (no pass in flight) because the prompt path touches the expert caches
     // and the drafter state and must never race a decode pass.  Returns 1 on a hard error.
@@ -862,33 +927,36 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         const bool admitting = !pending.empty() &&
             std::any_of(m.slots.begin(), m.slots.end(), [](const auto& ptr) { return !ptr->active.load(); });
         if (admitting && !pump_fence()) return 1;
+        // P4 live retention (retain): the slot's `consumed` IS the conversation its sessions hold (the
+        // invariant every writer keeps - see the Slot comment). A queued request whose prompt starts
+        // with a slot's FULL retained history, and is longer than it, continues that slot with no
+        // copy: admission skips session_zero and the pump reads only [reused, n-1). The bound and the
+        // exact-token rule are the serial loop's starts_with (generate.cpp:4576-4581): at most n-1
+        // retained tokens, the last token always opens the first verify window. Longest match wins; a
+        // partial or divergent prefix is a miss and the walk below zeroes the slot exactly as before.
+        // Off (default): this pre-pass is dead code and the walk is byte-identical.
+        while (retain && !pending.empty()) {
+            Impl::Slot* pick = nullptr;
+            int64_t best = 0;
+            const auto& tokens = pending.front().tokens;
+            for (auto& ptr : m.slots) {
+                const auto& held = *ptr;
+                if (held.active.load()) continue;
+                const int64_t L = (int64_t) held.consumed.size();
+                if (L < 1 || L > (int64_t) tokens.size() - 1) continue;
+                bool same = true;
+                for (int64_t i = 0; i < L && same; ++i) same = held.consumed[(size_t) i] == (int32_t) tokens[(size_t) i];
+                if (same && L > best) { best = L; pick = ptr.get(); }
+            }
+            if (pick == nullptr) break;   // no live match for the queue head: the normal walk admits it
+            auto& s = *pick;
+            s.request = std::move(pending.front()); pending.pop_front();
+            if (!admit_slot(s, best)) return 1;
+        }
         for (auto& ptr : m.slots) if (!ptr->active.load() && !pending.empty()) {
             auto& s = *ptr;
             s.request = std::move(pending.front()); pending.pop_front();
-            s.read.store(0); s.generated = s.offered = s.accepted = 0;
-            s.prompt_ms.store(0); s.first = true; s.active.store(true);
-            s.position.store((int64_t) s.request.tokens.size() - 1);
-            s.current = (int32_t) s.request.tokens.back();
-            s.consumed.clear();
-            std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
-            s.suffix.reset(); s.policy = spec::DraftPolicy{c.window};
-            for (auto token : s.request.tokens) s.suffix.append((int32_t) token);
-            // P1-cache-revive hook note (no behavior change): the future park/restore lift attaches
-            // HERE, at the admission boundary only - never mid-round (a ~1-2 GiB memcpy at 100K q4_0
-            // would stall decode). Per-slot per-stage sessions: capture/restore every stage's state on
-            // its device under OnDevice, stamp the carve (layer_lo/hi) and reject cross-carve restores,
-            // re-seed per-stage PLE scratch, invalidate on prefix divergence (longest exact-token-prefix
-            // best-match; non-prefix checkpoints are unreachable by chain design).
-            for (size_t st = 0; st < m.stages.size(); ++st) {   // C4: every stage's state resets on its device
-                const core::OnDevice on(m.stages[st].device);
-                core::session_zero(*s.stages[st].state, g, nullptr, m.stage_rt[st].prompt_stream);
-            }
-            for (size_t st = 0; st < m.stage_rt.size(); ++st) {
-                core::progress_at("concurrency: resetting a stage", (int64_t) st);   // the watchdog's view
-                if (cudaStreamSynchronize(m.stage_rt[st].prompt_stream) != cudaSuccess) { err = "concurrency: reset failed"; return 1; }
-            }
-            s.draft->reset(); s.draft->set_prompt_len((int64_t) s.request.tokens.size());
-            s.stages[0].verify.set_sampling(s.request.sampling);
+            if (!admit_slot(s, 0)) return 1;
         }
 
         pump_resume();   // new prefillable slots are announced here (a no-op when the pump is off)
