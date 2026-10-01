@@ -392,10 +392,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     int64_t produced = 0, target_rows = 0;
     auto report_profile = [&]() {
         if (!profiling || !rounds) return;
-        double wait = batch[0].ms_wait, pool_ms = batch[0].ms_pool, host = batch[0].ms_host;
-        for (const auto& s : m.slots) {
-            wait += s->stages[0].verify.ms_wait; pool_ms += s->stages[0].verify.ms_pool; host += s->stages[0].verify.ms_host;
-        }
+        // every stage of the chain waits - a split's stage 1 included: sum them all, not stage 0's only.
+        double wait = 0, pool_ms = 0, host = 0;
+        for (const auto& b : batch) { wait += b.ms_wait; pool_ms += b.ms_pool; host += b.ms_host; }
+        for (const auto& s : m.slots)
+            for (const auto& gs : s->stages) {
+                wait += gs.verify.ms_wait; pool_ms += gs.verify.ms_pool; host += gs.verify.ms_host;
+            }
         std::fprintf(stderr, "strata concurrent profile: rounds=%lld tokens=%lld rows=%lld target_ms=%.1f "
                      "draft_ms=%.1f commit_ms=%.1f adapt_ms=%.1f prefill_ms=%.1f "
                      "target_wait_ms=%.1f target_pool_ms=%.1f target_host_ms=%.1f\n",

@@ -21,6 +21,7 @@
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
 
+#include <atomic>
 #include <cstdio>
 
 #include "strata/core/expert_source.hpp"
@@ -151,6 +152,10 @@ public:
     int64_t batch_captures = 0;
     double batch_gpu_ms[4] = {}; // member pre, shared expert dispatch, member post, head
     int64_t windows = 0;
+    /// Copy-stream host functions queued by fetch_dma (n > 0) since construction.  A window syncs the
+    /// copy stream only when IT queued one: a window that queued none cannot raise flag B in the next
+    /// one, so the stream is already drained (run()).
+    std::atomic<uint32_t> fetches_{0};
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();

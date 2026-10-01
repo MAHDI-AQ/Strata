@@ -2287,14 +2287,27 @@ int main(int argc, char** argv) {
     serve_stages[0].device = 0;
     serve_stages[0].wt = &wt;
     serve_stages[0].session = &ss;
+    // C4 coverage fix: THE LAYER RANGES MUST BE SET BEFORE `prepare()`.  `prepare` carves every owned
+    // per-slot session with `session_bytes(..., stages[st].lb, stages[st].le)`; the ranges used to be
+    // filled in phase B, after this call, so each owned session was carved at the FULL-MODEL size
+    // (972.6 MiB at 100K q4_0) instead of its stage's range (503.4 MiB) - 7 x 469.2 = 3,284 MiB/card
+    // that the expert cache, sized after the sessions, paid for.  Values identical to phase B's fill.
+    serve_stages[0].lb = 0;
+    serve_stages[0].le = split_devs.empty() ? g.n_layers : split_at[0];
     for (size_t i = 0; i < stages.size(); ++i) {
         serve_stages.emplace_back();
         strata::program::ServeStage& sg = serve_stages.back();
         sg.device = stages[i]->dev;
         sg.wt = &stages[i]->wt;
         sg.session = &stages[i]->ss;
+        sg.lb = stages[i]->lb;
+        sg.le = stages[i]->le;
     }
-    if (split_same) serve_stages.push_back(serve_stages[0]);
+    if (split_same) {
+        serve_stages.push_back(serve_stages[0]);
+        serve_stages[1].lb = split_at[0];
+        serve_stages[1].le = g.n_layers;
+    }
 
     std::unique_ptr<strata::program::ConcurrentServe> concurrent;
     if (o.concurrency > 1) {
