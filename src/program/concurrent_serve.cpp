@@ -650,6 +650,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         std::fflush(stdout);
         live.erase(s.request.id);
         s.active.store(false);
+        // LANE sched-impl P1 (admission wake; T4 L7/L13 micro): a freed slot is re-admitted at the
+        // next service_input, but the bottom idle park sleeps on input->cv (2 ms tick). Wake it when
+        // queued work waits so a STOP re-admits without the tick. Wake-only: no scheduling decision
+        // changes; admission still only runs in service_input (safe point); H1 region untouched.
+        if (!pending.empty()) input->cv.notify_all();
     };
     // ============================ STAGE-PIPELINE OVERLAP (lane overlap) ============================
     // stage0[N+1] || stage1[N]: with the hand-off DOUBLE-BUFFERED by parity, stage0 of the next
@@ -1134,7 +1139,15 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             // Nothing to parse and no ready window: the pump is the only producer.  Wait for input (or a
             // 2 ms tick) instead of spinning; the next round starts as soon as a chunk completes a prompt.
             std::unique_lock<std::mutex> lock(input->mutex);
-            input->cv.wait_for(lock, std::chrono::milliseconds(2), [&] { return !input->lines.empty() || input->eof; });
+            // LANE sched-impl P1: also wake when queued requests wait AND a slot is free, so the
+            // finish()-notify above shortens the STOP-to-readmit park. The free-slot conjunct keeps
+            // the old 2 ms tick whenever everything queued is unadmittable (no busy spin while
+            // prefill-bound with a full house).
+            input->cv.wait_for(lock, std::chrono::milliseconds(2), [&] {
+                return !input->lines.empty() || input->eof ||
+                       (!pending.empty() && std::any_of(m.slots.begin(), m.slots.end(),
+                                                        [](const auto& ptr) { return !ptr->active.load(); }));
+            });
         }
         if (quit) break;
         rotation = (rotation + 1) % m.slots.size();
