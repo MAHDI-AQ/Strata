@@ -4,10 +4,13 @@
 //    (H * H * x == x, H is symmetric and orthonormal with scale 1/sqrt(256) = 1/16).
 // 2. Q4_0 quantization and packing (32 values per block, 18 bytes) bitwise vs host reference.
 // 3. kv_append_q4_step and kv_gather_q4_step through paged pool against host reference.
+// 3b. kv_append_q4_batch_step (the captured window's one-call append) == the per-token steps, bit-identical,
+//     device pool and KV-streaming host copy, with a capture + replay over rewritten step rows.
 // 4. Invariance of dot products under Walsh-Hadamard rotation: (H*q) . (H*k) == q . k.
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa.hpp"
 
 #include <cuda_runtime.h>
@@ -277,6 +280,136 @@ int main() {
         ++g_fail;
     } else {
         std::printf("  -> All Q4_0 pool blocks bitwise equal to host quantizer (OK)\n");
+    }
+
+    // -------------------------------------------------------------
+    // Test 3b: the batched STEP append == the per-token steps, captured
+    // -------------------------------------------------------------
+    // The captured decode window (verify.cpp) appends a whole group's rows in ONE kv_append_q4_batch_step
+    // call, every row's position read from its own DEVICE step row; the per-token kv_append_q4_step loop is
+    // the oracle (test 3 above verified it against the host quantizer).  Same cells, same rotated rows, fresh
+    // pools: the pool bytes must be BIT-IDENTICAL, device copy and KV-streaming host copy alike.  Then ONE
+    // captured call is replayed twice with the step rows rewritten between the replays: a position baked in
+    // at capture would rewrite the first run's cells and leave the second's empty.
+    std::printf("[3b/4] Verifying the batched step append vs the per-token steps (capture included)...\n");
+    {
+        const int W = 6;                                   // the window's rows
+        const int32_t RUN0 = 37, RUN1 = 53;                // two disjoint runs of W cells
+        std::vector<std::vector<float>> run_k(2), run_v(2);
+        for (int r = 0; r < 2; ++r)
+            for (int t = 0; t < W; ++t) {
+                std::vector<float> kv(H * D), vv(H * D);
+                for (auto& x : kv) x = nd(rng) * 2.0f;
+                for (auto& x : vv) x = nd(rng) * 2.0f;
+                for (int h = 0; h < H; ++h) {
+                    fwht256_host_reference(kv.data() + h * D);
+                    fwht256_host_reference(vv.data() + h * D);
+                }
+                run_k[r].insert(run_k[r].end(), kv.begin(), kv.end());
+                run_v[r].insert(run_v[r].end(), vv.begin(), vv.end());
+            }
+        // the oracle pool, the one-call pool, the captured pool, and the oracle's two-run leg
+        uint8_t* pk_o = dalloc<uint8_t>(pool_bytes); uint8_t* pv_o = dalloc<uint8_t>(pool_bytes);
+        uint8_t* pk_b = dalloc<uint8_t>(pool_bytes); uint8_t* pv_b = dalloc<uint8_t>(pool_bytes);
+        uint8_t* pk_c = dalloc<uint8_t>(pool_bytes); uint8_t* pv_c = dalloc<uint8_t>(pool_bytes);
+        uint8_t* pk_f = dalloc<uint8_t>(pool_bytes); uint8_t* pv_f = dalloc<uint8_t>(pool_bytes);
+        uint8_t* hk_o = dalloc<uint8_t>(pool_bytes); uint8_t* hv_o = dalloc<uint8_t>(pool_bytes);
+        uint8_t* hk_b = dalloc<uint8_t>(pool_bytes); uint8_t* hv_b = dalloc<uint8_t>(pool_bytes);
+        uint8_t* hk_c = dalloc<uint8_t>(pool_bytes); uint8_t* hv_c = dalloc<uint8_t>(pool_bytes);
+        uint8_t* hk_f = dalloc<uint8_t>(pool_bytes); uint8_t* hv_f = dalloc<uint8_t>(pool_bytes);
+        const k::KvHostPools host_o{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, hk_o, hv_o};
+        const k::KvHostPools host_b{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, hk_b, hv_b};
+        const k::KvHostPools host_c{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, hk_c, hv_c};
+        const k::KvHostPools host_f{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, hk_f, hv_f};
+        float* d_krow = dalloc<float>(H * D); float* d_vrow = dalloc<float>(H * D);
+        float* d_K = dalloc<float>((size_t) W * H * D); float* d_V = dalloc<float>((size_t) W * H * D);
+        int32_t* d_steps = dalloc<int32_t>((size_t) W * k::kStepCount);
+        auto steps_for = [&](int32_t base) {
+            std::vector<int32_t> st((size_t) W * k::kStepCount, 0);
+            for (int t = 0; t < W; ++t) {
+                st[(size_t) t * k::kStepCount + k::kStepPos] = base + t;
+                st[(size_t) t * k::kStepCount + 1] = base + t + 1;   // kStepNKv: pos + 1
+            }
+            ck(cudaMemcpy(d_steps, st.data(), st.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "steps");
+        };
+        auto load_run = [&](int r) {
+            ck(cudaMemcpy(d_K, run_k[r].data(), run_k[r].size() * sizeof(float), cudaMemcpyHostToDevice), "K");
+            ck(cudaMemcpy(d_V, run_v[r].data(), run_v[r].size() * sizeof(float), cudaMemcpyHostToDevice), "V");
+        };
+        auto single_leg = [&](const int32_t base, int r, uint8_t* pk, uint8_t* pv, const k::KvHostPools& host) {
+            steps_for(base);
+            for (int t = 0; t < W; ++t) {
+                ck(cudaMemcpy(d_krow, run_k[r].data() + (size_t) t * H * D, H * D * sizeof(float), cudaMemcpyHostToDevice), "krow");
+                ck(cudaMemcpy(d_vrow, run_v[r].data() + (size_t) t * H * D, H * D * sizeof(float), cudaMemcpyHostToDevice), "vrow");
+                k::kv_append_q4_step(pk, pv, d_table, d_steps + (size_t) t * k::kStepCount, d_krow, d_vrow, s, nullptr, &host);
+            }
+        };
+        // oracle leg 1: RUN0 token by token (device pool + host copy)
+        single_leg(RUN0, 0, pk_o, pv_o, host_o);
+        // the batch leg: the same cells from the window's contiguous rows in one call
+        load_run(0); steps_for(RUN0);
+        k::kv_append_q4_batch_step(pk_b, pv_b, d_table, d_steps, W, d_K, d_V, s, nullptr, &host_b);
+        ck(cudaDeviceSynchronize(), "sync 3b");
+        auto cmp_pool = [&](const char* what, const uint8_t* a, const uint8_t* b) {
+            std::vector<uint8_t> ha(pool_bytes), hb(pool_bytes);
+            ck(cudaMemcpy(ha.data(), a, pool_bytes, cudaMemcpyDeviceToHost), "d2h");
+            ck(cudaMemcpy(hb.data(), b, pool_bytes, cudaMemcpyDeviceToHost), "d2h");
+            const bool eq = std::memcmp(ha.data(), hb.data(), pool_bytes) == 0;
+            std::printf("  %-52s %s\n", what, eq ? "bit-identical" : "*** WRONG ***");
+            if (!eq) ++g_fail;
+        };
+        cmp_pool("batch step vs per-token steps, K", pk_o, pk_b);
+        cmp_pool("batch step vs per-token steps, V", pv_o, pv_b);
+        cmp_pool("host copies (KV streaming), K", hk_o, hk_b);
+        cmp_pool("host copies (KV streaming), V", hv_o, hv_b);
+        // ONE captured call, replayed for RUN0 and then for RUN1; the oracle appends both runs
+        load_run(0); steps_for(RUN0);
+        cudaStream_t cs2 = nullptr;
+        ck(cudaStreamCreate(&cs2), "cs2");
+        ck(cudaStreamBeginCapture(cs2, cudaStreamCaptureModeThreadLocal), "begincap");
+        k::kv_append_q4_batch_step(pk_c, pv_c, d_table, d_steps, W, d_K, d_V, s, cs2, &host_c);
+        cudaGraph_t g2 = nullptr;
+        ck(cudaStreamEndCapture(cs2, &g2), "endcap");
+        ck(cudaStreamDestroy(cs2), "csd");
+        size_t nodes2 = 0;
+        ck(cudaGraphGetNodes(g2, nullptr, &nodes2), "nodes");
+        cudaGraphExec_t ex2 = nullptr;
+        ck(cudaGraphInstantiate(&ex2, g2, 0), "inst");
+        ck(cudaGraphLaunch(ex2, nullptr), "launch run0");
+        load_run(1); steps_for(RUN1);
+        ck(cudaGraphLaunch(ex2, nullptr), "launch run1");
+        // the oracle's two-run leg: RUN0 then RUN1 token by token
+        single_leg(RUN0, 0, pk_f, pv_f, host_f);
+        single_leg(RUN1, 1, pk_f, pv_f, host_f);
+        ck(cudaDeviceSynchronize(), "sync 3b capture");
+        cmp_pool("captured replays vs per-token steps, K", pk_f, pk_c);
+        cmp_pool("captured replays vs per-token steps, V", pv_f, pv_c);
+        // the negative control: RUN1's cells must be populated through the SAME graph (a baked position would
+        // have rewritten RUN0's cells instead)
+        long long run1_nonzero = 0;
+        {
+            std::vector<uint8_t> hc(pool_bytes);
+            ck(cudaMemcpy(hc.data(), pk_c, pool_bytes, cudaMemcpyDeviceToHost), "d2h");
+            for (int t = 0; t < W; ++t) {
+                const long long pos = RUN1 + t;
+                for (int h = 0; h < H; ++h) {
+                    const long long page = (long long) table[pos / P];
+                    const uint8_t* row = hc.data() + ((page * H + h) * P + (pos % P)) * bytes_per_head;
+                    for (int i = 0; i < bytes_per_head; ++i) run1_nonzero += row[i] != 0;
+                }
+            }
+        }
+        std::printf("  %-52s %lld of %d non-zero\n", "the second run's cells arrive through the same graph",
+                    run1_nonzero, W * H * bytes_per_head);
+        if (run1_nonzero == 0) ++g_fail;
+        std::printf("  %-52s %zu nodes for one captured call\n", "the window append is capturable", nodes2);
+        ck(cudaGraphExecDestroy(ex2), "exd");
+        ck(cudaGraphDestroy(g2), "gd");
+        cudaFree(d_krow); cudaFree(d_vrow); cudaFree(d_K); cudaFree(d_V); cudaFree(d_steps);
+        cudaFree(pk_o); cudaFree(pv_o); cudaFree(pk_b); cudaFree(pv_b);
+        cudaFree(pk_c); cudaFree(pv_c); cudaFree(pk_f); cudaFree(pv_f);
+        cudaFree(hk_o); cudaFree(hv_o); cudaFree(hk_b); cudaFree(hv_b);
+        cudaFree(hk_c); cudaFree(hv_c); cudaFree(hk_f); cudaFree(hv_f);
     }
 
     // -------------------------------------------------------------

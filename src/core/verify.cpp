@@ -574,10 +574,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
-                // R2-revive: the batched tail is open under Q4_0 KV too. kv_append and the
-                // indexer append stay per-token (their batch entry points take host-side
-                // positions, which would go stale on graph replay: batch graphs are keyed
-                // by shape, not position). The q rotation MUST stay under kv_q4 (added to
+                // R2-revive: the batched tail is open under Q4_0 KV too. K2: the kv_append_q4 and indexer
+                // appends batch a group's rows into ONE launch each via their *_batch_step entries, which
+                // read every row's position from its device step row - a host position would go stale on
+                // graph replay (batch graphs are keyed by shape, not position). n == 1 and the other
+                // storage modes keep the per-token loop. The q rotation MUST stay under kv_q4 (added to
                 // the qb path below): without it <Hq,Hk> misaligns.
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled();
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
@@ -597,6 +598,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                 }
                 stamp(l, 8, grp);
                 if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+                // K2: one launch per K/V over the group's rows; each row's position is read from its own
+                // device step row at replay. The per-token loop below stays the oracle (and the path for
+                // n == 1, kv_hybrid/kv_int8/fp16, and STRATA_DEC_BATCH=0).
+                if (dec_batch && n > 1 && st.kv_q4)
+                    kv_append_q4_batch_step(st.k_q4, st.v_q4, st.page_table, step_ + tb * kStepCount, n,
+                                            kcur_ + tb * NKV * HD, vcur_ + tb * NKV * HD, s, cs, &st.host);
+                else
                 for (int t = tb; t < te; ++t) {
                     const int32_t* step_t = step_ + t * kStepCount;
                     if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
@@ -615,6 +623,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                                        vcur_ + t * NKV * HD, s, cs, &st.host);
                 }
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                // K2: the group's contiguous run in ONE call; the kernels read the run's first cell from
+                // its device step row and mask their fixed launch shapes, so any replay position works.
+                if (dec_batch && n > 1)
+                    native_qsa_indexer_append_batch_step(idx_raw + tb * ID, n, step_ + tb * kStepCount + kStepPos, 0,
+                                                         (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                         rope_scaling(), cs);
+                else
                 for (int t = tb; t < te; ++t)
                     native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
                                               (const float*) wikn->data, EPS, ib, s, st.max_cells,
