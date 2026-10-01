@@ -201,6 +201,10 @@ public:
     int64_t batch_captures = 0;
     double batch_gpu_ms[4] = {}; // member pre, shared expert dispatch, member post, head
     int64_t windows = 0;
+    /// LANE sched-impl P3 (host-loop O3 counter-only): drive_passes no-progress accounting, written
+    /// only when STRATA_DRIVE_HISTO is set. Zero wait-posture change; the O3 behavior change (if any)
+    /// waits for the H1 repair.
+    uint64_t drive_idle_iters = 0, drive_idle_maxburst = 0, drive_calls = 0;
     /// Copy-stream host functions queued by fetch_dma (n > 0) since construction.  A window syncs the
     /// copy stream only when IT queued one: a window that queued none cannot raise flag B in the next
     /// one, so the stream is already drained (run()).
