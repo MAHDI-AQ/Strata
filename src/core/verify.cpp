@@ -1379,7 +1379,24 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
                 err = "batch verify: cannot query free VRAM"; return false;
             }
         }
-        if (free_bytes < reserve_bytes) {
+        // LANE failclean (test hook, default off): STRATA_TEST_REFUSE_CAPTURE is a comma list of
+        // 1-based capture ordinals to refuse with the reserve message - the falsification hook for
+        // the clean-fail path that needs no VRAM pressure.  Ordinals count every UNCACHED batch
+        // capture of the process: "1" refuses the first (stage-0 of the first batch unit), "2" the
+        // second (that unit's stage-1 capture), "1,3" a stage-0 refusal then a later stage-1 one.
+        // The refusal keeps the real message so the callers' matching and bookkeeping are verbatim.
+        static int test_capture_ordinal = 0;
+        static const char* test_refuse_list = std::getenv("STRATA_TEST_REFUSE_CAPTURE");
+        ++test_capture_ordinal;
+        bool test_refuse = false;
+        if (test_refuse_list != nullptr) {
+            const std::string list = std::string(",") + test_refuse_list + ",";
+            test_refuse = list.find("," + std::to_string(test_capture_ordinal) + ",") != std::string::npos;
+        }
+        if (free_bytes < reserve_bytes || test_refuse) {
+            if (test_refuse)
+                std::fprintf(stderr, "strata verify: TEST hook refused batch capture #%d (STRATA_TEST_REFUSE_CAPTURE=%s)\n",
+                             test_capture_ordinal, test_refuse_list);
             cudaGraphExecDestroy(graph_exec);
             err = "batch verify: graph leaves " + std::to_string(free_bytes >> 20) +
                   " MiB free, below VRAM reserve; reduce expert cache/context";
