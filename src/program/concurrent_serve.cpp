@@ -775,6 +775,28 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         std::fprintf(stderr, "strata concurrent: stage overlap on: stage0[N+1] runs with stage1[N] "
                              "(ping-pong hand-off, per-parity captures)\n");
     }
+
+    // N1 (C2 acceptance kit, env-gated, default off): the stale-sink negative control.  Point a
+    // stage's publish target at ANOTHER stage's sink so the executing verifier's empty-plan
+    // fallback fires (verify.cpp service_one) and the round completes with silently wrong tokens,
+    // no hang.  The decision is resolved ONCE here - the env cannot change under a serve loop, so
+    // with it unset the round sites below keep only this cached branch and production behavior is
+    // unchanged.  The poison is applied at EVERY site that points a stage's publish target,
+    // because the pool reads split_drive.plan[st] at the LAYER DISPATCH of whichever pass it
+    // services:
+    //   * the top-of-round refresh (which skips stages >= 1 on the overlap path), and
+    //   * the overlap path's launch-site refresh of stages >= 1: the launched stage-1 pass is
+    //     serviced in a LATER round (the next drive, or the no-windows branch that closes the
+    //     previous unit), so a poison applied at the top of a round alone is overwritten by that
+    //     refresh before any stage-1 dispatch reads it - the stale arm went token-identical
+    //     (0/12 runs differed) on the two-device overlap path while the same hook was VALID on
+    //     the serial path (N1-hook forensics, 2026-10-01).
+    const char* const n1_stale_env = std::getenv("STRATA_PLAN_SINK_STALE");
+    auto n1_poison_plan_sinks = [&]() {
+        if (n1_stale_env == nullptr || stage_plans == nullptr || m.stages.size() < 2) return;
+        const int stale = std::abs(std::atoi(n1_stale_env)) % (int) m.stages.size();
+        stage_plans[stale] = stage_plans[(stale + 1) % (int) m.stages.size()];
+    };
     // One round unit: the windows of one iteration, their stage-0 and stage-1 pass owners, and the
     // slots whose epilogue (acceptance, commit, drafts) is still pending.
     struct Unit {
@@ -1114,14 +1136,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             dispatch.plan = windows.size() == 1 ? win_slots.front()->stages[0].verify.plan_sink()
                                                 : batch[0].plan_sink();
-            // N1 (C2 acceptance kit, env-gated, default off): the stale-sink negative control.  Point stage
-            // `st`'s publish target at ANOTHER stage's sink - a verifier that is not executing this round -
-            // so the empty-plan fallback fires and the round completes with silently wrong tokens, no hang.
-            if (const char* v = std::getenv("STRATA_PLAN_SINK_STALE");
-                v != nullptr && stage_plans != nullptr && m.stages.size() > 1) {
-                const int stale = std::abs(std::atoi(v)) % (int) m.stages.size();
-                stage_plans[stale] = stage_plans[(stale + 1) % (int) m.stages.size()];
-            }
+            // N1 (C2 acceptance kit, env-gated, default off): the stale-sink negative control -
+            // see n1_poison_plan_sinks.  The poison consumes exactly what the refresh above set,
+            // so it hits single-window AND batch rounds; the launch-site call below re-applies it
+            // where the overlap path points the stage>=1 targets.
+            n1_poison_plan_sinks();
             bool ok = true;
 
             if (!overlap) {
@@ -1261,6 +1280,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     for (size_t st = 1; st < m.stages.size(); ++st)
                         if (stage_plans)
                             stage_plans[st] = u.single ? u.slot->stages[st].verify.plan_sink() : batch[st].plan_sink();
+                    // N1: re-apply the stale-sink poison AFTER this refresh.  This is the site that
+                    // owns the just-launched stage-1 pass's sink, and the pass is not serviced until a
+                    // later round reads split_drive.plan[st] - without this second application the
+                    // top-of-round poison is overwritten here before any stage-1 dispatch sees it.
+                    n1_poison_plan_sinks();
                     ok = u.single ? u.lane1->begin_pass_window(u.T, u.tokens, u.pos0, pool, user, ev1[u.parity], err)
                                   : u.lane1->begin_pass_batch(u.chain, pool, user, ev1[u.parity], err);
                     if (!ok) {
