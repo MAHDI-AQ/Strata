@@ -903,6 +903,42 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             for (auto* ptr : u.ready) if (!ptr->draft->idle(err)) return false;
         return true;
     };
+    // LANE overlap-width (merged drain): a slot re-enters only after its unit's EPILOGUE ran
+    // (acceptance -> commit -> the draft that writes the next window's tokens) - that is the data
+    // dependency, not a policy.  What was policy is WHEN the drain ran: the old loop retired the
+    // in-flight unit in a separate iteration (a second "round") and launched its successor only in
+    // the one after.  With every slot inside the single in-flight unit (the locked-step shape: c
+    // requests admitted together, c == slots), the exclusion left the ready set empty, so the loop
+    // alternated launch-round / retire-only-round: rounds doubled (930 vs 492 at 5x87.5K, ~5.5
+    // tok/round) and no stage-0/stage-1 pair ever overlapped (prev was always already retired when
+    // the next unit launched).  The merged drain below retires the unit at the TOP of the iteration
+    // and falls through to build + launch its successor in the SAME iteration: one round per unit,
+    // full per-round batch width, like the serial loop.  Partial shapes (some slots mid-prompt)
+    // keep the two-units-in-flight pipeline path exactly as it was.
+    auto drain_prev_unit = [&]() -> int {
+        if (!core::Verifier::drive_passes(nullptr, prev.lane1, err)) return 1;
+        if (prev.single) { if (!prev.lane1->end_pass_window(prev.T, prev.out, err)) return 1; }
+        else { if (!prev.lane1->end_pass_batch(prev.chain, err)) return 1; }
+        target_ms += elapsed(prev.t_start);
+        target_rows += prev.single ? prev.T : [&] { int64_t r = 0; for (const auto& w : prev.windows) r += w.count; return r; }();
+        if (!retire_unit(prev)) return 1;
+        prev.valid = false;
+        return 0;
+    };
+    // The merged-drain precondition, read WITHOUT the ready-scan's side effects: could any slot
+    // launch a window this instant?  Mirrors the scan's inclusion test exactly where it matters
+    // (active, caught up, not owned by the in-flight unit, and the context / max_new headroom that
+    // n >= 1 needs); the scan still owns finish()/allocation.  Over-inclusion is safe - the normal
+    // path then runs and the scan decides; under-inclusion cannot happen, because every condition
+    // here is necessary for the scan to produce a window for that slot.
+    auto slot_launchable = [&](Impl::Slot& s) -> bool {
+        if (!s.active.load() || s.read.load(std::memory_order_acquire) < s.position.load()) return false;
+        if (overlap && prev.valid &&
+            std::find(prev.ready.begin(), prev.ready.end(), &s) != prev.ready.end()) return false;
+        if (s.position.load() >= c.context) return false;
+        if (s.generated >= s.request.max_new) return false;
+        return true;
+    };
     // P4: one slot's admission - the exact sequence the loop always ran (bookkeeping, per-stage reset
     // on each stage's device, drafter re-arm), plus the live-retention arm. `reused` = tokens of this
     // request the slot's sessions already hold (0 = fresh: zero every stage, today's path). The caller
@@ -1048,6 +1084,16 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     while (!quitting) {
         bool quit = false, input_done = false;
         core::progress().busy.store(!live.empty());
+        // LANE overlap-width (merged drain): when the in-flight unit owns every slot that could
+        // launch, retire it HERE and fall through - the successor unit is built and launched in
+        // this same iteration (one round per unit; see drain_prev_unit).  A partial ready set
+        // still takes the pipelined path below, exactly as before.
+        if (overlap && prev.valid) {
+            bool launchable = false;
+            for (size_t j = 0; j < m.slots.size() && !launchable; ++j)
+                launchable = slot_launchable(*m.slots[(rotation + j) % m.slots.size()]);
+            if (!launchable && drain_prev_unit()) return 1;
+        }
         if (!(overlap && prev.valid)) {   // nothing in flight: the input side runs now (the original position)
             if (service_input(quit)) return 1;
             input_done = true;
@@ -1324,13 +1370,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
         } else if (overlap && prev.valid) {
             // Nothing to launch: finish the previous unit (its stage-1 pass is the only thing in flight).
-            if (!core::Verifier::drive_passes(nullptr, prev.lane1, err)) return 1;
-            if (prev.single) { if (!prev.lane1->end_pass_window(prev.T, prev.out, err)) return 1; }
-            else { if (!prev.lane1->end_pass_batch(prev.chain, err)) return 1; }
-            target_ms += elapsed(prev.t_start);
-            target_rows += prev.single ? prev.T : [&] { int64_t r = 0; for (const auto& w : prev.windows) r += w.count; return r; }();
-            if (!retire_unit(prev)) return 1;
-            prev.valid = false;
+            if (drain_prev_unit()) return 1;
             if (dispatch.failed) {
                 err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
                 return 1;
