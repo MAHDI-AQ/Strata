@@ -42,8 +42,11 @@ class ConcurrentServe {
 public:
     explicit ConcurrentServe(ConcurrentConfig config);
     ~ConcurrentServe();
-    // Allocate sequence states and the shared prompt workspace BEFORE sizing the expert cache.
-    bool prepare(const core::ModelGeometry&, core::SessionState&, core::MtpDrafter&, std::string&);
+    // Allocate the per-stage sequence states and the stage-owned prompt workspaces BEFORE sizing the expert
+    // cache.  `stages` is the same list run() takes: stage 0 borrows `primary`; stages >= 1 borrow their
+    // ServeStage::session (the CLI GpuStage session the borrowed drafter was loaded against).
+    bool prepare(const core::ModelGeometry&, core::SessionState&, core::MtpDrafter&,
+                 const std::vector<ServeStage>&, std::string&);
     // stages.size()==1 == the single-GPU engine.  stage_plans = split_drive.plan (nullptr at N=1);
     // the per-round publish targets the C4 loops refresh.
     int run(const std::vector<ServeStage>& stages, core::ExpertSource* source,

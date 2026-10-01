@@ -266,9 +266,34 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
     return true;
 }
 
+// ================================ THE REPLAY FAMILY IS WHOLE-MODEL ================================
+// **A REPLAY PATH LAUNCHES ONE SESSION'S EVERY LAYER AND REPORTS A WHOLE-MODEL NUMBER.**  A layer-split stage's
+// session is not a whole model: it owns [layer_lo, layer_hi) and takes its input from the previous stage's
+// hand-off (serve runs the stages' verifiers; the prompt path runs the stages' prefill chain).  A range capture
+// has `gr.n` == its range's length - not `g.n_layers` - so these paths REFUSE it rather than launch a graph list
+// that stops at the carve's edge while the caller reads a whole-model number.
+namespace {
+bool whole_model_capture(const ModelGeometry& g, const SessionGraphs& gr, const char* what, std::string& err) {
+    if (gr.captured && gr.n == g.n_layers) return true;
+    err = std::string(what) + ": these paths run the whole model through one session; this capture covers " +
+          std::to_string(gr.n) + " of " + std::to_string(g.n_layers) + " layers" +
+          (gr.captured ? "" : " (nothing is captured)") +
+          " - a layer split serves its stages through their verifiers and prompt chain";
+    return false;
+}
+/// The token paths (`session_token`, `session_capture_token` - and through the capture guard, `session_run_token`)
+/// need the same thing of the SESSION: one carved for the whole model.  An unresolved session (a hand-built one
+/// that never ran `session_init`) has 0/0 here and is left alone - only a session `session_init` resolved to a
+/// partial range is refused.
+bool whole_model_session(const ModelGeometry& g, const SessionState& s) {
+    return s.layer_lo == 0 && (s.layer_hi == 0 || s.layer_hi == g.n_layers) &&
+           s.qsa_ord0 == 0 && s.gdn_ord0 == 0;
+}
+}  // namespace
+
 bool session_replay(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
                     void* stream, std::string& err) {
-    if (!gr.captured || gr.n != g.n_layers) { err = "session_replay: not captured"; return false; }
+    if (!whole_model_capture(g, gr, "session_replay", err)) return false;
     cudaStream_t cs = (cudaStream_t) stream;
     stage_token(g, pos, pos_base, s);
     for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -283,7 +308,8 @@ bool session_replay(const ModelGeometry& g, int64_t pos, int32_t pos_base, Sessi
 
 bool session_replay_full(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s,
                          SessionGraphs& gr, void* stream, std::string& err) {
-    if (!gr.captured || gr.n != g.n_layers || gr.posts == nullptr) {
+    if (!whole_model_capture(g, gr, "session_replay_full", err)) return false;
+    if (gr.posts == nullptr) {
         err = "session_replay_full: not captured with post graphs";
         return false;
     }
@@ -313,6 +339,7 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
         err = "session_replay_stages: not captured with the split";
         return false;
     }
+    if (!whole_model_capture(g, gr, "session_replay_stages_per_layer", err)) return false;
     cudaStream_t cs = (cudaStream_t) stream;
     stage_token(g, pos, pos_base, s);
 
@@ -369,6 +396,7 @@ bool session_replay_stage_sweep(const ModelGeometry& g, int64_t pos, int32_t pos
         err = "session_replay_stage_sweep: not captured with the split";
         return false;
     }
+    if (!whole_model_capture(g, gr, "session_replay_stage_sweep", err)) return false;
     if (k < 1 || k > 5) { err = "session_replay_stage_sweep: k must be 1..5"; return false; }
     cudaStream_t cs = (cudaStream_t) stream;
     stage_token(g, pos, pos_base, s);
@@ -410,6 +438,7 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
         err = "session_replay_stage_prefixes: not captured with the split";
         return false;
     }
+    if (!whole_model_capture(g, gr, "session_replay_stage_prefixes", err)) return false;
     cudaStream_t cs = (cudaStream_t) stream;
     stage_token(g, pos, pos_base, s);
     const int64_t n = g.n_layers;
@@ -559,7 +588,7 @@ void SessionLoopScratch::free() {
 bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
                   PoolFn pool, HitFn hits, void* user, bool overlap, void* stream, std::string& err,
                   float* dump_layers, SessionLoopScratch* scratch) {
-    if (!gr.captured || gr.n != g.n_layers) { err = "session_loop: not captured"; return false; }
+    if (!whole_model_capture(g, gr, "session_loop", err)) return false;
     if (gr.parts_dev == nullptr) { err = "session_loop: the graphs were captured without a parts buffer"; return false; }
     if (s.db == nullptr) { err = "session_loop: no doorbell; the loop has nothing to poll"; return false; }
 
@@ -772,6 +801,14 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                    SessionState& s, const float* parts, void* stream, bool sync_every_layer,
                    std::string& err) {
+    // **THE TOKEN PATHS ARE WHOLE-MODEL, LIKE THE REPLAY FAMILY.**  This one broadcasts ONE embedding into `R`
+    // and walks every layer to the head, and the row arithmetic below assumes a whole-model session
+    // (`gdn_index` is the model-global GDN ordinal); a layer-split stage's session would index
+    // `gdn_state`/`qsa_states` outside its carve.  Refuse it here rather than corrupt state.
+    if (!whole_model_session(g, s)) {
+        err = "session_token: a layer-split stage session cannot run the whole-model token path";
+        return false;
+    }
     cudaStream_t cs = (cudaStream_t) stream;
     int64_t qsa_index = 0;
     int64_t gdn_index = 0;
@@ -820,6 +857,11 @@ namespace strata::core {
 bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, SessionState& s, float* parts_dev,
                            const float* y_miss_host, size_t parts_bytes, TokenGraph& tg, std::string& err,
                            const TokenHits* hits) {
+    // the same whole-model rule as `session_token`: the captured graph holds every layer and reads one session.
+    if (!whole_model_session(g, s)) {
+        err = "session_capture_token: a layer-split stage session cannot capture the whole-model token graph";
+        return false;
+    }
     if (hits != nullptr && !hits->on()) { err = "session_capture_token: incomplete hit configuration"; return false; }
     if (tg.captured) return true;
     if (s.db == nullptr || s.db->d_flag == nullptr || s.db->d_seq == nullptr) {
