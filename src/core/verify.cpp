@@ -369,7 +369,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
     // residual, pending write and inject (see set_stage)
     if (lb_ > 0) {
         // C2-A3: a batch round packs every member's rows [0, total); row0 is this member's offset.
-        if (row0 < 0 || row0 + T > (int64_t) max_t_) { err = "verify: window row offset out of range"; return false; }
+        if (row0 < 0 || row0 + T > (int64_t) 16) { err = "verify: window row offset out of range (row0=" + std::to_string(row0) + ", T=" + std::to_string(T) + ", max_t=" + std::to_string(max_t_) + ")"; return false; }
         for (int t = 0; t < T; ++t) {
             const float* in = hand_in_ + (size_t) (row0 + t) * HB;
             copy_from_mapped(Rt(t), in, HC * N, cs);
@@ -765,7 +765,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
     if (phase == 1) return pre(layer, 0);
     if (phase == 2 || phase == 3) return post(layer, 0);
     if (phase == 5) {   // C2-A3: a split's earlier stage hands this window's packed rows on
-        if (row0 < 0 || row0 + T > (int64_t) max_t_) { err = "verify: window row offset out of range"; return false; }
+        if (row0 < 0 || row0 + T > (int64_t) 16) { err = "verify: window row offset out of range (row0=" + std::to_string(row0) + ", T=" + std::to_string(T) + ", max_t=" + std::to_string(max_t_) + ")"; return false; }
         for (int t = 0; t < T; ++t) {
             float* out = hand_out_ + (size_t) (row0 + t) * HB;
             copy_from_mapped(out, Rt(t), HC * N, cs);
