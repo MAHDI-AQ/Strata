@@ -1536,10 +1536,12 @@ void Verifier::publish_plan(void* ctx) {
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
-bool Verifier::commit(int n_keep, std::string& err) {
+// LANE hostloop: commit() is split so callers can LAUNCH every slot's commit chain first and wait
+// afterwards (the per-slot chains then run concurrently instead of one-slot-at-a-time).  The
+// contract is unchanged for the historical wrapper: commit() == commit_launch() + commit_wait().
+bool Verifier::commit_launch(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
-    const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
@@ -1551,15 +1553,25 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[0] = ss_->ple_prev[1];
             ss_->ple_prev[1] = last_tokens_[t];
         }
-    // Only the CHAIN TAIL syncs.  A non-tail stage's commit graph writes only that stage's own session
-    // state; its consumers are the next launch on the SAME stream (ordered without a host wait) and
-    // nothing on the host.  The tail's sync is the caller's dependency: the drafter's own stream reads
-    // the last stage's committed state next.
-    if (next_ != nullptr) return next_->commit(n_keep, err);
+    // A non-tail stage's commit graph writes only that stage's own session state; its consumers are
+    // the next launch on the SAME stream (ordered without a host wait) and nothing on the host.
+    if (next_ != nullptr) return next_->commit_launch(n_keep, err);
+    return true;
+}
+
+// Only the CHAIN TAIL waits.  The tail's wait is the caller's dependency: the drafter's own stream
+// reads the last stage's committed state next (ms_commit now measures the tail WAIT only).
+bool Verifier::commit_wait(std::string& err) {
+    if (next_ != nullptr) return next_->commit_wait(err);
+    const Clock::time_point t0 = Clock::now();
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     ms_commit += ms_since(t0);
     return true;
+}
+
+bool Verifier::commit(int n_keep, std::string& err) {
+    return commit_launch(n_keep, err) && commit_wait(err);
 }
 
 
