@@ -169,6 +169,11 @@ class StrataEngine:
         self._write_lock = threading.Lock()
         self._channels_lock = threading.Lock()
         self._channels = {}
+        # Request progress for /metrics at concurrency > 1: each reader stores (read, total) under
+        # its request number.  Deliberately NOT guarded by _channels_lock - a CPython dict's
+        # set/pop/copy are single atomic steps, and /metrics must never wait on a request-path lock
+        # (the first attempt at this patch took that lock and could deadlock against its own caller).
+        self._shared_progress = {}
         self._request_number = 0
         self.multiplex = False
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
@@ -233,7 +238,16 @@ class StrataEngine:
 
     @property
     def progress(self):
-        return getattr(self._request_local, "progress", None) if self.multiplex else getattr(self, "_progress_value", None)
+        if not self.multiplex:
+            return getattr(self, "_progress_value", None)
+        # Concurrent mode: the metrics thread cannot read the request threads' locals, so report
+        # what the readers recorded: the furthest-along read count and the sum of the totals
+        # (surfaces as live.prompt_read / live.prompt_total in /metrics).  copy() is one atomic
+        # step, and taking no lock keeps a /metrics call from ever waiting on the request path.
+        vals = [v for v in self._shared_progress.copy().values() if v and v[1]]
+        if not vals:
+            return None
+        return (max(v[0] for v in vals), sum(v[1] for v in vals))
 
     @progress.setter
     def progress(self, value):
@@ -320,7 +334,9 @@ class StrataEngine:
                     yield int(line[2:])
                 elif line.startswith("PP "):
                     fields = line.split()
-                    self.progress = (int(fields[1]), int(fields[2]))
+                    pr = (int(fields[1]), int(fields[2]))
+                    self.progress = pr                       # this reader's value (unchanged)
+                    self._shared_progress[number] = pr       # /metrics snapshot; lock-free (see progress)
                     yield None
                 elif line.startswith("DONE "):
                     self._parse_done(line)
@@ -332,6 +348,7 @@ class StrataEngine:
         finally:
             with self._channels_lock:
                 self._channels.pop(number, None)
+            self._shared_progress.pop(number, None)          # lock-free (see progress)
             if sent and not done:
                 try:
                     self._send(f"CSTOP {number}")
@@ -980,7 +997,7 @@ class Service:
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
-        if state == "reading" and progress:
+        if progress and s.get("busy"): # also while a mixed batch still reads (state may be "generating")
             live["prompt_read"], live["prompt_total"] = progress
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
