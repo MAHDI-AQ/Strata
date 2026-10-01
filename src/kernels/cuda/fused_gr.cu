@@ -180,7 +180,7 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
 }
 
 #if defined(__HIPCC__)
-constexpr int TILE = 1280;             // eight-token tile fits gfx1100's 64 KiB LDS limit
+constexpr int TILE = 1280;             // eight-token tile fits RDNA3/RDNA4's 64 KiB LDS limit
 #else
 constexpr int TILE = 2560;             // xn floats per token staged at a time: 320 chunks of 8, 10 per lane
 #endif
@@ -342,7 +342,20 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         // fits the 48 KB default (4 tokens of the CUDA tile; all 8 of HIP's smaller tile).  The down kernel's
         // outputs (lo, inject_out) are strictly per-token, so the chunk boundaries are safe, and the up kernel
         // below still sees every token of the batch in one launch.
-        const int capacity = (optin > 0 ? optin : 48 * 1024) / (int) (TILE * sizeof(float));
+        //
+        // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
+        // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
+        // will launch is its per-block limit, so the capacity comes from that below sm_70 - the same 4 tokens
+        // the "no opt-in" branch assumes, but taken from the attribute that is actually enforced.
+#if defined(__HIPCC__)
+        const int usable = optin > 0 ? optin : 48 * 1024;
+#else
+        int cc = 0, per_block = 0;
+        cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&per_block, cudaDevAttrMaxSharedMemoryPerBlock, dev);
+        const int usable = (cc >= 7 && optin > 0) ? optin : per_block;
+#endif
+        const int capacity = usable / (int) (TILE * sizeof(float));
         chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
         attr[dev] = true;
     }
