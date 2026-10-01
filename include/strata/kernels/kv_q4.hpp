@@ -53,6 +53,14 @@ void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64
                   const float* V, const QsaShapes& s, void* stream, const KvHostPools* host = nullptr,
                   const KvHostPools* stage = nullptr);
 
+/// The captured decode window: the n consecutive (already rotated) cells at the positions of n step rows
+/// ([n, kStepCount] DEVICE memory, kStepPos each), K/V [n, n_head_kv, 256]; one launch per K/V.  Every
+/// position is re-read at each graph replay, so one shape-keyed capture serves windows at any position.
+/// Row-wise this is kv_append_q4_step's arithmetic and the prompt batch's, cell for cell.
+void kv_append_q4_batch_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+                             int64_t n, const float* K, const float* V, const QsaShapes& s, void* stream,
+                             const KvHostPools* host = nullptr);
+
 /// Gather step[kStepWidth] cells named by `ids` into FP16 scratch [id][kv_head][head_dim] (still rotated).
 void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* page_table, const int32_t* ids,
                        const int32_t* step, int64_t max_ids, const QsaShapes& s, uint16_t* k_scratch,

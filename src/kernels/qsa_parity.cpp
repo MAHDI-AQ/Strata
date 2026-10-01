@@ -1454,6 +1454,144 @@ int main(int argc, char** argv) {
         check(cudaStreamDestroy(cs), "csd");
     }
 
+    // ================= the native indexer's batched STEP append: device positions, mid-sequence, captured =====
+    // The captured decode window (verify.cpp) calls native_qsa_indexer_append_batch_step once per member's
+    // contiguous run; the run's first cell is read from the DEVICE step row so a shape-keyed capture re-reads
+    // it at every replay.  (a) mid-sequence, under all three scalings: the run starts at cell 9, so block 2's
+    // keys mix the seed's tail with the run's rows - the state must be BIT-IDENTICAL to the sequential
+    // appends'.  (b) ONE captured call replayed at TWO different device positions equals the sequential
+    // oracle after each replay; a position baked in at capture would rewrite the first run's blocks instead
+    // of the second's (the state comparison is the negative control).
+    {
+        std::printf("\n-- the native indexer's batched step append (device positions)\n");
+        using RST = strata::kernels::RopeScalingType;
+        const int64_t MC = 1024, W = 8, SEED = 9;   // seed cells 0..8; runs of 8: [9..16], [17..24], [25..32]
+        const int64_t NALL = SEED + 3 * W;
+        std::vector<float> raws((size_t) NALL * IDXD);
+        for (size_t i = 0; i < raws.size(); ++i) raws[i] = (float) std::sin((double) i * 0.017) * 2.0f - 0.2f;
+        cudaStream_t cs = nullptr;
+        check(cudaStreamCreate(&cs), "cs");
+        const size_t prows = (size_t) (MC / R + 1) * IDXD, trows = (size_t) (R - 1) * IDXD;
+        Dev<float> pA(prows), dA(IDXD), tA(trows), pB(prows), dB(IDXD), tB(trows),
+                   pC(prows), dC(IDXD), tC(trows), pD(prows), dD(IDXD), tD(trows);
+        Dev<int32_t> bA(1), bB(1), bC(1), bD(1), dpos(1);
+        Dev<float> drawAll((size_t) W * IDXD);
+        strata::kernels::RopeScaling sc;               // set per variant (a) / explicitly none for (b)
+        auto init = [&](Dev<float>& P, Dev<float>& Dd, Dev<float>& T, Dev<int32_t>& B) {
+            check(cudaMemset(P.p, 0, prows * 4), "zero");
+            check(cudaMemset(Dd.p, 0, (size_t) IDXD * 4), "zero");
+            check(cudaMemset(T.p, 0, trows * 4), "zero");
+            check(cudaMemset(B.p, 0, 4), "zero");
+        };
+        auto bufs_of = [&](Dev<float>& T, Dev<float>& Dd, Dev<float>& P, Dev<int32_t>& B) {
+            return strata::kernels::QsaIndexerBuffers{T.p, Dd.p, P.p, B.p};
+        };
+        auto singles = [&](const strata::kernels::QsaIndexerBuffers& bf, int64_t first, int64_t n) {
+            Dev<float> draw((size_t) IDXD);
+            for (int64_t c = first; c < first + n; ++c) {
+                check(cudaMemcpy(draw.p, &raws[(size_t) c * IDXD], IDXD * 4, cudaMemcpyHostToDevice), "raw");
+                const int32_t cp = (int32_t) c;
+                check(cudaMemcpy(dpos.p, &cp, 4, cudaMemcpyHostToDevice), "pos");
+                strata::kernels::native_qsa_indexer_append(draw.p, dpos.p, 0, dw_kn.p, EPS, bf, S, MC, sc, cs);
+            }
+        };
+        auto batch_step = [&](const strata::kernels::QsaIndexerBuffers& bf, int64_t first) {
+            check(cudaMemcpy(drawAll.p, &raws[(size_t) first * IDXD], (size_t) W * IDXD * 4,
+                             cudaMemcpyHostToDevice), "raw");
+            const int32_t fp = (int32_t) first;
+            check(cudaMemcpy(dpos.p, &fp, 4, cudaMemcpyHostToDevice), "pos");
+            strata::kernels::native_qsa_indexer_append_batch_step(drawAll.p, W, dpos.p, 0, dw_kn.p, EPS, bf, S, MC,
+                                                                  sc, cs);
+        };
+        auto diff = [&](Dev<float>& P1, Dev<float>& D1, Dev<float>& T1, Dev<int32_t>& B1,
+                        Dev<float>& P2, Dev<float>& D2, Dev<float>& T2, Dev<int32_t>& B2) -> long long {
+            const std::vector<float> p = P1.get(prows), q = P2.get(prows);
+            const std::vector<float> d = D1.get((size_t) IDXD), e = D2.get((size_t) IDXD);
+            const std::vector<float> t = T1.get(trows), u = T2.get(trows);
+            const std::vector<int32_t> b = B1.get(1), v = B2.get(1);
+            long long bad = 0;
+            for (size_t i = 0; i < p.size(); ++i) bad += std::memcmp(&p[i], &q[i], 4) != 0;
+            for (size_t i = 0; i < d.size(); ++i) bad += std::memcmp(&d[i], &e[i], 4) != 0;
+            for (size_t i = 0; i < t.size(); ++i) bad += std::memcmp(&t[i], &u[i], 4) != 0;
+            bad += std::memcmp(&b[0], &v[0], 4) != 0;
+            return bad;
+        };
+        // (a) mid-sequence, all three scalings
+        struct Variant { const char* name; RST type; double factor; double ext; };
+        const Variant variants[] = {{"none", RST::None, 1.0, 0.0},
+                                    {"linear 2", RST::Linear, 2.0, 0.0},
+                                    {"yarn 2", RST::YaRN, 2.0, 1.0}};
+        for (const Variant& var : variants) {
+            sc.type = var.type;
+            sc.factor = var.factor;
+            sc.ext_factor = var.ext;
+            init(pA, dA, tA, bA); init(pB, dB, tB, bB);
+            const auto fa = bufs_of(tA, dA, pA, bA), fb = bufs_of(tB, dB, pB, bB);
+            singles(fa, 0, SEED);
+            singles(fb, 0, SEED);
+            singles(fa, SEED, W);
+            batch_step(fb, SEED);
+            check(cudaStreamSynchronize(cs), "sync a");
+            const long long bad = diff(pA, dA, tA, bA, pB, dB, tB, bB);
+            std::printf("  %-46s %s (%lld of %zu state words differ)\n",
+                        (std::string("batch step vs sequential, mid-sequence, ") + var.name).c_str(),
+                        bad ? "*** WRONG ***" : "bit-identical", bad,
+                        (size_t) (MC / R + 1) * IDXD + (size_t) IDXD + trows + 1);
+            if (bad) ++g_bad;
+        }
+        // (b) one captured call, two replays at different device positions
+        sc.type = RST::None; sc.factor = 1.0; sc.ext_factor = 0.0;
+        init(pC, dC, tC, bC); init(pD, dD, tD, bD);
+        const auto fc = bufs_of(tC, dC, pC, bC), fd = bufs_of(tD, dD, pD, bD);
+        singles(fc, 0, SEED + W);                      // cells 0..16, identical history on both sides
+        singles(fd, 0, SEED + W);
+        const int32_t first0 = (int32_t) (SEED + W);   // 17
+        check(cudaMemcpy(dpos.p, &first0, 4, cudaMemcpyHostToDevice), "pos");
+        check(cudaMemcpy(drawAll.p, &raws[(size_t) first0 * IDXD], (size_t) W * IDXD * 4,
+                         cudaMemcpyHostToDevice), "raw");
+        cudaStream_t cs2 = nullptr;
+        check(cudaStreamCreate(&cs2), "cs2");
+        check(cudaStreamBeginCapture(cs2, cudaStreamCaptureModeThreadLocal), "begincap");
+        strata::kernels::native_qsa_indexer_append_batch_step(drawAll.p, W, dpos.p, 0, dw_kn.p, EPS, fc, S, MC,
+                                                              sc, cs2);
+        cudaGraph_t g2 = nullptr;
+        check(cudaStreamEndCapture(cs2, &g2), "endcap");
+        check(cudaStreamDestroy(cs2), "csd");
+        size_t nodes2 = 0;
+        check(cudaGraphGetNodes(g2, nullptr, &nodes2), "nodes");
+        cudaGraphExec_t ex2 = nullptr;
+        check(cudaGraphInstantiate(&ex2, g2, 0), "inst");
+        check(cudaGraphLaunch(ex2, nullptr), "launch 1");
+        singles(fd, SEED + W, W);                      // the oracle's first window
+        check(cudaStreamSynchronize(cs), "sync b1");
+        const long long bad1 = diff(pC, dC, tC, bC, pD, dD, tD, bD);
+        std::printf("  %-46s %s (%lld differ, %zu nodes)\n", "captured replay at the first position",
+                    bad1 ? "*** WRONG ***" : "bit-identical", bad1, nodes2);
+        if (bad1) ++g_bad;
+        const int32_t first1 = (int32_t) (SEED + 2 * W);   // 25
+        check(cudaMemcpy(dpos.p, &first1, 4, cudaMemcpyHostToDevice), "pos");
+        check(cudaMemcpy(drawAll.p, &raws[(size_t) first1 * IDXD], (size_t) W * IDXD * 4,
+                         cudaMemcpyHostToDevice), "raw");
+        check(cudaGraphLaunch(ex2, nullptr), "launch 2");
+        singles(fd, SEED + 2 * W, W);                  // the oracle's second window
+        check(cudaStreamSynchronize(cs), "sync b2");
+        const long long bad2 = diff(pC, dC, tC, bC, pD, dD, tD, bD);
+        std::printf("  %-46s %s (%lld differ)\n", "the SAME graph replayed at a later position",
+                    bad2 ? "*** WRONG ***" : "bit-identical", bad2);
+        if (bad2) ++g_bad;
+        // the negative control, printed explicitly: the later window's blocks must be populated
+        const std::vector<float> pc = pC.get(prows);
+        int later_rows_nonzero = 0;
+        for (int64_t b = 6; b <= 7; ++b)
+            for (size_t d = 0; d < (size_t) IDXD; ++d) later_rows_nonzero += pc[(size_t) b * IDXD + d] != 0.0f;
+        std::printf("  %-46s %d of %d non-zero\n", "the later window's pooled rows (blocks 6-7)",
+                    later_rows_nonzero, 2 * IDXD);
+        if (later_rows_nonzero == 0) ++g_bad;
+        check(cudaGraphExecDestroy(ex2), "exd");
+        check(cudaGraphDestroy(g2), "gd");
+        check(cudaStreamDestroy(cs), "csd");
+    }
+
     // ================= the spare (position 0) under rope scaling: the table indexer vs the native one =========
     // The spare key (`dead`, and `pooled[0]` until the first block completes) rotates at angle 0.  Its sine is
     // 0 in every scaling, so the rotation is `v * cos_tab[0][pair]`: exactly `v` unscaled (row 0 is (1, 0), the

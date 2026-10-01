@@ -33,10 +33,20 @@ bool native_qsa_indexer_enabled();
 // This adapter does not alter score accumulation, top-k, or finite 1e9 tail bias.
 // perf-review C-2: the appends of cells [p0, p0 + n) at once, leaving the buffers exactly as n calls of the
 // single append in order would (the prompt path appends a chunk before any query reads the state). raw [n, 128].
-// Host-side positions (not for a captured graph).
+// Host-side positions (not for a captured graph; the captured window's entry is _batch_step below).
 void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
                                      const RopeScaling& scaling, void* stream);
+
+// The captured decode window: ONE member's contiguous run of n cells, raw [n, 128], the run's first cell read
+// from DEVICE memory (`first_cell_device`, its first step row's kStepPos) so a shape-keyed capture re-reads it
+// at every replay.  The launch shapes depend on n alone and out-of-range cells are masked in-kernel, so the
+// same captured graph stays valid wherever the window lands.  Callers keep calls to contiguous runs (members'
+// runs are independent); the state left is exactly the sequential single appends'.
+void native_qsa_indexer_append_batch_step(const float* raw, int64_t n, const int32_t* first_cell_device,
+                                          int32_t pos_base, const float* gamma, float epsilon,
+                                          const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
+                                          const RopeScaling& scaling, void* stream);
 
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device,
                                int32_t pos_base, const float* gamma, float epsilon,

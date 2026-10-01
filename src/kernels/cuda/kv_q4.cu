@@ -135,6 +135,27 @@ __global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* _
     if (stage.k_q4 != nullptr) q4_store(is_v ? stage.v_q4 : stage.k_q4, row_id, b, th, d, byte);
 }
 
+// The captured decode window: the same per-block arithmetic as the prompt batch above, every row's position
+// read from its own step row (DEVICE memory, re-read at every graph replay - the single-token kernel's read).
+__global__ void kv_append_q4_batch_step_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
+                                               const int32_t* __restrict__ table,
+                                               const int32_t* __restrict__ step,
+                                               const float* __restrict__ K, const float* __restrict__ V,
+                                               int kv_heads, int head_dim, int page_size, int is_v_grid,
+                                               KvHostPools host) {
+    const long long t = blockIdx.x;
+    const long long pos = (long long) __ldg(step + t * kStepCount + kStepPos);
+    const int h = blockIdx.y, b = blockIdx.z, th = threadIdx.x;
+    const bool is_v = is_v_grid != 0;
+    const float x = (is_v ? V : K)[t * (kv_heads * head_dim) + h * head_dim + b * QK4_0 + th];
+    uint8_t byte;
+    const uint16_t d = q4_group(x, th, byte);
+    const long long page = (long long) table[pos / page_size];
+    const long long row_id = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+    if (page >= 0) q4_store(is_v ? v_q4 : k_q4, (page * kv_heads + h) * page_size + (pos % page_size), b, th, d, byte);
+    if (host.k_q4 != nullptr) q4_store(is_v ? host.v_q4 : host.k_q4, row_id, b, th, d, byte);
+}
+
 // Gather step[kStepWidth] cells into FP16 scratch (the non-fused attention paths)
 __global__ void kv_gather_q4_kernel(const uint8_t* __restrict__ k_q4, const uint8_t* __restrict__ v_q4,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
@@ -212,6 +233,21 @@ void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64
         kv_append_q4_batch_kernel<<<grid, 32, 0, cs>>>(k_q4, v_q4, page_table, pos0, K, V, (int) s.n_head_kv,
                                                        (int) s.head_dim, (int) s.page_size, is_v, h, st);
     check("kv_append_q4 batch launch");
+}
+
+void kv_append_q4_batch_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+                             int64_t n, const float* K, const float* V, const QsaShapes& s, void* stream,
+                             const KvHostPools* host) {
+    if (n <= 0) return;
+    need_256(s, "kv_append_q4_batch_step");
+    const dim3 grid((unsigned) n, (unsigned) s.n_head_kv, (unsigned) (s.head_dim / QK4_0));
+    cudaStream_t cs = (cudaStream_t) stream;
+    const KvHostPools h = host ? *host : KvHostPools{};
+    for (int is_v = 0; is_v < 2; ++is_v)
+        kv_append_q4_batch_step_kernel<<<grid, 32, 0, cs>>>(k_q4, v_q4, page_table, step, K, V,
+                                                            (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
+                                                            is_v, h);
+    check("kv_append_q4 batch-step launch");
 }
 
 void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* page_table, const int32_t* ids,

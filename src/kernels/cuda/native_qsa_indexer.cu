@@ -199,6 +199,88 @@ __global__ void append_tail(const float* __restrict__ raw, int64_t n, int64_t p0
     if (cell < p0) return;
     tail[s * D + d] = __half2float(__float2half_rn(raw[(cell - p0) * D + d]));
 }
+// ---- K2: the captured decode window's batched append.  The same arithmetic as append_first/append_blocks/
+// append_tail, with the run's first cell read from DEVICE memory and the launch shapes fixed functions of n
+// alone (out-of-range work masked inside, never launched away) - so one shape-keyed capture replays at any
+// position.  One call owns ONE member's contiguous run.
+__global__ void append_first_step(const float* __restrict__ raw, const int32_t* __restrict__ first_dev,
+                                  const float* __restrict__ gamma, float epsilon, float* __restrict__ dead,
+                                  float* __restrict__ pooled, float theta_scale, float freq_scale,
+                                  float corr_low, float corr_high, float ext_factor, float mscale,
+                                  const int32_t* __restrict__ mtab) {
+    if (__ldg(first_dev) != 0) return;                 // the spare's completion only at cell 0
+    const int d = threadIdx.x;
+    __shared__ float values[D];
+    __shared__ float partials[32];
+    float mean = 0.0f;
+    if (d < D) {
+        const float incoming = __half2float(__float2half_rn(raw[d]));
+        float sum = incoming;
+#pragma unroll
+        for (int j = 1; j < R; ++j) sum = __fadd_rn(sum, incoming);
+        mean = __fmaf_rn(0.25f, sum, 0.0f);
+    }
+    const float square_sum = norm_scale(mean, partials, d);
+    const float scale = rsqrtf(square_sum / D + epsilon);
+    if (d < D) values[d] = scale * mean * gamma[d];
+    __syncthreads();
+    if (d >= D) return;
+    const float y = pooled_value(values, d, 0, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale,
+                                 mtab, true);
+    pooled[d] = y;
+    dead[d] = y;
+}
+__global__ void append_blocks_step(const float* __restrict__ raw, int64_t n, const int32_t* __restrict__ first_dev,
+                                   int32_t pos_base, const float* __restrict__ gamma, float epsilon,
+                                   const float* __restrict__ tail, const float* __restrict__ dead,
+                                   float* __restrict__ pooled, int32_t* __restrict__ block_pos, int64_t max_cells,
+                                   float theta_scale, float freq_scale, float corr_low, float corr_high,
+                                   float ext_factor, float mscale, const int32_t* __restrict__ mtab) {
+    const int64_t p0 = (int64_t) __ldg(first_dev);
+    if (p0 < 0 || p0 >= max_cells) return;             // the single append ignores such cells
+    const int64_t end = p0 + n - 1 < max_cells ? p0 + n - 1 : max_cells - 1;
+    const int64_t first = p0 <= R - 1 ? 0 : (p0 - (R - 1) + R - 1) / R;
+    const int64_t hi = end >= R - 1 ? (end - (R - 1)) / R : -1;
+    const int64_t b = first + blockIdx.x;              // the grid covers ceil(n / R) >= the possible blocks
+    if (b > hi) return;
+    const int d = threadIdx.x;
+    __shared__ float values[D];
+    __shared__ float partials[32];
+    float mean = 0.0f;
+    if (d < D) {
+        auto key = [&](int j) -> float {
+            const int64_t cell = b * R + j;
+            return cell >= p0 ? __half2float(__float2half_rn(raw[(cell - p0) * D + d])) : tail[j * D + d];
+        };
+        float sum = key(0);
+#pragma unroll
+        for (int j = 1; j < R; ++j) sum = __fadd_rn(sum, key(j));
+        mean = __fmaf_rn(0.25f, sum, 0.0f);
+    }
+    const float square_sum = norm_scale(mean, partials, d);
+    const float scale = rsqrtf(square_sum / D + epsilon);
+    if (d < D) values[d] = scale * mean * gamma[d];
+    __syncthreads();
+    if (d >= D) return;
+    const int rope_pos = pos_base + R * (int) b;
+    pooled[std::size_t(b) * D + d] = pooled_value(values, d, rope_pos, theta_scale, freq_scale, corr_low, corr_high,
+                                                  ext_factor, mscale, mtab, false);
+    if (b == hi) {
+        pooled[std::size_t(b + 1) * D + d] = dead[d];
+        if (d == 0) *block_pos = rope_pos;
+    }
+}
+__global__ void append_tail_step(const float* __restrict__ raw, int64_t n, const int32_t* __restrict__ first_dev,
+                                 int64_t max_cells, float* __restrict__ tail) {
+    const int s = blockIdx.x, d = threadIdx.x;
+    if (d >= D) return;
+    const int64_t p0 = (int64_t) __ldg(first_dev);
+    if (p0 < 0 || p0 >= max_cells) return;
+    const int64_t last = p0 + n - 1 < max_cells ? p0 + n - 1 : max_cells - 1;
+    int64_t cell = last - ((last % R) - s + R) % R;       // the last cell <= last with cell % 4 == s
+    if (cell < p0) return;
+    tail[s * D + d] = __half2float(__float2half_rn(raw[(cell - p0) * D + d]));
+}
 struct Span { const void* p; std::size_t n; };
 void validate(Span s) {
     const auto p = reinterpret_cast<std::uintptr_t>(s.p);
@@ -257,6 +339,35 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
                                                                        b.dead, b.pooled, b.block_pos, first, hi,
                                                                        theta_scale, fsf, cl, ch, ef, ms, mtab);
     append_tail<<<R - 1, D, 0, st>>>(raw, n, p0, b.tail);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_qsa_indexer_append_batch_step(const float* raw, int64_t n, const int32_t* first_cell_device,
+                                          int32_t pos_base, const float* gamma, float epsilon,
+                                          const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
+                                          const RopeScaling& scaling, void* stream) {
+    if (n <= 0) return;
+    if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT || max_cells < 1 ||
+        max_cells > INT32_MAX || pos_base < 0 || pos_base % R || int64_t(pos_base) + max_cells > INT32_MAX ||
+        !std::isfinite(epsilon) || epsilon <= 0.0f || rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument("native QSA indexer (batch-step): bad geometry, parameters or scaling");
+    const Span spans[] = {{raw, std::size_t(n) * D * 4},{first_cell_device,4},{gamma,D*4},{b.tail,(R-1)*D*4},
+        {b.dead,D*4},{b.pooled,std::size_t(max_cells/R+1)*D*4},{b.block_pos,4}};
+    for (const auto& span : spans) validate(span);
+    for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
+        if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
+    const float fsf = k.freq_scale, cl = k.corr_low, ch = k.corr_high, ef = k.ext_factor, ms = k.attn_factor;
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    const int32_t* mtab = mrope_table();
+    append_first_step<<<1, THREADS, 0, st>>>(raw, first_cell_device, gamma, epsilon, b.dead, b.pooled, theta_scale,
+                                             fsf, cl, ch, ef, ms, mtab);
+    append_blocks_step<<<(unsigned) ((n + R - 1) / R), THREADS, 0, st>>>(raw, n, first_cell_device, pos_base, gamma,
+                                                                         epsilon, b.tail, b.dead, b.pooled,
+                                                                         b.block_pos, max_cells, theta_scale, fsf, cl,
+                                                                         ch, ef, ms, mtab);
+    append_tail_step<<<R - 1, D, 0, st>>>(raw, n, first_cell_device, max_cells, b.tail);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
