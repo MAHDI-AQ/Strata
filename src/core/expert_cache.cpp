@@ -186,6 +186,35 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     return true;
 }
 
+int64_t ExpertCache::release_tail_bytes(int64_t need_bytes, int64_t floor_slots, uint8_t** base_out) {
+    if (base_out != nullptr) *base_out = nullptr;
+    if (need_bytes <= 0 || base_ == nullptr) return -1;
+    // R4.2g's per-layer path keeps its own cursors; the strand below would desync them.  Refuse rather
+    // than half-release (the fleet's profile mode runs the global cursor).
+    if (per_layer_) return -1;
+    if (slots_ <= floor_slots) return -1;
+    // The suffix's byte size, exactly the prompt path's lend idiom (`part_bytes` in generate.cpp): sized
+    // slots carry per-slot offsets, uniform slots are blob-strided.
+    auto tail_bytes = [&](int64_t first) -> int64_t {
+        if (!off_.empty()) return (int64_t) off_[(size_t) slots_] - (int64_t) off_[(size_t) first];
+        return (slots_ - first) * blob_;
+    };
+    int64_t first = slots_;
+    while (first > floor_slots && tail_bytes(first) < need_bytes) --first;
+    if (tail_bytes(first) < need_bytes) return -1;
+    if (first >= slots_) return -1;   // no slot to release (need_bytes <= 0 is caught above)
+    if (base_out != nullptr) {
+        *base_out = off_.empty() ? base_ + (size_t) first * (size_t) blob_ : base_ + off_[(size_t) first];
+    }
+    // Every pair whose slot lives in the suffix is no longer resident; the cache never evicts these
+    // back - the bytes belong to the caller now.
+    for (auto& r : residency_) if (r >= first) r = kNotResident;
+    slots_ = first;
+    if (next_free_ > first) next_free_ = first;
+    if (admitted_ > first) admitted_ = first;
+    return first;
+}
+
 void ExpertCache::close() {
 #if defined(STRATA_USE_HIP)
     if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);

@@ -82,6 +82,17 @@ public:
     int64_t bytes() const { return off_.empty() ? slots_ * blob_ : (int64_t) off_.back(); }
     double gib() const { return (double) bytes() / 1073741824.0; }
 
+    /// **STRATA_SLOT_LAZY: HAND THE TAIL TO ANOTHER OWNER WITHOUT RETURNING IT TO THE DRIVER.**
+    /// The arena is ONE allocation, so a shrink cannot free bytes; what it CAN do is stop owning them:
+    /// the last slots' bytes become the caller's (a deferred slot's session arena is carved there), the
+    /// released pairs fall back to the streaming path, and `slots()` shrinks so no future admit, fill or
+    /// plan names them.  `*base_out` receives the suffix's first byte (valid even though the slot index
+    /// leaves the cache's range).  Returns the first released slot, or -1 when the suffix above
+    /// `floor_slots` cannot hold `need_bytes` (or the cache runs per-layer admission - refused).
+    /// Captured graphs stay safe: they read the residency table, so the caller must clear the released
+    /// pairs on EVERY residency copy before the next plan (see the adapt() doctrine).
+    int64_t release_tail_bytes(int64_t need_bytes, int64_t floor_slots, uint8_t** base_out);
+
     /// `(layer, expert)` -> slot index, or `kNotResident`.  Bounds-checked: a bad layer or expert returns
     /// `kNotResident` rather than reading whatever is adjacent in the table.
     int32_t slot_of(int64_t layer, int64_t expert) const;
