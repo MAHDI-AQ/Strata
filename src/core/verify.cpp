@@ -40,6 +40,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -330,7 +331,8 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // so the CPU computes A's experts of layer l while the GPU runs B's mixer and router of layer l, and B's experts
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
-bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase, int64_t layer) {
+bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase, int64_t layer,
+                            int64_t row0) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const WeightTable& wt = *wt_;
@@ -366,10 +368,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
     if (lb_ > 0) {
+        // C2-A3: a batch round packs every member's rows [0, total); row0 is this member's offset.
+        if (row0 < 0 || row0 + T > (int64_t) max_t_) { err = "verify: window row offset out of range"; return false; }
         for (int t = 0; t < T; ++t) {
-            copy_from_mapped(Rt(t), hand_in_ + (size_t) t * HB, HC * N, cs);
-            copy_from_mapped(bo_ + (size_t) t * N, hand_in_ + (size_t) t * HB + HC * N, N, cs);
-            copy_from_mapped(inj2_ + (size_t) t * HC, hand_in_ + (size_t) t * HB + HC * N + N, HC, cs);
+            const float* in = hand_in_ + (size_t) (row0 + t) * HB;
+            copy_from_mapped(Rt(t), in, HC * N, cs);
+            copy_from_mapped(bo_ + (size_t) t * N, in + HC * N, N, cs);
+            copy_from_mapped(inj2_ + (size_t) t * HC, in + HC * N + N, HC, cs);
         }
     } else if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
         ne->gather_dev(tok_, T, emb_, cs);
@@ -759,6 +764,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
 
     if (phase == 1) return pre(layer, 0);
     if (phase == 2 || phase == 3) return post(layer, 0);
+    if (phase == 5) {   // C2-A3: a split's earlier stage hands this window's packed rows on
+        if (row0 < 0 || row0 + T > (int64_t) max_t_) { err = "verify: window row offset out of range"; return false; }
+        for (int t = 0; t < T; ++t) {
+            float* out = hand_out_ + (size_t) (row0 + t) * HB;
+            copy_from_mapped(out, Rt(t), HC * N, cs);
+            copy_from_mapped(out + HC * N, bo_ + (size_t) t * N, N, cs);
+            copy_from_mapped(out + HC * N + N, inj2_ + (size_t) t * HC, HC, cs);
+        }
+        return true;
+    }
     if (phase < 0) {
     for (int grp = 0; grp < G; ++grp)
         if (!pre(lb_, grp)) return false;
@@ -1157,16 +1172,30 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user, std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
-    if (batch.empty() || batch.size() > 4 || split_ || next_ || lb_ != 0 || le_ != g_->n_layers) {
-        err = "batch verify: requires 1..4 complete single-GPU windows"; return false;
+    const bool chained = le_ < g_->n_layers;   // this stage hands its rows to a next stage
+    if (batch.empty() || batch.size() > 4 || split_) {
+        err = "batch verify: requires 1..4 member windows"; return false;
     }
+    // C2-A1: the chain must be CONTIGUOUS: the next stage starts exactly at this stage's le_,
+    // same geometry, and only a last stage may be chained-free.  A missing/mis-ranged next
+    // stage is an error, never a silent head-less run.
+    if (chained ? (next_ == nullptr || next_->lb_ != le_ || next_->g_ != g_)
+                : (next_ != nullptr)) {
+        err = "batch verify: the stage chain is not contiguous"; return false;
+    }
+    assert(!chained || (next_->lb_ == le_ && next_->le_ <= g_->n_layers));   // belt; A1 above is operative
     int total = 0;
     std::vector<std::pair<Verifier*, int>> shape;
     for (const auto& b : batch) {
         Verifier* v = b.verifier;
-        if (!v || v == this || v->g_ != g_ || v->wt_ != wt_ || v->device_ != device_ || v->split_ || v->next_ ||
-            v->lb_ != 0 || v->le_ != g_->n_layers || b.count < 1 || b.count > v->max_t_ ||
-            !b.tokens || !b.output) {
+        const bool member_chained = v != nullptr && v->next_ != nullptr;
+        if (!v || v == this || v->g_ != g_ || v->wt_ != wt_ || v->device_ != device_ || v->split_ ||
+            v->lb_ != lb_ || v->le_ != le_ ||                       // THIS stage's range, this device
+            member_chained != chained ||                            // a slot chains all its stages or none
+            (member_chained && (v->next_->g_ != g_ || v->next_->lb_ != le_)) ||
+            (lb_ > 0 && v->hand_in_ != hand_in_) ||                  // one boundary buffer, shared
+            (chained && v->hand_out_ != hand_out_) ||
+            b.count < 1 || b.count > v->max_t_ || !b.tokens || !b.output) {
             err = "batch verify: incompatible member"; return false;
         }
         for (const auto& previous : shape) if (previous.first == v || previous.first->ss_ == v->ss_) {
@@ -1175,6 +1204,14 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
         total += b.count;
         shape.emplace_back(v, b.count);
     }
+    // C2-A6: max_t_ = max(2, c.rows) <= 16 (verify.cpp:149: batch_workspace caps at 16; kVerifyMaxT = 8,
+    // verify_kernels.hpp:21), but the POOL refuses any single call with n_tok * k > kMaxWindowEntries
+    // (128; src/core/expert_source.cpp:974, guards at :982 and :988) and n_tok > MAXT (16;
+    // include/strata/kernels/cpu/expert.hpp:131).  This model: k = ss.k = 10 (verify.cpp:163)
+    // => <= 12 rows/round.  The acceptance configs keep --batch-rows 8.  The split hand-off buffer is
+    // kVerifyMaxT = 8 rows per boundary (generate.cpp:3696-3708) - batch-rows 8 fits EXACTLY; C3
+    // re-sizes it max(kVerifyMaxT, batch_rows).  13+ rows abort the engine LOUDLY at layer 0
+    // (dispatch.failed -> exit 1).  A7's census prints rows= for every capture.
     if (total > max_t_) { err = "batch verify: row budget exceeded"; return false; }
     for (const auto& b : batch)
         if (!b.verifier->stage_inputs(b.count, b.tokens, b.position, err) || !b.verifier->capture_commit(err)) return false;
@@ -1188,9 +1225,14 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
     }
     if (!graph_exec) {
         const auto capture_start = Clock::now();
+        struct CaptureGuard {
+            cudaStream_t cs; bool open = false;
+            ~CaptureGuard() { if (open) { cudaGraph_t g = nullptr; cudaStreamEndCapture(cs, &g); if (g) cudaGraphDestroy(g); } }
+        } capture_guard{cs_};
         if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
             err = "batch verify: begin capture failed"; return false;
         }
+        capture_guard.open = true;
         bool ok = true;
         const int64_t N = g_->n_embd, K = ss_->k;
         auto copy = [&](void* dst, const void* src, size_t bytes, cudaStream_t stream) {
@@ -1198,8 +1240,15 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
             // holding the driver lock needed by the host that must service its preceding doorbell.
             copy_i32_from_mapped((int32_t*) dst, (const int32_t*) src, (int64_t) (bytes / 4), stream);
         };
-        for (const auto& b : batch) if (ok) ok = b.verifier->record_window(b.count, cs_, err, 0);
-        for (int64_t l = 0; ok && l < g_->n_layers; ++l) {
+        // C2-A4: row0(member i) = sum of counts[j], j < i — a pure function of the shape list,
+        // identical in both stages' captures by construction.
+        int row_in = 0;
+        for (const auto& b : batch) if (ok) {
+            ok = b.verifier->record_window(b.count, cs_, err, 0, 0, row_in);
+            row_in += b.count;
+        }
+        if (ok && row_in != total) { err = "batch verify: row mapping broken (in)"; return false; }
+        for (int64_t l = lb_; ok && l < le_; ++l) {          // C2: this stage's layers only
             if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + 27), cs_);
             if (batch_parallel_ && cudaEventRecord(batch_fork_, cs_) != cudaSuccess) {
                 err = "batch verify: fork failed"; ok = false; break;
@@ -1243,14 +1292,76 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
             if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + 30), cs_);
         }
         if (prof_on_) gpu_stamp(prof_, (int) (g_->n_layers * kProfPer + 2), cs_);
-        for (const auto& b : batch) if (ok) ok = b.verifier->record_window(b.count, cs_, err, 4);
+        // C2-A4: the same cumulative offsets as the capture head; chained stages hand the rows
+        // on (phase 5), the last stage runs the head (phase 4).
+        int row_out = 0;
+        for (const auto& b : batch) if (ok) {
+            ok = chained ? b.verifier->record_window(b.count, cs_, err, 5, 0, row_out)
+                         : b.verifier->record_window(b.count, cs_, err, 4);
+            row_out += b.count;
+        }
+        if (ok && row_out != total) { err = "batch verify: row mapping broken (out)"; return false; }
         if (prof_on_) gpu_stamp(prof_, (int) (g_->n_layers * kProfPer + 3), cs_);
         cudaGraph_t graph = nullptr;
         const cudaError_t end = cudaStreamEndCapture(cs_, &graph);
+        capture_guard.open = false;           // disarm before any early return below
         if (!ok || end != cudaSuccess) {
             if (graph) cudaGraphDestroy(graph);
             if (err.empty()) err = "batch verify: end capture failed";
             return false;
+        }
+        if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {   // C2-A7: batch hand-off census
+            // Prove the capture is wired for THIS stage: a chained stage wrote its packed rows to
+            // hand_out (3 copy_from_mapped nodes per row: R, bo, inj), a later stage read them from
+            // hand_in, and a full-range coordinator has neither.  "No head on a chained stage" is the
+            // A4c either/or tail; the phase-5 count is its evidence.
+            size_t nn = 0;
+            cudaGraphGetNodes(graph, nullptr, &nn);
+            std::vector<cudaGraphNode_t> nodes(nn);
+            cudaGraphGetNodes(graph, nodes.data(), &nn);
+            const uintptr_t hb = (uintptr_t) Verifier::handoff_floats(*g_);
+            const uintptr_t span = (uintptr_t) total * hb * sizeof(float);
+            const uintptr_t hin = (uintptr_t) hand_in_, hout = (uintptr_t) hand_out_;
+            int in_nodes = 0, out_nodes = 0, named = 0;
+#if CUDART_VERSION >= 12030   // cudaFuncGetName arrived in CUDA 12.3
+            for (cudaGraphNode_t nd : nodes) {
+                cudaGraphNodeType ty;
+                cudaGraphNodeGetType(nd, &ty);
+                if (ty != cudaGraphNodeTypeKernel) continue;
+                cudaKernelNodeParams kp{};
+                if (cudaGraphKernelNodeGetParams(nd, &kp) != cudaSuccess || kp.func == nullptr) continue;
+                const char* fn = nullptr;
+                if (cudaFuncGetName(&fn, kp.func) != cudaSuccess || fn == nullptr) continue;
+                if (std::strstr(fn, "copy_from_mapped") == nullptr) continue;   // not copy_i32_from_mapped
+                ++named;
+                const char* dst = kp.kernelParams ? *(const char* const*) kp.kernelParams[0] : nullptr;
+                const char* src = kp.kernelParams ? *(const char* const*) kp.kernelParams[1] : nullptr;
+                if (hout != 0 && (uintptr_t) dst >= hout && (uintptr_t) dst < hout + span) ++out_nodes;
+                if (hin != 0 && (uintptr_t) src >= hin && (uintptr_t) src < hin + span) ++in_nodes;
+            }
+#endif
+            std::fprintf(stderr, "strata verify: batch capture stage [%lld,%lld) rows=%d hand_out=%d "
+                                 "hand_in=%d (%d copy_from_mapped nodes)\n",
+                         (long long) lb_, (long long) le_, total, out_nodes, in_nodes, named);
+#if CUDART_VERSION >= 12030
+            std::string& e2 = err;   // fail the round loudly on a wiring violation, never silently
+            if (chained && (out_nodes != 3 * total || in_nodes != 0)) {
+                e2 = "batch verify: stage [" + std::to_string(lb_) + "," + std::to_string(le_) +
+                     ") captured no complete hand-off out (" + std::to_string(out_nodes) + " of " +
+                     std::to_string(3 * total) + " copy_from_mapped nodes)";
+                cudaGraphDestroy(graph); return false;
+            }
+            if (!chained && lb_ > 0 && (in_nodes != 3 * total || out_nodes != 0)) {
+                e2 = "batch verify: stage [" + std::to_string(lb_) + "," + std::to_string(le_) +
+                     ") captured no complete hand-in (" + std::to_string(in_nodes) + " of " +
+                     std::to_string(3 * total) + " copy_from_mapped nodes)";
+                cudaGraphDestroy(graph); return false;
+            }
+            if (!chained && lb_ == 0 && (in_nodes != 0 || out_nodes != 0)) {
+                e2 = "batch verify: a full-range coordinator captured hand-off copies";
+                cudaGraphDestroy(graph); return false;
+            }
+#endif
         }
         const cudaError_t instantiate = cudaGraphInstantiate(&graph_exec, graph, 0);
         cudaGraphDestroy(graph);
@@ -1287,8 +1398,9 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
     groups_[total] = 1;
     batch_replay_ = graph_exec;
     const bool ran = run(total, nullptr, 0, pool, user, nullptr, err);
-    batch_replay_ = nullptr;
+    batch_replay_ = nullptr;                                             // reset BEFORE any chain call
     if (!ran) return false;
+    for (const auto& b : batch) ++b.verifier->windows;                   // this stage's members ran
     if (prof_on_) {
         cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
         for (int64_t l = 0; l < g_->n_layers; ++l)
@@ -1298,6 +1410,25 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
         batch_gpu_ms[3] += (double) (prof_h_[(size_t) g_->n_layers * kProfPer + 3] -
                                      prof_h_[(size_t) g_->n_layers * kProfPer + 2]) / 1e6;
     }
+    if (chained) {
+        // C2-A5: the hand-off was written into mapped memory and this stage's stream was synced by
+        // run() above; the next stage replays the SAME rows in the SAME order.  Outputs are the
+        // last stage's; sampling settings and final_R already chain through set_next().
+        std::vector<BatchWindow> chain_batch;
+        chain_batch.reserve(batch.size());
+        for (const auto& b : batch)
+            chain_batch.push_back({b.verifier->next_, b.count, b.tokens, b.position, b.output});
+        // belt: the derivation is positional — same size/order/counts, the member's own next stage
+        assert(chain_batch.size() == batch.size());
+        for (size_t i = 0; i < batch.size(); ++i) {
+            assert(chain_batch[i].verifier == batch[i].verifier->next_ &&
+                   chain_batch[i].count == batch[i].count &&
+                   chain_batch[i].verifier->lb_ == le_);                 // contiguity, per member
+        }
+        (void) 0;
+        return next_->run_batch(chain_batch, pool, next_user_, err);
+    }
+    // ---- the last stage: the head ran here (members' phase 4) — sampling and outputs
     for (const auto& b : batch) {
         Verifier& v = *b.verifier;
         if (v.head_sampling_ && ((!v.sampling_.greedy && v.sampling_.temperature > 0) || v.hist_d_)) {
@@ -1307,10 +1438,8 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
         }
     }
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "batch verify: sampling failed"; return false; }
-    for (const auto& b : batch) {
+    for (const auto& b : batch)
         for (int t = 0; t < b.count; ++t) b.output[t] = b.verifier->h_out_[t];
-        ++b.verifier->windows;
-    }
     return true;
 }
 
