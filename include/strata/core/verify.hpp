@@ -75,8 +75,13 @@ public:
         int64_t position;
         int32_t* output;
     };
-    // This instance is a dedicated batch workspace; each member owns independent sequence state.
-    // Shared expert work is packed across requests. Attention, recurrence and commit remain per member.
+    // This instance is a batch coordinator for ONE stage [lb_, le_) of the layer split: every member
+    // runs this stage's layers on this device, with THIS stage's range and shared hand-off buffers.
+    // The stage chain must be CONTIGUOUS (next_->lb_ == le_); a chained stage writes the packed rows
+    // to the hand-off (phase 5) and recurses into next_->run_batch with the members' own next stages;
+    // a full-range coordinator keeps today's path (no chain, head per member, phase 4).
+    // Row packing: member i's rows start at row0 = sum of counts[j], j < i — identical rows land at
+    // identical offsets in every stage by construction. Attention, recurrence and commit stay per member.
     bool run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user, std::string& err);
     // Configure before init; CLI validation supplies a positive bounded cache limit.
     void set_batch_cache(int limit, int reserve_mib) { batch_cache_limit_ = limit; batch_reserve_mib_ = reserve_mib; }
@@ -172,7 +177,12 @@ private:
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
-    bool record_window(int T, cudaStream_t cs, std::string& err, int phase = -1, int64_t layer = 0);
+    /// phase < 0: the single-window record (unchanged, row0 = 0); 0: window inputs (lb_ > 0 reads
+    /// the hand-off); 1: pre(l); 2: post(l) expert stage; 3: member combine; 4: head; 5: stage
+    /// hand-off OUT (a split's earlier stage).  `row0` = this window's first row in a batch
+    /// round's packed hand-off buffer; single-window callers leave it 0.
+    bool record_window(int T, cudaStream_t cs, std::string& err, int phase = -1, int64_t layer = 0,
+                       int64_t row0 = 0);
     bool stage_inputs(int T, const int32_t* tokens, int64_t pos0, std::string& err);
     struct BatchGraph { std::vector<std::pair<Verifier*, int>> shape; cudaGraphExec_t graph = nullptr; };
     std::vector<BatchGraph> batch_graphs_;
