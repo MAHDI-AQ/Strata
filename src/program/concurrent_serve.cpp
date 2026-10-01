@@ -678,6 +678,22 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // changes; admission still only runs in service_input (safe point); H1 region untouched.
         if (!pending.empty()) input->cv.notify_all();
     };
+    // LANE failclean (K1b): a batch capture refused for want of the VRAM reserve fails THIS round:
+    // every request that participated gets its ERR line and its slot released exactly as finish()
+    // releases one, the refusal is named loudly, and the engine stays up for the next round.  The
+    // Verifier destroys the refused graph and caches nothing (prepare_batch), so the next round
+    // recaptures cleanly.  One semantics for the serial round and BOTH stage-overlap launch sites.
+    auto refuse_round = [&](const std::vector<Impl::Slot*>& round, const std::string& why) {
+        for (auto* ptr : round) {
+            auto& rs = *ptr;
+            if (!rs.count) continue;
+            error(rs.request.id, why);
+            live.erase(rs.request.id);
+            rs.active.store(false);
+            rs.count = 0;
+        }
+        std::fprintf(stderr, "strata concurrent: batch round refused (%s); requests errored, engine up\n", why.c_str());
+    };
     // ============================ STAGE-PIPELINE OVERLAP (lane overlap) ============================
     // stage0[N+1] || stage1[N]: with the hand-off DOUBLE-BUFFERED by parity, stage0 of the next
     // unit runs on CUDA0 while stage1 of the current unit still reads the other parity on CUDA1.
@@ -1016,19 +1032,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 // the engine.  The Verifier destroys the refused graph and caches nothing, so the
                 // next round recaptures cleanly; error the round's requests and stay up for it.
                 // Any other failure (wiring, dispatch, pool) keeps fail-stop semantics.
-                // L3-rebase: serial path only (run_batch lives here); the overlap path below keeps
-                // fail-stop - see lane-l3-rebase/report.md (D1).
+                // LANE failclean: a refused capture keeps the engine up on the serial path AND on
+                // both stage-overlap launch sites below - every path a refusal can surface on fails
+                // THIS round only; any other failure keeps fail-stop semantics.
                 if (!dispatch.failed && err.find("below VRAM reserve") != std::string::npos) {
-                    for (auto* ptr : ready) {
-                        auto& rs = *ptr;
-                        if (!rs.count) continue;
-                        error(rs.request.id, err);
-                        live.erase(rs.request.id);
-                        rs.active.store(false);
-                        rs.count = 0;
-                    }
-                    std::fprintf(stderr, "strata concurrent: batch round refused (%s); requests errored, engine up\n",
-                                 err.c_str());
+                    refuse_round(ready, err);
                     rotation = (rotation + 1) % m.slots.size();
                     continue;
                 }
@@ -1086,7 +1094,27 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
                 ok = u.single ? u.lane0->begin_pass_window(u.T, u.tokens, u.pos0, pool, user, ev0[u.parity], err)
                               : u.lane0->begin_pass_batch(u.windows, pool, user, ev0[u.parity], err);
-                if (!ok) return 1;
+                if (!ok) {
+                    // LANE failclean: a capture refused for want of the VRAM reserve fails THIS round;
+                    // any other failure keeps fail-stop.  The refused unit launched nothing, so the
+                    // PREVIOUS unit (still in flight) is finished here first - its requests are
+                    // healthy and must not be starved by a refusal streak - and u consumed no parity:
+                    // unit_parity is not advanced, so the next round simply retries (and captures
+                    // again once the reserve allows).
+                    if (err.find("below VRAM reserve") == std::string::npos) return 1;
+                    if (!core::Verifier::drive_passes(nullptr, prev.valid ? prev.lane1 : nullptr, err)) return 1;
+                    if (prev.valid) {
+                        if (prev.single) { if (!prev.lane1->end_pass_window(prev.T, prev.out, err)) return 1; }
+                        else { if (!prev.lane1->end_pass_batch(prev.chain, err)) return 1; }
+                        target_ms += elapsed(prev.t_start);
+                        target_rows += prev.single ? prev.T : [&] { int64_t r = 0; for (const auto& w : prev.windows) r += w.count; return r; }();
+                        if (!retire_unit(prev)) return 1;
+                        prev.valid = false;
+                    }
+                    refuse_round(u.ready, err);
+                    rotation = (rotation + 1) % m.slots.size();
+                    continue;
+                }
                 if (!core::Verifier::drive_passes(u.lane0, prev.valid ? prev.lane1 : nullptr, err)) return 1;
                 if (u.single) { if (!u.lane0->end_pass_window(u.T, nullptr, err)) return 1; }
                 else { if (!u.lane0->end_pass_batch(u.windows, err)) return 1; }
@@ -1117,7 +1145,16 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                             stage_plans[st] = u.single ? u.slot->stages[st].verify.plan_sink() : batch[st].plan_sink();
                     ok = u.single ? u.lane1->begin_pass_window(u.T, u.tokens, u.pos0, pool, user, ev1[u.parity], err)
                                   : u.lane1->begin_pass_batch(u.chain, pool, user, ev1[u.parity], err);
-                    if (!ok) return 1;
+                    if (!ok) {
+                        // LANE failclean: the same refusal rule as the stage-0 launch above.  This
+                        // unit's stage 0 completed (end_pass_batch above) without a commit, and the
+                        // previous unit was already retired, so nothing is in flight; unit_parity is
+                        // not advanced and the next round retries.
+                        if (err.find("below VRAM reserve") == std::string::npos) return 1;
+                        refuse_round(u.ready, err);
+                        rotation = (rotation + 1) % m.slots.size();
+                        continue;
+                    }
                     ev1_valid[u.parity] = true;
                     prev = std::move(u);
                     prev.valid = true;
