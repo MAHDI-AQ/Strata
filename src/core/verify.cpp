@@ -1041,6 +1041,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (!batch_replay_) for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
+    const uint32_t fetches_at_launch = fetches_.load(std::memory_order_relaxed);
     const cudaError_t le = cudaGraphLaunch(batch_replay_ ? batch_replay_ : exec_[T], cs_);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -1103,7 +1104,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
-    cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    // no host function of this window may raise flag B in the next one - and only a fetch_dma(n > 0)
+    // of THIS window can queue one, so a window that queued none leaves the copy stream drained.
+    if (fetches_.load(std::memory_order_relaxed) != fetches_at_launch)
+        cudaStreamSynchronize(copy_);
     if (batch_replay_) { ++windows; progress_beat(); return true; }
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
         cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
@@ -1484,6 +1488,7 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
     if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
+    v->fetches_.fetch_add(1, std::memory_order_relaxed);
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
     for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * bytes, src[i], bytes, cudaMemcpyHostToDevice, v->copy_);
     FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
@@ -1508,15 +1513,20 @@ bool Verifier::commit(int n_keep, std::string& err) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     if (ple_stage())   // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {
             ss_->ple_prev[0] = ss_->ple_prev[1];
             ss_->ple_prev[1] = last_tokens_[t];
         }
+    // Only the CHAIN TAIL syncs.  A non-tail stage's commit graph writes only that stage's own session
+    // state; its consumers are the next launch on the SAME stream (ordered without a host wait) and
+    // nothing on the host.  The tail's sync is the caller's dependency: the drafter's own stream reads
+    // the last stage's committed state next.
+    if (next_ != nullptr) return next_->commit(n_keep, err);
+    const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit(n_keep, err);
+    return true;
 }
 
 }  // namespace strata::core
