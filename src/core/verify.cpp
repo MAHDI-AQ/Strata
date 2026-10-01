@@ -1604,11 +1604,18 @@ bool Verifier::launch_pass(int T, cudaEvent_t done, std::string& err) {
     pass_fetches_at_launch_ = fetches_.load(std::memory_order_relaxed);
     const cudaError_t le = cudaGraphLaunch(batch_replay_ ? batch_replay_ : exec_[parity_][T], cs_);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs_);
-    if (done != nullptr && cudaEventRecord(done, cs_) != cudaSuccess) {
-        err = "verify: the pass completion event failed";
-        return false;
-    }
+    // R2 (split1): NO host CUDA call lands between this launch and the first serviced doorbell.
+    // The discarded cudaStreamQuery(cs_) that sat here, and recording the pass completion event on
+    // the in-flight stream, were the host's driver touches of the stage hand-off window: on a
+    // two-device split the p2 probe parked on a driver lock in exactly this span ("graphed"
+    // without "recorded", the host thread spinning inside the driver - the #31 class: the host
+    // inside a CUDA call while the GPU spins on a flag the host must raise).  The query is removed
+    // (its result was discarded); the event moves to where the pass ends and its stream was waited
+    // out (end_pass_window/end_pass_batch).  Its consumers only gate on "the pass completed", and
+    // host order establishes that no later than those points, so the meaning is unchanged.
+    // v3 (split1-r2fix): the deferred record is legal because the event now lives in the recording
+    // stream's own context - ev0/ev1 are created on their own stage's device (concurrent_serve.cpp).
+    deferred_done_ = done;
     VDBG("launched\n");
     return true;
 }
@@ -1842,6 +1849,19 @@ bool Verifier::end_pass_window(int T, int32_t* out, std::string& err) {
     // beside the expert workers).
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    // R2 (split1): the pass is over and cs_ is drained - record its completion event now (was: at
+    // launch time, on the in-flight stream; see launch_pass).  Every consumer runs after this
+    // point in host order, so the event's meaning ("the pass completed") is unchanged.
+    if (deferred_done_ != nullptr) {
+        const cudaError_t de = cudaEventRecord(deferred_done_, cs_);
+        deferred_done_ = nullptr;
+        if (de != cudaSuccess) {   // split1-v3: name the actual CUDA refusal (P1 forensics)
+            std::fprintf(stderr, "strata verify: the pass completion event failed: %s (%s)\n",
+                         cudaGetErrorName(de), cudaGetErrorString(de));
+            err = "verify: the pass completion event failed";
+            return false;
+        }
+    }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     // (sync invariant, rebased): see run() tail - same verifier, same comparison.
     if (fetches_.load(std::memory_order_relaxed) != pass_fetches_at_launch_)
@@ -1859,6 +1879,18 @@ bool Verifier::end_pass_batch(const std::vector<BatchWindow>& batch, std::string
     const OnDevice on_device(device_);
     pass_live_ = false;
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "batch verify: the pass stream failed"; return false; }
+    // R2 (split1): as in end_pass_window - the launched pass's completion event is recorded after
+    // its stream was waited out, never on the in-flight stream (see launch_pass).
+    if (deferred_done_ != nullptr) {
+        const cudaError_t de = cudaEventRecord(deferred_done_, cs_);
+        deferred_done_ = nullptr;
+        if (de != cudaSuccess) {   // split1-v3: name the actual CUDA refusal (P1 forensics)
+            std::fprintf(stderr, "strata batch verify: the pass completion event failed: %s (%s)\n",
+                         cudaGetErrorName(de), cudaGetErrorString(de));
+            err = "batch verify: the pass completion event failed";
+            return false;
+        }
+    }
     // (sync invariant, rebased): serial run_batch funnels through run() batch_replay_,
     // which skips this sync when no fetch_dma(n > 0) was queued - same comparison here.
     if (fetches_.load(std::memory_order_relaxed) != pass_fetches_at_launch_)

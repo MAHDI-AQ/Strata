@@ -721,34 +721,48 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // write / flag reset / capture happens only after the pass it belongs to has completed (the
     // driver waits its completion event).  STRATA_STAGE_OVERLAP=0 restores the serial loop; a
     // single-stage engine or a 3+-stage split never takes this path.
-    // LANE lane-fix-split1: same-device-only until the two-device stage-1
-    // drive stall is root-caused (ladder-D: the stage-1 pass is launched on
-    // the second device but never serviced; the serial loop is proven healthy
-    // on both).  A cross-device split keeps the proven serial loop;
-    // split_same keeps the overlap path below byte-for-byte.
-    const bool same_device = m.stages.size() == 2 && m.stages[0].device == m.stages[1].device;
-    const bool overlap = same_device && [] {
+    // LANE split1-r2: the two-device stage-1 park is fixed - the stage-1 launch leaves no host
+    // driver call on the in-flight cross-device stream (verify.cpp's launch_pass) - so the
+    // two-device split takes the overlap path too.  The 2-stage shape is a real precondition
+    // (the hand-off parity machinery below is exactly two-staged); STRATA_STAGE_OVERLAP=0
+    // restores the serial loop.
+    // LANE split1-r2fix-v3: the v2 build's record refusal is fixed at the object - a completion
+    // event lives in the context it is recorded in, so ev0/ev1 are created (and destroyed) on
+    // their own stage's device in the event setup below; the launch span stays as v2 left it.
+    const bool overlap = m.stages.size() == 2 && [] {
         const char* v = std::getenv("STRATA_STAGE_OVERLAP");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    // R2 (split1-v3): a completion event is a CUDA object of the device whose pass it times - ev0 is
+    // recorded on stage 0's stream, ev1 on stage 1's - so each is created (and destroyed, on every
+    // exit path) on its OWN stage's device: the same context semantics the same-device overlap always
+    // ran under, where creation and record contexts coincide.  The v2 build created both under run()'s
+    // entry context (CUDA0) and the stage-1 record failed on the CUDA1 stream (P1 2026-10-01 19:14Z,
+    // "verify: the pass completion event failed").  Same-device: the two devices are equal and already
+    // current, so the guards are no-ops and the call sequence is unchanged.
+    const int overlap_dev0 = m.stages.empty() ? -1 : m.stages[0].device;
+    const int overlap_dev1 = m.stages.size() > 1 ? m.stages[1].device : overlap_dev0;
     cudaEvent_t ev0[2] = {}, ev1[2] = {};
     bool ev1_valid[2] = {false, false};
-    struct OverlapEventsGuard {   // every exit path of run() destroys them
-        cudaEvent_t* ev0; cudaEvent_t* ev1;
+    struct OverlapEventsGuard {   // every exit path of run() destroys them, each on its own device
+        cudaEvent_t* ev0; cudaEvent_t* ev1; int dev0; int dev1;
         ~OverlapEventsGuard() {
             for (int q = 0; q < 2; ++q) {
-                if (ev0[q]) cudaEventDestroy(ev0[q]);
-                if (ev1[q]) cudaEventDestroy(ev1[q]);
+                if (ev0[q]) { const core::OnDevice on(dev0); cudaEventDestroy(ev0[q]); }
+                if (ev1[q]) { const core::OnDevice on(dev1); cudaEventDestroy(ev1[q]); }
             }
         }
-    } overlap_events_guard{ev0, ev1};
+    } overlap_events_guard{ev0, ev1, overlap_dev0, overlap_dev1};
     if (overlap) {
-        for (int q = 0; q < 2; ++q)
-            if (cudaEventCreateWithFlags(&ev0[q], cudaEventDisableTiming) != cudaSuccess ||
-                cudaEventCreateWithFlags(&ev1[q], cudaEventDisableTiming) != cudaSuccess) {
+        for (int q = 0; q < 2; ++q) {
+            bool made = false;
+            { const core::OnDevice on(overlap_dev0); made = cudaEventCreateWithFlags(&ev0[q], cudaEventDisableTiming) == cudaSuccess; }
+            if (made) { const core::OnDevice on(overlap_dev1); made = cudaEventCreateWithFlags(&ev1[q], cudaEventDisableTiming) == cudaSuccess; }
+            if (!made) {
                 err = "concurrency: the stage-overlap events failed";
                 return 1;
             }
+        }
         std::fprintf(stderr, "strata concurrent: stage overlap on: stage0[N+1] runs with stage1[N] "
                              "(ping-pong hand-off, per-parity captures)\n");
     }
