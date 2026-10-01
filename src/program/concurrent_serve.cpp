@@ -324,6 +324,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     if (stages.empty() || !stages[0].wt || !stages[0].cache || !stages[0].dispatch) {
         err = "concurrency: no stage"; return 1;
     }
+    // P1-cache-revive defense-in-depth: the CLI refuses enabled parking before prepare(); a
+    // programmatic caller bypassing it must not silently run uncached.
+    if (c.conversation_cache_mib > 0) {
+        err = "concurrency: conversation prefix-cache parking is not supported on the concurrent path (kill-switch: conversation_cache_mib=0)";
+        return 1;
+    }
     // C1 boundary: at N=1 every binding below is the very object the old run() took as a separate
     // argument - same call sequence, same objects, same order (re-root, not a rewrite).
     const ServeStage& st0 = stages[0];
@@ -492,7 +498,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         for (float& usage : dispatch.usage) usage *= 0.7f;
         return true;
     };
-    std::fprintf(stderr, "strata concurrent: shared expert batching; independent MTP; adaptive cache %s; no conversation-prefix reuse\n", adaptive ? "on" : "off");
+    // P1-cache-revive: the concurrent path parks nothing yet, so the prefix cache is always
+    // off here; the DONE trailer field below stays 0. Banner states it so logs are greppable.
+    std::fprintf(stderr, "strata concurrent: shared expert batching; independent MTP; adaptive cache %s; prefix-cache off (parking not yet supported on this path)\n", adaptive ? "on" : "off");
     std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s\n",
                 c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.kv.c_str(), c.suffix, adaptive ? "adaptive" : "static");
     std::printf("READY %lld stop multiplex\n", (long long) c.context);
@@ -655,6 +663,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     });
     auto finish = [&](Impl::Slot& s, const char* reason) {
         const double decode = s.first ? 0 : elapsed(s.decode_start);
+        // P1-cache-revive: the trailing field is reused_prefix_tokens. The concurrent path parks
+        // nothing yet, so it is always 0; server.py already parses this position, so the wire
+        // format is stable for the future lift (which will fill it per request).
         std::printf("R %llu DONE %lld %zu %.1f %.1f %s %lld %lld 0\n", (unsigned long long) s.request.id,
                     (long long) s.generated, s.request.tokens.size(), s.prompt_ms.load(), decode, reason,
                     (long long) s.accepted, (long long) s.offered);
@@ -846,6 +857,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
             s.suffix.reset(); s.policy = spec::DraftPolicy{c.window};
             for (auto token : s.request.tokens) s.suffix.append((int32_t) token);
+            // P1-cache-revive hook note (no behavior change): the future park/restore lift attaches
+            // HERE, at the admission boundary only - never mid-round (a ~1-2 GiB memcpy at 100K q4_0
+            // would stall decode). Per-slot per-stage sessions: capture/restore every stage's state on
+            // its device under OnDevice, stamp the carve (layer_lo/hi) and reject cross-carve restores,
+            // re-seed per-stage PLE scratch, invalidate on prefix divergence (longest exact-token-prefix
+            // best-match; non-prefix checkpoints are unreachable by chain design).
             for (size_t st = 0; st < m.stages.size(); ++st) {   // C4: every stage's state resets on its device
                 const core::OnDevice on(m.stages[st].device);
                 core::session_zero(*s.stages[st].state, g, nullptr, m.stage_rt[st].prompt_stream);

@@ -2372,6 +2372,17 @@ int main(int argc, char** argv) {
         config.reserve_mib = o.vram_reserve_mib; config.mtp_dir = o.mtp; config.spec_min_p = (float) o.spec_min_p;
         config.suffix = o.suffix_draft; config.eos = o.eos_ids; config.kv = o.kv;
         config.adapt_every = o.adapt_every; config.adapt_swaps = o.adapt_swaps;
+        config.conversation_cache_mib = o.conversation_cache_mib;
+        config.conversation_cache_slots = o.conversation_cache_slots;
+        config.conversation_cache_min_free_mib = o.conversation_cache_min_free_mib;
+        // P1-cache-revive: the #189 parking core has no concurrent/split save/restore yet
+        // (the serial path already refuses split+parking at startup; this path parks nothing).
+        // Refuse early with the kill-switch named; the env override lets a fleet force off.
+        if (const char* cc_env = std::getenv("STRATA_CONCURRENT_CACHE_MIB")) config.conversation_cache_mib = std::atoll(cc_env);
+        if (config.conversation_cache_mib > 0) {
+            std::fprintf(stderr, "strata concurrent: conversation prefix-cache parking is not yet supported on the concurrent path; disable with --conversation-cache-mib 0 (fleet kill-switch STRATA_CONCURRENT_CACHE_MIB=0)\n");
+            return 2;
+        }
         concurrent = std::make_unique<strata::program::ConcurrentServe>(config);
         if (!concurrent->prepare(g, ss, mtp, serve_stages, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     }
