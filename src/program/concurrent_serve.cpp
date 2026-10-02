@@ -494,6 +494,19 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     double target_ms = 0, draft_ms = 0, commit_ms = 0, adapt_ms = 0;
     std::atomic<double> prefill_ms{0};   // written by the pump thread, read by the profile (lane prefill)
     int64_t produced = 0, target_rows = 0;
+
+    // spec acceptance census (lane-spec instrumentation; rebased to d319d46 + per-source/per-position by
+    // lane-spec-fuse).  windows served, drafts offered to verify, drafts accepted, and the histograms that
+    // show WHERE the draft chain truncates (count) and how much commits (keep).  The DIRECT per-request
+    // channel (draft_n/draft_n_accepted, serve/server.py:472) sums these same two fields per request, so
+    // this census is the engine-side aggregate of that measure; the owner audit (2026-10-02) retires the
+    // aggregate-profile-identity reconstruction of acceptance in favour of reading these counters.
+    int64_t windows_served = 0, offered_total = 0, accepted_total = 0;
+    int64_t count_hist[9] = {}, keep_hist[9] = {};
+    // per-source split (F5): [0] the MTP chain, [1] a suffix-lookup window; per-position: the draft at
+    // window row t (t = 1..) was offered, and accepted when the window's committed rows keep >= t.
+    int64_t source_windows[2] = {}, source_offered[2] = {}, source_accepted[2] = {};
+    int64_t pos_offered[9] = {}, pos_accepted[9] = {};
     // D1: admission-scan stall samples - the whole-queue match pass's added time at the safe point,
     // for the falsifier (p50/max printed in the profile; only ever written while retain is on).
     constexpr size_t kAdmissionStallSamples = 256;
@@ -508,10 +521,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             for (const auto& gs : s->stages) {
                 wait += gs.verify.ms_wait; pool_ms += gs.verify.ms_pool; host += gs.verify.ms_host;
             }
-        std::fprintf(stderr, "strata concurrent profile: rounds=%lld tokens=%lld rows=%lld target_ms=%.1f "
+        std::fprintf(stderr, "strata concurrent profile: rounds=%lld tokens=%lld rows=%lld windows=%lld "
+                     "offered=%lld accepted=%lld target_ms=%.1f "
                      "draft_ms=%.1f commit_ms=%.1f adapt_ms=%.1f prefill_ms=%.1f "
                      "target_wait_ms=%.1f target_pool_ms=%.1f target_host_ms=%.1f\n",
-                     (long long) rounds, (long long) produced, (long long) target_rows, target_ms,
+                     (long long) rounds, (long long) produced, (long long) target_rows, (long long) windows_served,
+                     (long long) offered_total, (long long) accepted_total, target_ms,
                      draft_ms, commit_ms, adapt_ms, prefill_ms.load(), wait, pool_ms, host);
         std::fflush(stderr);
         std::fprintf(stderr, "strata concurrent detail: captures=%lld capture_ms=%.1f gpu_pre_ms=%.1f "
@@ -977,6 +992,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             commit_ms += elapsed(commit_start);
             produced += keep;
             s.offered += s.count - 1; s.accepted += keep - 1;
+            offered_total += s.count - 1; accepted_total += keep - 1;
+            ++count_hist[std::min(s.count, 8)]; ++keep_hist[std::min(keep, 8)];
+            const int spec_src = s.lookup ? 1 : 0;
+            ++source_windows[spec_src];
+            source_offered[spec_src] += s.count - 1; source_accepted[spec_src] += keep - 1;
+            for (int t = 1; t < s.count; ++t) ++pos_offered[std::min(t, 8)];
+            for (int t = 1; t < keep; ++t) ++pos_accepted[std::min(t, 8)];
             for (int t = 0; t < keep; ++t) {
                 s.consumed.push_back(s.window[t]); s.suffix.append(s.output[t]); ++s.generated;
                 std::printf("R %llu T %d\n", (unsigned long long) s.request.id, s.output[t]);
@@ -1392,6 +1414,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
 
         if (!windows.empty()) {
             ++batch_sizes[windows.size()];
+            windows_served += (int64_t) windows.size();
             if (c.pad_batch && windows.size() > 1) {
                 int padded_rows = 0;
                 for (const auto& w : windows)
@@ -1651,6 +1674,26 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     std::fprintf(stderr, "strata concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
                  (long long) batch_sizes[1], (long long) batch_sizes[2], (long long) batch_sizes[3], (long long) batch_sizes[4],
                  (long long) batch_sizes[5], (long long) batch_sizes[6], (long long) batch_sizes[7], (long long) batch_sizes[8]);
+    // lane-spec: the acceptance census at exit - windows served, drafts offered vs accepted (offered = the
+    // sum over windows of count-1; accepted likewise of keep-1 - the same fields the DONE line carries per
+    // request), split by the window's source and read off by draft position.
+    std::fprintf(stderr, "strata concurrent: spec census: windows=%lld offered=%lld accepted=%lld "
+                 "mtp[windows=%lld offered=%lld accepted=%lld] lookup[windows=%lld offered=%lld accepted=%lld]\n",
+                 (long long) windows_served, (long long) offered_total, (long long) accepted_total,
+                 (long long) source_windows[0], (long long) source_offered[0], (long long) source_accepted[0],
+                 (long long) source_windows[1], (long long) source_offered[1], (long long) source_accepted[1]);
+    std::fprintf(stderr, "strata concurrent: spec windows by verified count: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
+                 (long long) count_hist[1], (long long) count_hist[2], (long long) count_hist[3], (long long) count_hist[4],
+                 (long long) count_hist[5], (long long) count_hist[6], (long long) count_hist[7], (long long) count_hist[8]);
+    std::fprintf(stderr, "strata concurrent: spec windows by committed tokens: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
+                 (long long) keep_hist[1], (long long) keep_hist[2], (long long) keep_hist[3], (long long) keep_hist[4],
+                 (long long) keep_hist[5], (long long) keep_hist[6], (long long) keep_hist[7], (long long) keep_hist[8]);
+    std::fprintf(stderr, "strata concurrent: spec offered by position: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
+                 (long long) pos_offered[1], (long long) pos_offered[2], (long long) pos_offered[3], (long long) pos_offered[4],
+                 (long long) pos_offered[5], (long long) pos_offered[6], (long long) pos_offered[7], (long long) pos_offered[8]);
+    std::fprintf(stderr, "strata concurrent: spec accepted by position: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
+                 (long long) pos_accepted[1], (long long) pos_accepted[2], (long long) pos_accepted[3], (long long) pos_accepted[4],
+                 (long long) pos_accepted[5], (long long) pos_accepted[6], (long long) pos_accepted[7], (long long) pos_accepted[8]);
     return 0;
 }
 }
