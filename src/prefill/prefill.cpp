@@ -1840,9 +1840,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 // pointer table's entries are absolute bases, so the product is bit-exact.
                                 const auto& f = lay.fmt[(size_t) l];
                                 const bool resident = slot < 0;
-                                m.gsrc_host[2 * (g * MMQ_GROUP + q)] =
+                                // Index by half: the per-group slice layout is [MMQ_GROUP gate/up bases]
+                                // [MMQ_GROUP down bases] and each launch reads entry q of its own half.  An
+                                // interleaved [gu,dn] pair layout makes a partial last group read entries
+                                // its walk never wrote - undefined channel bases (the c5-deep fault).
+                                m.gsrc_host[2 * g * MMQ_GROUP + q] =
                                     resident ? (const char*) blob_dev : (const char*) (m.grp_gu + q * mmq_gub);
-                                m.gsrc_host[2 * (g * MMQ_GROUP + q) + 1] =
+                                m.gsrc_host[2 * g * MMQ_GROUP + MMQ_GROUP + q] =
                                     resident ? (const char*) blob_dev + f.down_off : (const char*) (m.grp_d + q * mmq_db);
                                 if (!resident) {
                                     mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
