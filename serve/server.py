@@ -153,6 +153,17 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
+def session_hint(ids) -> int:
+    """D1 wire hint: a stable u64 key for a conversation, from a hash of its first <=256 prompt tokens.
+    The engine uses it to prefer the slot that already holds this conversation's prefix; a stale or
+    colliding key is harmless - the hint only redirects to a slot whose retained history still matches
+    the prompt exactly, and the engine falls back to its longest-match scan otherwise."""
+    h = hashlib.blake2b(digest_size=8)
+    h.update(b"strata-sess:")
+    h.update(",".join(str(int(t)) for t in ids[:256]).encode())
+    return int.from_bytes(h.digest(), "big")
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`. Legacy requests are serialized. A multiplex-capable engine instead accepts request-tagged
@@ -174,6 +185,10 @@ class StrataEngine:
         # set/pop/copy are single atomic steps, and /metrics must never wait on a request-path lock
         # (the first attempt at this patch took that lock and could deadlock against its own caller).
         self._shared_progress = {}
+        # D1: admission queue-wait per request number (CGEN send -> first PP/T), recorded by each
+        # reader under its own number - lock-free like _shared_progress; attached to the request's
+        # DONE dict so it can never be mis-paired across concurrent readers.
+        self._shared_queue_wait = {}
         self._request_number = 0
         self.multiplex = False
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
@@ -314,8 +329,11 @@ class StrataEngine:
         done = False
         sent = False
         try:
-            self._send(f"CGEN {number} {int(max_new)}{self.sampling_keys(sampling or {})} "
-                       + ",".join(str(int(t)) for t in ids))
+            head = f"CGEN {number} {int(max_new)}{self.sampling_keys(sampling or {})}"
+            if (self.info or {}).get("admission"):    # D1: only an engine that advertises the hint
+                head += f" sess={session_hint(ids)}"
+            sent_at = time.monotonic()
+            self._send(head + " " + ",".join(str(int(t)) for t in ids))
             sent = True
             heartbeat = time.monotonic()
             while not cancel.is_set():
@@ -331,8 +349,12 @@ class StrataEngine:
                 if line is None:
                     raise EngineDied("the concurrent engine stopped")
                 if line.startswith("T "):
+                    if number not in self._shared_queue_wait:   # D1: first PP/T ends the admission wait
+                        self._shared_queue_wait[number] = round((time.monotonic() - sent_at) * 1000.0, 2)
                     yield int(line[2:])
                 elif line.startswith("PP "):
+                    if number not in self._shared_queue_wait:
+                        self._shared_queue_wait[number] = round((time.monotonic() - sent_at) * 1000.0, 2)
                     fields = line.split()
                     pr = (int(fields[1]), int(fields[2]))
                     self.progress = pr                       # this reader's value (unchanged)
@@ -340,6 +362,7 @@ class StrataEngine:
                     yield None
                 elif line.startswith("DONE "):
                     self._parse_done(line)
+                    self.last["queue_wait_ms"] = self._shared_queue_wait.get(number)   # D1: this request's
                     done = True
                     return
                 elif line.startswith("ERR "):
@@ -349,6 +372,7 @@ class StrataEngine:
             with self._channels_lock:
                 self._channels.pop(number, None)
             self._shared_progress.pop(number, None)          # lock-free (see progress)
+            self._shared_queue_wait.pop(number, None)        # D1: lock-free (see progress)
             if sent and not done:
                 try:
                     self._send(f"CSTOP {number}")
@@ -782,7 +806,7 @@ class Service:
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
-                       "prompt_ms": 0.0, "decode_ms": 0.0}
+                       "prompt_ms": 0.0, "decode_ms": 0.0, "cache_hit": 0, "queue_wait_ms": 0.0, "queue_wait_n": 0}
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
@@ -1253,6 +1277,7 @@ class Service:
                     started = request_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
+                    queue_wait = last.get("queue_wait_ms")   # D1: concurrent path only (paired with DONE)
                     self.history.append({
                         "projection": (sampling or {}).get("experimental_speed_projection") is not False
                         if loaded else None,
@@ -1262,7 +1287,8 @@ class Service:
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
-                        "hit_rate": hit_rate})
+                        "hit_rate": hit_rate, "cache_hit": bool(last.get("reused") or 0),
+                        "queue_wait_ms": queue_wait})
                     t = self.totals
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
@@ -1270,6 +1296,10 @@ class Service:
                     t["output_tokens"] += n
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
+                    t["cache_hit"] += 1 if (last.get("reused") or 0) > 0 else 0
+                    if queue_wait is not None:
+                        t["queue_wait_ms"] += queue_wait
+                        t["queue_wait_n"] += 1
                     fresh = getattr(self.engine, "last", None)
                     if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                         timings = request_timings(len(ids), n, last)
