@@ -1184,8 +1184,8 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const bool chained = le_ < g_->n_layers;   // this stage hands its rows to a next stage
-    if (batch.empty() || batch.size() > 8 || split_) {
-        err = "batch verify: requires 1..8 member windows"; return false;
+    if (batch.empty() || batch.size() > 16 || split_) {
+        err = "batch verify: requires 1..16 member windows"; return false;
     }
     // C2-A1: the chain must be CONTIGUOUS: the next stage starts exactly at this stage's le_,
     // same geometry, and only a last stage may be chained-free.  A missing/mis-ranged next

@@ -495,7 +495,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     const bool adaptive = c.adapt_every > 0 && c.adapt_swaps > 0;
     if (adaptive) dispatch.usage.assign((size_t) g.n_layers * g.n_expert, 0.0f);
     int64_t rounds = 0;
-    int64_t batch_sizes[9]{};   // one slot per member count 1..8 (pair-combine raise)
+    int64_t batch_sizes[17]{};   // one slot per member count 1..16 (M2 request-lattice raise; 17 entries)
     const bool profiling = std::getenv("STRATA_CONCURRENT_PROFILE") != nullptr;
     double target_ms = 0, draft_ms = 0, commit_ms = 0, adapt_ms = 0;
     std::atomic<double> prefill_ms{0};   // written by the pump thread, read by the profile (lane prefill)
@@ -1278,7 +1278,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             std::string reason;
             if (!parse_request(line, c, wt.find("output.weight")->ne1, request, reason)) { error(request.id, reason); continue; }
             if (live.count(request.id)) { error(request.id, "duplicate request id"); continue; }
-            if (pending.size() >= 16) { error(request.id, "request queue is full"); continue; }
+            if (pending.size() >= 32) { error(request.id, "request queue is full"); continue; }
             live.insert(request.id);
             pending.push_back(std::move(request));
         }
@@ -1298,7 +1298,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // retained tokens, the last token always opens the first verify window. A partial or divergent
         // prefix is a miss and the walk below zeroes the slot exactly as before.
         // D1 prefix-aware admission: the match pass scans the WHOLE pending deque (bounded by its own
-        // cap of 16 entries) against every idle slot and admits the longest exact match FIRST; ties
+        // cap of 32 entries) against every idle slot and admits the longest exact match FIRST; ties
         // break by arrival order, then by slot index.  The head-only pass this replaces could only
         // ever admit the queue head, so a longer-matching turn behind it was served fresh and the
         // retained history it matched was lost.  The CGEN sess= hint (pending[q].session) makes a
@@ -1307,7 +1307,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // length prefilter (a candidate must beat the current best) and early-exit compares; the
         // added stall is sampled below for the falsifier.
         // Off (default): this pre-pass is dead code and the walk is byte-identical.
-        constexpr size_t kAdmissionScanQueue = 16;   // the pending deque's own cap (see the overflow check above)
+        constexpr size_t kAdmissionScanQueue = 32;   // the pending deque's own cap (see the overflow check above; M2 raise 16->32 for burst headroom)
         const auto admit_start = retain ? Clock::now() : Clock::time_point{};
         while (retain && !pending.empty()) {
             Impl::Slot* pick = nullptr;
@@ -1714,9 +1714,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     for (auto& s : m.slots) if (s->active.load()) finish(*s, "cancel");
     for (const auto& r : pending) error(r.id, "server shutting down");
     report_profile();
-    std::fprintf(stderr, "strata concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
+    std::fprintf(stderr, "strata concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld 9=%lld 10=%lld 11=%lld 12=%lld 13=%lld 14=%lld 15=%lld 16=%lld\n",
                  (long long) batch_sizes[1], (long long) batch_sizes[2], (long long) batch_sizes[3], (long long) batch_sizes[4],
-                 (long long) batch_sizes[5], (long long) batch_sizes[6], (long long) batch_sizes[7], (long long) batch_sizes[8]);
+                 (long long) batch_sizes[5], (long long) batch_sizes[6], (long long) batch_sizes[7], (long long) batch_sizes[8],
+                 (long long) batch_sizes[9], (long long) batch_sizes[10], (long long) batch_sizes[11], (long long) batch_sizes[12],
+                 (long long) batch_sizes[13], (long long) batch_sizes[14], (long long) batch_sizes[15], (long long) batch_sizes[16]);
     // lane-spec: the acceptance census at exit - windows served, drafts offered vs accepted (offered = the
     // sum over windows of count-1; accepted likewise of keep-1 - the same fields the DONE line carries per
     // request), split by the window's source and read off by draft position.
