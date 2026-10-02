@@ -48,10 +48,43 @@ int main() {
         // With eight agents the 24 rows spread evenly.
         assert((schedule_rows({8,8,8,8,8,8,8,8}, 24, false) == std::vector<int>{3,3,3,3,3,3,3,3}));
     }
+    // LANE m1m2 (M2 request lattice 8 -> 16): the c16 battery - the same 196,608-case shape as the
+    // recorded 24-row envelope point (8^4 x 24 budgets x 2 policies), now over a 16-member wanted
+    // vector (the four values cycle, then mirror).  Same invariants as the 4-wide sweep: rows sum to
+    // min(budget, Sigma wanted); every row within [0, wanted[i]]; fair mode starves no member once
+    // the budget covers the member count (budget >= 16).
+    int checks16 = 0;
+    for (int a = 1; a <= 8; ++a) for (int b = 1; b <= 8; ++b)
+    for (int c = 1; c <= 8; ++c) for (int d = 1; d <= 8; ++d)
+    for (int budget = 1; budget <= 24; ++budget) for (bool depth : {false, true}) {
+        const int quad[4] = {a, b, c, d};
+        std::vector<int> wanted(16);
+        for (int i = 0; i < 16; ++i) wanted[(size_t) i] = quad[(i < 8 ? i : 15 - i) % 4];
+        const auto rows = schedule_rows(wanted, budget, depth);
+        int total = 0; for (int n : wanted) total += n;
+        assert(std::accumulate(rows.begin(), rows.end(), 0) == std::min(budget, total));
+        for (int i = 0; i < 16; ++i) assert(rows[(size_t) i] >= 0 && rows[(size_t) i] <= wanted[(size_t) i]);
+        if (!depth && budget >= 16) for (int n : rows) assert(n > 0);
+        ++checks16;
+    }
+    // Rotating the eligible list must give every one of 16 members progress with a one-row budget.
+    for (bool depth : {false, true}) {
+        int progress[16]{};
+        for (int rotation = 0; rotation < 16; ++rotation) {
+            const auto rows = schedule_rows(std::vector<int>(16, 8), 1, depth);
+            for (int j = 0; j < 16; ++j) progress[(rotation+j)%16] += rows[(size_t) j];
+        }
+        for (int n : progress) assert(n == 1);
+    }
+    // The full 24-row envelope spreads across 16 members: 8 get 2 rows, 8 get 1.
+    assert((schedule_rows(std::vector<int>(16, 8), 24, false) ==
+            std::vector<int>{2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1}));
     {
-        // The pair-combine raise: 8 requests are accepted, 9 are not.
+        // The request lattice: 16 requests are accepted, 17 are not (M2 raise).  (The 8-legal case the
+        // old pair-combine test asserted is now covered by the 16-wide sweep and the named 16 case.)
+        assert(schedule_rows(std::vector<int>(16, 1), 24, false).size() == 16);
         bool rejected = false;
-        try { schedule_rows(std::vector<int>(9, 1), 24, false); } catch (const std::invalid_argument&) { rejected = true; }
+        try { schedule_rows(std::vector<int>(17, 1), 24, false); } catch (const std::invalid_argument&) { rejected = true; }
         assert(rejected);
     }
     {
@@ -62,4 +95,5 @@ int main() {
         assert(rejected);
     }
     std::cout << checks << " schedule cases passed\n";
+    std::cout << checks16 << " c16 schedule cases passed\n";
 }
