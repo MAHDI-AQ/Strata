@@ -2116,6 +2116,7 @@ bool Prefill::ple_prefetch_next(const int64_t* next_tokens, int64_t n_next) {
     m.ple_pf_n = T;
     const int32_t p0 = m.ple_pf_pv[0], p1 = m.ple_pf_pv[1];
     m.ple_pf = std::async(std::launch::async, [&m, T, buf, p0, p1] {
+        strata::kernels::cpu::adopt_spawn_mask();   // STRATA_AUX_WIDE: the prefetch gather is not the host loop
         const int32_t pv[2] = {p0, p1};
         return ple_gather_impl(m, m.ple_pf_tokens.data(), T, pv, buf, m.ple_pf_err);
     });

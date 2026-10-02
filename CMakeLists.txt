@@ -533,7 +533,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # re-learning.
   add_executable(ple_parity src/kernels/ple_parity.cpp)
   target_include_directories(ple_parity PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(ple_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  target_link_libraries(ple_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   set(STRATA_PLE_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro" CACHE PATH
       "Directory containing required ple_in.bin and ple_out.bin parity fixtures")
   add_test(NAME ple_parity COMMAND ple_parity --selftest
@@ -596,7 +596,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # Plan v0.3 P2: the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.
   add_executable(ple_reader_test src/ngram/ple_reader_test.cpp)
   target_include_directories(ple_reader_test PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(ple_reader_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  target_link_libraries(ple_reader_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
 
   # The GPU test runs ON THE TARGET PC. `--selftest` allocates
