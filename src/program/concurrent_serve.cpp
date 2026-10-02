@@ -255,6 +255,12 @@ struct ConcurrentServe::Impl {
 ConcurrentServe::ConcurrentServe(ConcurrentConfig c) : impl_(std::make_unique<Impl>(std::move(c))) {}
 ConcurrentServe::~ConcurrentServe() = default;
 
+int64_t ConcurrentServe::prompt_workspace_bytes() const {   // LANE m1m2 (M1 telemetry)
+    int64_t bytes = 0;
+    for (const auto& rt : impl_->stage_rt) bytes += (int64_t) rt.prompt_bytes;
+    return bytes;
+}
+
 bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& primary, core::MtpDrafter& draft,
                               const std::vector<ServeStage>& stages, std::string& err) {
     auto& m = *impl_;
