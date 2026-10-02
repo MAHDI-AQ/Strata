@@ -1874,11 +1874,22 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             int64_t maxr = 0;
                             for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                             pt.mark(kPfGemmGU, cs);
-                            if (!blob_path) {
-                                // the zeroed tail after the group's last expert (see MMQ_TAIL); the zero-copy path
-                                // covers its over-reads at each streamed member's gather instead
-                                cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
-                                cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
+                            // the zeroed tail after the group's last expert (see MMQ_TAIL).  Unconditional: the
+                            // zero-copy path's launches read STREAMED members' matrices from these buffers too,
+                            // so the bytes behind the group's last filled slot must be finite for the zero-copy
+                            // path for exactly the same reason they must be for the gathered path.  The
+                            // per-streamed memset above covers only the slot each streamed member leaves behind
+                            // it; it cannot cover the group's own tail.  (~8 KB per group; the measured win was
+                            // the skipped gathers, not these.)
+                            cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
+                            cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
+                            if (blob_path) {
+                                // P4: the mapped table's entries for this group are complete - publish them the
+                                // way every other host-written device-visible buffer in this engine publishes
+                                // (mtp.cpp stages its chain behind the same fence before cudaGraphLaunch): a
+                                // seq_cst fence between the stores and the launches, so no partially written
+                                // entry can be observed by the MMQ kernels.
+                                std::atomic_thread_fence(std::memory_order_seq_cst);
                             }
                             mmq::Product gu;
                             gu.w = blob_path ? nullptr : (const void*) m.grp_gu;
