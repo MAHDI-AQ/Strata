@@ -2116,7 +2116,13 @@ int main(int argc, char** argv) {
     // those allocations are already made before a stage's cache is sized, so what has to be held back here is
     // the windows and - only on the stage that carries them - the drafter and the head.
     const int64_t kWindowMib = 96;       // the verify windows; 75 MiB measured, rounded up
-    const int64_t kDrafterMib = 1000;    // the MTP drafter (839 MiB) + the head, on the last stage only
+    // The drafter reserve is concurrency-aware (lane-spec-decode 3.1): the measured c5 footprint is
+    // 890 MiB (weights 786 + slot-0 state 104) + 104 MiB of independent state and buffers PER EXTRA SLOT
+    // (4 replicas at c5 = 416 MiB; 7 at c8 = 728) + the 212.9 MiB draft head.  The flat 1000 MiB never
+    // counted the slot replicas; the c*256 concurrency margin absorbed them only by accident, which is
+    // the wrong accounting for c8+/128K planning.  Account the replicas here (+416 MiB at c5; c1 keeps
+    // the old reservation).
+    const int64_t kDrafterMib = 1000 + (int64_t) std::max(0, o.concurrency - 1) * 104;
     auto stage_room = [&](int dev, bool later, bool drafter) -> int64_t {
         const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
