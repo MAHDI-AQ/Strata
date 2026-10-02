@@ -130,7 +130,7 @@ void Context::run(const Product& p, void* stream) {
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows, (const char * const *) p.w_tab};
+                        p.max_rows, p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {

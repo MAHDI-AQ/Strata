@@ -310,12 +310,6 @@ struct Prefill::Impl {
     int32_t* grp_host = nullptr;
     int32_t* grp_dev = nullptr;          // its device alias
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
-    // the zero-copy path's per-group pointer tables (mapped pinned, written by the pump, read by the kernels):
-    // per (layer) group, [MMQ_GROUP gate/up bases][MMQ_GROUP down bases], all host-known when the group's last
-    // expert is computed.  Written per group; the kernel reads the current group's slice only (a fresh slice per
-    // group, never rewritten while its launches may still run - slices are per group and layers are host-synced).
-    const char** gsrc_host = nullptr;
-    const char** gsrc_dev = nullptr;     // its device alias
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
     uint8_t* stage_dev[RING_MAX] = {};
@@ -417,7 +411,6 @@ Prefill::~Prefill() {
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
-    if (impl_->gsrc_host) cudaFreeHost(impl_->gsrc_host);
     for (void* p : impl_->owned) cudaFree(p);
 }
 
@@ -452,21 +445,8 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
 // MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
-// llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert
-// (single-sourced: mmq::kReadOverTail; the zero-copy path reads blobs in place and must honor the same contract).
-constexpr size_t MMQ_TAIL = mmq::kReadOverTail;
-// P4 zero-copy MMQ (STRATA_MMQ_BLOB, default off): a resident expert's weights are read in place from its VRAM
-// cache slot through the per-group pointer table (moe_mmq.cu `w_tab` -> the vendor mmq.cuh's `x_ptrs`) instead of
-// being gathered into grp_gu/grp_d; a streamed expert still gathers (its staging slot's bytes are consumed by that
-// copy, keeping today's lifetime).  Same bytes, same arithmetic: bit-exact by construction; off = the gathered
-// path, byte-for-byte.  The same-binary A/B arm is STRATA_MMQ_BLOB=0/1.
-inline bool mmq_blob() {
-    static const bool v = [] {
-        const char* e = std::getenv("STRATA_MMQ_BLOB");
-        return e != nullptr && std::atoi(e) != 0;
-    }();
-    return v;
-}
+// llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
+constexpr size_t MMQ_TAIL = 4096;
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
@@ -577,21 +557,6 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 if (h) cudaFreeHost(h);
                 cudaGetLastError();
             }
-        }
-    }
-    if (mmq_blob() && m.gsrc_host == nullptr) {
-        // P4 zero-copy: the per-group pointer tables, mapped so the pump writes them without a copy (the group
-        // buffers' idiom).  One slice per group per layer; ng = ceil(n_expert / MMQ_GROUP) groups.
-        const size_t ng = (size_t) (m.g->n_expert + MMQ_GROUP - 1) / MMQ_GROUP;
-        void *h = nullptr, *d = nullptr;
-        if (cudaHostAlloc(&h, ng * 2 * (size_t) MMQ_GROUP * sizeof(const char*), cudaHostAllocMapped) == cudaSuccess &&
-            cudaHostGetDevicePointer(&d, h, 0) == cudaSuccess) {
-            m.gsrc_host = (const char**) h;
-            m.gsrc_dev = (const char**) d;
-        } else {   // no mapped table: the zero-copy path stays off (blob_path checks gsrc_dev)
-            if (h) cudaFreeHost(h);
-            cudaGetLastError();
-            std::fprintf(stderr, "prefill mmq: STRATA_MMQ_BLOB set but the mapped pointer-table alloc failed; zero-copy stays off\n");
         }
     }
     for (int b = 0; b < 2; ++b) {
@@ -1207,15 +1172,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        // P4: the zero-copy gate for this chunk (the layout is global; the env is read once per process)
-        const bool blob_path = mmq_blob() && lay0.native && m.gsrc_dev != nullptr;
-        if (blob_path) {
-            static const bool bl = [] {
-                std::fprintf(stderr, "prefill mmq: zero-copy blob path ON (STRATA_MMQ_BLOB): resident experts read in place\n");
-                return true;
-            }();
-            (void) bl;
-        }
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
@@ -1831,29 +1787,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const int32_t e = order[j];
                         pt.mark(kPfDequant, cs);
                         if (use_mmq) {
+                            // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                             const size_t q = j % MMQ_GROUP;
-                            const size_t j0 = j - q, g = j0 / MMQ_GROUP;
-                            if (blob_path) {
-                                // P4 zero-copy: hand MMQ the expert's own bytes (a resident one from its VRAM
-                                // cache slot - no gather at all; a streamed one still gathers, since that copy
-                                // is what consumes its staging slot).  Same bytes the gather produced - the
-                                // pointer table's entries are absolute bases, so the product is bit-exact.
-                                const auto& f = lay.fmt[(size_t) l];
-                                const bool resident = slot < 0;
-                                m.gsrc_host[2 * (g * MMQ_GROUP + q)] =
-                                    resident ? (const char*) blob_dev : (const char*) (m.grp_gu + q * mmq_gub);
-                                m.gsrc_host[2 * (g * MMQ_GROUP + q) + 1] =
-                                    resident ? (const char*) blob_dev + f.down_off : (const char*) (m.grp_d + q * mmq_db);
-                                if (!resident) {
-                                    mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
-                                                       mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
-                                    // the gathered down matrix's last row ends at its slot's end: MMQ's K
-                                    // over-read (MMQ_TAIL) reads the NEXT slot - zero it (the group tail
-                                    // memsets below cover the group's last slot)
-                                    cudaMemsetAsync(m.grp_d + (size_t) (q + 1) * mmq_db, 0, MMQ_TAIL, m.cs);
-                                }
-                            } else if (lay.native) {
-                                // gather the expert into its group slot (GGUF blocks, unchanged or converted)
+                            if (lay.native) {
                                 const auto& f = lay.fmt[(size_t) l];
                                 mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
                                                    mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
@@ -1863,22 +1799,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
                             if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                             // the group's products: gate/up, swiglu, the group's H to q8_1, down
-                            const size_t n = order.size();
+                            const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
                             const int ngx = (int) (q + 1);
                             const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
                             int64_t maxr = 0;
                             for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                             pt.mark(kPfGemmGU, cs);
-                            if (!blob_path) {
-                                // the zeroed tail after the group's last expert (see MMQ_TAIL); the zero-copy path
-                                // covers its over-reads at each streamed member's gather instead
-                                cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
-                                cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
-                            }
+                            // the zeroed tail after the group's last expert (see MMQ_TAIL)
+                            cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
+                            cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
                             mmq::Product gu;
-                            gu.w = blob_path ? nullptr : (const void*) m.grp_gu;
-                            gu.w_tab = blob_path ? (const void* const*) (m.gsrc_dev + 2 * (g * MMQ_GROUP)) : nullptr;
-                            gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
+                            gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                             gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                             gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
                             m.mmq_ctx->run(gu, m.cs);
@@ -1886,9 +1817,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             pt.mark(kPfGemmD, cs);
                             mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
                             mmq::Product dn;
-                            dn.w = blob_path ? nullptr : (const void*) m.grp_d;
-                            dn.w_tab = blob_path ? (const void* const*) (m.gsrc_dev + 2 * (g * MMQ_GROUP) + MMQ_GROUP) : nullptr;
-                            dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
+                            dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
                             dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
                             dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                             dn.ld_dst = N;
