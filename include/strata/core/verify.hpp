@@ -68,7 +68,7 @@ public:
     /// the flags guarded, so this verifier refuses every later window.  True when the streams finished.
     bool release_gpu_waits(int timeout_ms);
 
-    /// `max_t` <= kVerifyMaxT; a dedicated expert-only batch workspace may reserve up to 16 rows.
+    /// `max_t` <= kVerifyMaxT; a dedicated expert-only batch workspace may reserve up to MAXT rows.
     /// `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err, bool batch_workspace = false);
@@ -335,7 +335,7 @@ private:
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
-    int groups_[17] = {};
+    int groups_[strata::kernels::cpu::MAXT + 1] = {};   ///< group count by window size T (2 = the split window)
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device

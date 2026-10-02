@@ -204,8 +204,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
-    if (max_t < 2 || max_t > (batch_workspace ? 16 : strata::kernels::kVerifyMaxT) || max_t > strata::kernels::cpu::MAXT) {
-        err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
+    if (max_t < 2 || max_t > (batch_workspace ? strata::kernels::cpu::MAXT : strata::kernels::kVerifyMaxT) ||
+        max_t > strata::kernels::cpu::MAXT) {
+        err = "verify: the window must hold 2.." +
+              std::to_string(batch_workspace ? strata::kernels::cpu::MAXT : strata::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
     if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
@@ -426,7 +428,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
     // residual, pending write and inject (see set_stage)
     if (lb_ > 0) {
         // C2-A3: a batch round packs every member's rows [0, total); row0 is this member's offset.
-        if (row0 < 0 || row0 + T > (int64_t) 16) { err = "verify: window row offset out of range (row0=" + std::to_string(row0) + ", T=" + std::to_string(T) + ", max_t=" + std::to_string(max_t_) + ")"; return false; }
+        if (row0 < 0 || row0 + T > (int64_t) strata::kernels::cpu::MAXT) { err = "verify: window row offset out of range (row0=" + std::to_string(row0) + ", T=" + std::to_string(T) + ", max_t=" + std::to_string(max_t_) + ")"; return false; }
         for (int t = 0; t < T; ++t) {
             const float* in = hand_in_ + (size_t) (row0 + t) * HB;
             copy_from_mapped(Rt(t), in, HC * N, cs);
@@ -843,7 +845,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
     if (phase == 1) return pre(layer, 0);
     if (phase == 2 || phase == 3) return post(layer, 0);
     if (phase == 5) {   // C2-A3: a split's earlier stage hands this window's packed rows on
-        if (row0 < 0 || row0 + T > (int64_t) 16) { err = "verify: window row offset out of range (row0=" + std::to_string(row0) + ", T=" + std::to_string(T) + ", max_t=" + std::to_string(max_t_) + ")"; return false; }
+        if (row0 < 0 || row0 + T > (int64_t) strata::kernels::cpu::MAXT) { err = "verify: window row offset out of range (row0=" + std::to_string(row0) + ", T=" + std::to_string(T) + ", max_t=" + std::to_string(max_t_) + ")"; return false; }
         for (int t = 0; t < T; ++t) {
             float* out = hand_out_ + (size_t) (row0 + t) * HB;
             copy_from_mapped(out, Rt(t), HC * N, cs);
@@ -1213,13 +1215,13 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
         total += b.count;
         shape.emplace_back(v, b.count);
     }
-    // C2-A6: max_t_ = max(2, c.rows) <= 16 (verify.cpp:149: batch_workspace caps at 16; kVerifyMaxT = 8,
-    // verify_kernels.hpp:21), and the POOL accepts any call whose n_tok * k fits kMaxWindowEntries
-    // (160; src/core/expert_source.cpp:974, guards at :982 and :988) and n_tok <= MAXT (16;
-    // include/strata/kernels/cpu/expert.hpp:131).  This model: k = ss.k = 10 (verify.cpp:164)
-    // => the full 16-row workspace envelope is legal; the 8-agent configs run --batch-rows 12..16.
-    // The split hand-off buffer is max(kVerifyMaxT, batch_rows) rows per boundary (generate.cpp:3781) -
-    // a 16-row round fits EXACTLY.  Rows beyond the envelope abort the engine LOUDLY at layer 0
+    // C2-A6: max_t_ = max(2, c.rows) <= the batch envelope (verify.cpp:207 caps a batch workspace at
+    // MAXT = 24; kVerifyMaxT = 8, verify_kernels.hpp:21), and the POOL accepts any call whose n_tok * k
+    // fits kMaxWindowEntries (240; src/core/expert_source.cpp:975, guards at :983 and :989) and
+    // n_tok <= MAXT (24; include/strata/kernels/cpu/expert.hpp:138).  This model: k = ss.k = 10
+    // => the full 24-row workspace envelope is legal (240 entries); the batch configs run --batch-rows 8..24.
+    // The split hand-off buffer is max(kVerifyMaxT, batch_rows) rows per boundary (generate.cpp:3893) -
+    // a 24-row round fits EXACTLY.  Rows beyond the envelope abort the engine LOUDLY at layer 0
     // (dispatch.failed -> exit 1).  A7's census prints rows= for every capture.
     if (total > max_t_) { err = "batch verify: row budget exceeded"; return false; }
     for (const auto& b : batch)
