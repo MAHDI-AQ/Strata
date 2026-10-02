@@ -212,6 +212,10 @@ struct ConcurrentServe::Impl {
         cudaStream_t prompt_stream = nullptr;
     };
     std::vector<StageRt> stage_rt;
+    // Lane w3-chaingate: the engine-wide "one deferred stage-1 run in flight" gate.  Every slot's
+    // stage-0 prompt points at THIS gate (run()'s per-slot block); all slots' stage-1 prompts share the
+    // stage-1 prompt workspace/stream, so two live stage-1 runs would alias it (prefill.hpp ChainGate).
+    prefill::ChainGate chain_gate;
     // STRATA_SLOT_LAZY (prepare reads the env; run()'s bringup_slot uses these members).
     bool lazy_slots = false;
     int64_t session_k = 0;
@@ -451,6 +455,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             // Lane pipeline-prefill: this pump may leave a chunk's stage-1 run in flight between chunks
             // (STRATA_PREFILL_CHAIN=1).  Only this path opts in, so a leaked env is inert elsewhere.
             s.stages[st].prompt.set_chain_defer(true);
+            // Lane w3-chaingate: the FIRST stage's prompt is the one that spawns the deferred next-stage
+            // runs; one gate across all slots keeps them from overlapping.  Stages >= 1 spawn their own
+            // deferred runs from INSIDE a gated run (3+ stage shapes) and must not take this gate.
+            if (st == 0) s.stages[st].prompt.set_chain_gate(&m.chain_gate);
         }
         // The drafter reads the chain's last residual and the LAST stage's weights/head (generate.cpp:3750).
         if (!s.draft->bind(*m.stages.back().wt, m.stages.back().head, s.stages[0].verify.final_R_all(), err)) return 1;

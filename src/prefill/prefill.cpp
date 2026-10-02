@@ -1980,8 +1980,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             // this stage's state is at the chunk's end now (synced) and moves on with the next chunk below
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
+            // lane w3-chaingate: at most ONE deferred stage-1 run in flight engine-wide.  Every slot's
+            // stage-1 prompt shares one workspace and stream (concurrent_serve.cpp stage_rt), so two
+            // overlapping stage-1 runs alias every buffer - the K<24 `prefill copy_i32` illegal-access
+            // fault.  The wait is at this SPAWN point and only in the chain arm; the spawned run releases
+            // the gate when it completes.  This slot's own previous stage-1 was drained just above, so the
+            // intended chain (S0(c+1) under a live S1(c)) is untouched: the gate serializes stage-1 runs
+            // ACROSS slots, never this slot's own two chunks.
+            ChainGate* gate = chain ? chain_gate_ : nullptr;
+            if (gate != nullptr) gate->acquire();
             next_->hand_in_ = h;
-            next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err] {
+            next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err, gate] {
+                struct GateRelease {
+                    ChainGate* g;
+                    ~GateRelease() { if (g != nullptr) g->release(); }
+                } release{gate};
                 return next_->run(tokens + c0, T, p0, next_err);
             });
             hand_buf ^= 1;
@@ -2123,5 +2136,7 @@ bool Prefill::chain_wait(std::string& err) {
 }
 
 void Prefill::set_chain_defer(bool on) { impl_->chain_defer = on; }
+
+void Prefill::set_chain_gate(ChainGate* gate) { chain_gate_ = gate; }
 
 }  // namespace strata::prefill

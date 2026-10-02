@@ -16,9 +16,11 @@
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace strata::prefill {
@@ -43,6 +45,32 @@ struct PrefillStats {
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {
+
+/// Lane w3-chaingate (STRATA_PREFILL_CHAIN, default off): the engine-wide "one deferred stage-1 run
+/// in flight" gate.  All slots' stage-1 prompts share one workspace and one stream, so two of them may
+/// never overlap; the concurrent engine hands the SAME gate to every slot's stage-0 prompt, whose `run`
+/// waits it at the stage-1 spawn point, and the spawned run releases it when it completes.  This
+/// serializes stage-1 runs across slots while leaving the intended per-slot S0(c+1) || S1(c) chain
+/// intact (stage-0 runs on the stage-0 workspace, so a live gate never holds it back).
+class ChainGate {
+public:
+    /// Wait until no deferred run is in flight, then take the gate.  Called on the spawning (stage-0) thread.
+    void acquire() {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this] { return !busy_; });
+        busy_ = true;
+    }
+    /// Release: the deferred run this gate was taken for has completed (the spawned task's exit path).
+    void release() {
+        { std::lock_guard<std::mutex> lk(mu_); busy_ = false; }
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool busy_ = false;
+};
 
 class Prefill {
 public:
@@ -117,6 +145,10 @@ public:
     void set_chain_defer(bool on);
     /// Wait the deferred stage-1 run (a no-op when none is in flight).  false with `err` on stage-1 failure.
     bool chain_wait(std::string& err);
+    /// Lane w3-chaingate: the shared gate of the engine this prompt belongs to.  `run` takes it at the
+    /// deferred-run spawn point (chain arm only), so at most ONE stage-1 run is in flight engine-wide;
+    /// null (default): no gating.  Set on the stage that SPAWNS the deferred run (stage 0 of a split).
+    void set_chain_gate(ChainGate* gate);
 
     /// Lane prefill R2 (STRATA_PLE_PREFETCH, default off): prefetch the PLE rows of a successor chunk on a
     /// thread, into the Impl's other host buffer (the concurrent pump calls it after a mid-prompt chunk).
@@ -130,6 +162,7 @@ public:
 private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
+    ChainGate* chain_gate_ = nullptr;   ///< lane w3-chaingate: the engine-wide stage-1 gate (null: off)
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     struct Impl;
