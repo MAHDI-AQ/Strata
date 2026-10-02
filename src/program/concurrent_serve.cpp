@@ -51,6 +51,7 @@ struct Request {
     std::vector<int64_t> tokens;
     kernels::SamplerParams sampling{};
     float spec_min_p = 0.5f;
+    uint64_t session = 0;   // D1 wire hint: the CGEN sess= conversation key (0 = none)
 };
 bool parse_request(const std::string& line, const ConcurrentConfig& config, int64_t vocab, Request& r, std::string& err) {
     std::istringstream input(line);
@@ -104,6 +105,15 @@ bool parse_request(const std::string& line, const ConcurrentConfig& config, int6
             else if (key == "penalty_freq") r.sampling.penalty_freq = f;
             else if (key == "penalty_present") r.sampling.penalty_present = f;
             else if (key == "spec_min_p") { if (f < 0 || f > 1) throw std::invalid_argument(key); r.spec_min_p = f; }
+            // D1 wire hint: the conversation key the server derives from the prompt prefix (a u64;
+            // 0 = absent).  Strict decimal digits so "-1" cannot wrap into a valid-looking key.
+            else if (key == "sess") {
+                if (value.empty() || value[0] < '0' || value[0] > '9') throw std::invalid_argument(key);
+                size_t sess_end = 0;
+                const unsigned long long n = std::stoull(value, &sess_end);
+                if (sess_end != value.size()) throw std::invalid_argument(key);
+                r.session = (uint64_t) n;
+            }
             else if (key == "cvec" && (f == 0 || f == 1)) {} // no control vector can be loaded in this mode
             else throw std::invalid_argument("unsupported key: " + key);
         }
@@ -156,6 +166,9 @@ struct ConcurrentServe::Impl {
         // full retained history as an exact prefix of its request continues the sequence with no copy and
         // no session_zero. `reused_prefix` = tokens THIS request reused (the DONE trailer's field 9).
         int64_t reused_prefix = 0;
+        // D1: the session key of the last request this slot admitted (the CGEN sess= hint), 0 = none.
+        // Written only while the retain pre-pass is live; read only by that pre-pass (inert when off).
+        uint64_t session = 0;
         std::atomic<int64_t> read{0}, position{0};
         int64_t generated = 0, offered = 0, accepted = 0;
         int32_t current = 0;
@@ -473,6 +486,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     double target_ms = 0, draft_ms = 0, commit_ms = 0, adapt_ms = 0;
     std::atomic<double> prefill_ms{0};   // written by the pump thread, read by the profile (lane prefill)
     int64_t produced = 0, target_rows = 0;
+    // D1: admission-scan stall samples - the whole-queue match pass's added time at the safe point,
+    // for the falsifier (p50/max printed in the profile; only ever written while retain is on).
+    constexpr size_t kAdmissionStallSamples = 256;
+    int64_t admit_scans = 0;
+    double admit_ms_sum = 0.0, admit_ms_max = 0.0, admit_ms_ring[kAdmissionStallSamples]{};
     auto report_profile = [&]() {
         if (!profiling || !rounds) return;
         // every stage of the chain waits - a split's stage 1 included: sum them all, not stage 0's only.
@@ -492,6 +510,15 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                      "gpu_experts_ms=%.1f gpu_post_ms=%.1f gpu_head_ms=%.1f\n",
                      (long long) batch[0].batch_captures, batch[0].ms_batch_capture, batch[0].batch_gpu_ms[0],
                      batch[0].batch_gpu_ms[1], batch[0].batch_gpu_ms[2], batch[0].batch_gpu_ms[3]);
+        if (admit_scans) {   // D1: only when the retain pre-pass ran (retain off => unchanged output)
+            const size_t n = std::min<size_t>((size_t) admit_scans, kAdmissionStallSamples);
+            std::vector<double> samples(admit_ms_ring, admit_ms_ring + n);
+            std::sort(samples.begin(), samples.end());
+            std::fprintf(stderr, "strata concurrent admission: passes=%lld scan_ms_mean=%.3f scan_ms_p50=%.3f "
+                         "scan_ms_max=%.3f (D1 whole-queue match pass; window=%zu)\n",
+                         (long long) admit_scans, admit_ms_sum / (double) admit_scans,
+                         samples[samples.size() / 2], admit_ms_max, n);
+        }
     };
     auto adapt = [&]() -> bool {
         // All target, commit, prefill and draft work has finished at this boundary. Updating both
@@ -559,8 +586,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                  adaptive ? "on" : "off",
                  retain ? "prefix-cache live-retention on (parking not yet supported on this path)"
                         : "prefix-cache off (parking not yet supported on this path)");
-    std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s\n",
-                c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.kv.c_str(), c.suffix, adaptive ? "adaptive" : "static");
+    // D1: advertise the sess= wire hint only while retention is on - the off path stays byte-identical
+    // (stdout and wire), and the server sends the hint only to an engine that advertises it.
+    std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s%s\n",
+                c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.kv.c_str(), c.suffix, adaptive ? "adaptive" : "static",
+                retain ? " admission=d1" : "");
     std::printf("READY %lld stop multiplex\n", (long long) c.context);
     // LANE sched-impl P2 (host-loop O1/O2 surface): echo the effective spin posture so the primary's
     // A/B reads off this log line. Zero wait-posture change: the knobs are honored where they already
@@ -1094,6 +1124,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         s.position.store((int64_t) s.request.tokens.size() - 1);
         s.current = (int32_t) s.request.tokens.back();
         s.reused_prefix = reused;
+        if (retain) s.session = s.request.session;   // D1: keep the slot's conversation key current
         if (reused == 0) s.consumed.clear();
         // reused > 0: `consumed` already IS request.tokens[0..reused) - the match proved it, and the
         // pump appends [reused, n-1) to it as it reads, so penalty/suffix state see the same n-1
@@ -1181,26 +1212,69 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // with a slot's FULL retained history, and is longer than it, continues that slot with no
         // copy: admission skips session_zero and the pump reads only [reused, n-1). The bound and the
         // exact-token rule are the serial loop's starts_with (generate.cpp:4576-4581): at most n-1
-        // retained tokens, the last token always opens the first verify window. Longest match wins; a
-        // partial or divergent prefix is a miss and the walk below zeroes the slot exactly as before.
+        // retained tokens, the last token always opens the first verify window. A partial or divergent
+        // prefix is a miss and the walk below zeroes the slot exactly as before.
+        // D1 prefix-aware admission: the match pass scans the WHOLE pending deque (bounded by its own
+        // cap of 16 entries) against every idle slot and admits the longest exact match FIRST; ties
+        // break by arrival order, then by slot index.  The head-only pass this replaces could only
+        // ever admit the queue head, so a longer-matching turn behind it was served fresh and the
+        // retained history it matched was lost.  The CGEN sess= hint (pending[q].session) makes a
+        // request prefer its own slot when that slot is idle and still holds a matching history; a
+        // busy or diverged keyed slot falls back to the longest-match scan.  Cost is bounded by the
+        // length prefilter (a candidate must beat the current best) and early-exit compares; the
+        // added stall is sampled below for the falsifier.
         // Off (default): this pre-pass is dead code and the walk is byte-identical.
+        constexpr size_t kAdmissionScanQueue = 16;   // the pending deque's own cap (see the overflow check above)
+        const auto admit_start = retain ? Clock::now() : Clock::time_point{};
         while (retain && !pending.empty()) {
             Impl::Slot* pick = nullptr;
+            size_t pick_q = 0;
             int64_t best = 0;
-            const auto& tokens = pending.front().tokens;
-            for (auto& ptr : m.slots) {
-                const auto& held = *ptr;
-                if (held.active.load()) continue;
-                const int64_t L = (int64_t) held.consumed.size();
-                if (L < 1 || L > (int64_t) tokens.size() - 1) continue;
-                bool same = true;
-                for (int64_t i = 0; i < L && same; ++i) same = held.consumed[(size_t) i] == (int32_t) tokens[(size_t) i];
-                if (same && L > best) { best = L; pick = ptr.get(); }
+            const size_t qn = std::min<size_t>(pending.size(), kAdmissionScanQueue);
+            for (size_t q = 0; q < qn; ++q) {
+                const auto& tokens = pending[q].tokens;
+                const int64_t nmax = (int64_t) tokens.size() - 1;
+                if (nmax < 1) continue;   // n < 2: no legal reuse for this request
+                if (nmax <= best) continue;   // cannot beat the current best: skip before any compare
+                Impl::Slot* cand = nullptr;
+                int64_t candL = 0;
+                if (pending[q].session != 0) {
+                    // The hint: the first idle slot of this session is THE keyed slot - use it when it
+                    // matches; otherwise (busy, unusable length, or diverged) fall back to longest-match.
+                    for (auto& ptr : m.slots) {
+                        const auto& held = *ptr;
+                        if (held.active.load() || held.session != pending[q].session) continue;
+                        const int64_t L = (int64_t) held.consumed.size();
+                        if (L < 1 || L > nmax) break;
+                        bool same = true;
+                        for (int64_t i = 0; i < L && same; ++i) same = held.consumed[(size_t) i] == (int32_t) tokens[(size_t) i];
+                        if (same) { cand = ptr.get(); candL = L; }
+                        break;
+                    }
+                }
+                if (cand == nullptr) {
+                    for (auto& ptr : m.slots) {
+                        const auto& held = *ptr;
+                        if (held.active.load()) continue;
+                        const int64_t L = (int64_t) held.consumed.size();
+                        if (L < 1 || L > nmax || L <= candL) continue;   // length prefilter: must beat the best
+                        bool same = true;
+                        for (int64_t i = 0; i < L && same; ++i) same = held.consumed[(size_t) i] == (int32_t) tokens[(size_t) i];
+                        if (same) { candL = L; cand = ptr.get(); }
+                    }
+                }
+                if (cand != nullptr && candL > best) { best = candL; pick = cand; pick_q = q; }
             }
-            if (pick == nullptr) break;   // no live match for the queue head: the normal walk admits it
+            if (pick == nullptr) break;   // no live match anywhere in the queue: the normal walk admits
             auto& s = *pick;
-            s.request = std::move(pending.front()); pending.pop_front();
+            s.request = std::move(pending[pick_q]); pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
             if (!admit_slot(s, best)) return 1;
+        }
+        if (retain && admitting) {   // D1 falsifier: the whole-queue scan's added stall at the safe point
+            const double ms = elapsed(admit_start);
+            ++admit_scans; admit_ms_sum += ms;
+            if (ms > admit_ms_max) admit_ms_max = ms;
+            admit_ms_ring[(size_t) (admit_scans - 1) % kAdmissionStallSamples] = ms;
         }
         for (auto& ptr : m.slots) if (!ptr->active.load() && !pending.empty()) {
             auto& s = *ptr;
