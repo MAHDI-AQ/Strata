@@ -340,6 +340,17 @@ struct Prefill::Impl {
     std::string chain_err;
     int chain_hand = 0;
     bool chain_defer = false;
+    // Lane prefill R2 (STRATA_PLE_PREFETCH, default off): the next chunk's PLE gather runs on a thread spawned
+    // by the concurrent pump (ple_prefetch_next) and is consumed by this object's next run() call when its key
+    // still matches.  The future, its error, the buffer index, a copy of its tokens and the two tokens before
+    // it persist across calls; invalid/empty when the feature is off.
+    std::future<bool> ple_pf;
+    std::string ple_pf_err;
+    std::vector<int64_t> ple_pf_tokens;
+    int32_t ple_pf_pv[2] = {0, 0};
+    int64_t ple_pf_n = 0;
+    int ple_pf_buf = 0;
+    int ple_up = 0;              // the ple_emb_host buffer the last uploaded chunk used (R2's alternation)
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -385,6 +396,8 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() {
     if (!impl_) return;
+    // R2: a prefetch thread may still be writing ple_emb_host/ple_rows - it must finish before the buffers go.
+    if (impl_->ple_pf.valid()) impl_->ple_pf.wait();
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     for (int i = 0; i < RING_MAX; ++i) {
@@ -945,6 +958,33 @@ struct PfTimer {
 };
 }  // namespace
 
+// R2 (STRATA_PLE_PREFETCH, default off): the cross-call prefetch runs this gather - the identical rows and
+// bytes the inline path runs (hoisted from run()'s lambda so both paths share one implementation).  `tok` is
+// the chunk's own token array, `pv0` the two tokens before it (they name the first positions' n-grams: the
+// rows depend on nothing else), `buf` selects the ple_rows/ple_emb_host pair.
+bool Prefill::ple_gather_impl(Impl& m, const int64_t* tok, int64_t T, const int32_t pv0[2], int buf,
+                              std::string& err) {
+    int32_t pv[2] = {pv0[0], pv0[1]};
+    for (int64_t t = 0; t < T; ++t) {
+        const int32_t tk = (int32_t) tok[t];
+        strata::kernels::ngram_rows(&tk, pv, 1, m.ss->ple.consts,
+                                    m.ple_rows[buf].data() + t * strata::kernels::PLE_N_HEADS);
+        pv[0] = pv[1];
+        pv[1] = tk;
+    }
+    return m.ss->ple.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], err);
+}
+
+namespace {
+bool ple_prefetch_env() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_PLE_PREFETCH");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+}
+}  // namespace
+
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
     Impl& m = *impl_;
@@ -998,22 +1038,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
+    // R2: the inline path keeps the rows/bytes it always produced - it runs the same hoisted gather the
+    // cross-call prefetch runs, with the chunk's two preceding tokens from this call's token array.
+    auto ple_gather = [&m, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
         const int64_t T = std::min(m.T, n - c0);
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
-        int32_t pv[2] = {at(c0), at(c0 + 1)};
-        for (int64_t t = 0; t < T; ++t) {
-            const int32_t tok = (int32_t) tokens[c0 + t];
-            strata::kernels::ngram_rows(&tok, pv, 1, ss.ple.consts,
-                                        m.ple_rows[buf].data() + t * strata::kernels::PLE_N_HEADS);
-            pv[0] = pv[1];
-            pv[1] = tok;
-        }
-        return ss.ple.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
+        const int32_t pv0[2] = {at(c0), at(c0 + 1)};
+        return ple_gather_impl(m, tokens + c0, T, pv0, buf, e);
     };
+    // R2 (STRATA_PLE_PREFETCH, default off): the pump may have prefetched this call's first chunk (see
+    // Prefill::ple_prefetch_next).  ON, the two host buffers alternate across calls - the prefetch wrote the
+    // other one - and every gather into a buffer waits that buffer's own previous upload; OFF, the reset.
+    const bool ple_pf_env = ple_prefetch_env();
     std::string ple_next_err;
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
-    int ple_buf = 0;
+    int ple_buf = ple_pf_env ? (m.ple_up ^ 1) : 0;
 
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
@@ -1079,14 +1118,39 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // ---- the PLE rows of the whole chunk, one batched SSD request (read ahead on a thread, see ple_gather)
         if (ple_on) {
             const auto tp = Clock::now();
-            if (!ple_next.valid()) {
-                if (!ple_gather(c0, ple_buf, err)) return false;
-            } else if (!ple_next.get()) {
-                err = ple_next_err;
-                return false;
+            bool ple_have = false;              // R2: the rows are already in ple_buf (the cross-call prefetch)
+            if (ple_pf_env && c0 == 0 && m.ple_pf.valid()) {
+                // R2: the pump spawned this chunk's gather after this slot's previous call.  Consume it only when
+                // its key - count, tokens and the two tokens before the chunk - is exactly this chunk's: the
+                // rows depend on nothing else.  Any other key (a cancel/re-admit replaced the tokens, a tail, an
+                // interleaved request) is a stale future, drained and dropped, and the inline gather below runs.
+                const bool key = m.ple_pf_n == T && (int64_t) m.ple_pf_tokens.size() == T &&
+                                 m.ple_pf_pv[0] == prev[0] && m.ple_pf_pv[1] == prev[1] &&
+                                 std::equal(m.ple_pf_tokens.begin(), m.ple_pf_tokens.end(), tokens);
+                if (key) {
+                    // the buffer is free: the spawn synchronized its own previous upload before the gather wrote it
+                    if (!m.ple_pf.get()) { err = m.ple_pf_err; return false; }
+                    ple_buf = m.ple_pf_buf;
+                    ple_have = true;
+                    ++stats_.ple_pf_consumed;
+                } else {
+                    (void) m.ple_pf.get();
+                    ++stats_.ple_pf_wasted;
+                }
+            }
+            if (!ple_have) {
+                if (!ple_next.valid()) {
+                    if (ple_pf_env) cudaEventSynchronize(m.ple_copied[ple_buf]);   // R2: its previous upload is done
+                    if (!ple_gather(c0, ple_buf, err)) return false;
+                    if (ple_pf_env) ++stats_.ple_pf_inline;
+                } else if (!ple_next.get()) {
+                    err = ple_next_err;
+                    return false;
+                }
             }
             cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs);
             cudaEventRecord(m.ple_copied[ple_buf], m.cs);
+            if (ple_pf_env) m.ple_up = ple_buf;   // R2: the buffer the next spawn must not overwrite
             if (c0 + m.T < n) {
                 cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
@@ -1997,7 +2061,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                      (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
-                             "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+                             "PLE %.0f ms; ple prefetch spawned/consumed/inline/wasted %lld/%lld/%lld/%lld\n",
+                     host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple,
+                     (long long) stats_.ple_pf_spawned, (long long) stats_.ple_pf_consumed,
+                     (long long) stats_.ple_pf_inline, (long long) stats_.ple_pf_wasted);
     }
     if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
         cudaStreamSynchronize(m.cs);
@@ -2014,6 +2081,38 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
     }
     return true;
+}
+
+bool Prefill::ple_prefetch_next(const int64_t* next_tokens, int64_t n_next) {
+    Impl& m = *impl_;
+    if (!ple_prefetch_env() || next_tokens == nullptr || m.ple_pf.valid()) return false;
+    // the same gate run() uses for its PLE block (this object's stage owns layer 1)
+    if (!(m.ss->ple.ready() && stage_lb_ <= 1 && 1 < stage_le_)) return false;
+    const int64_t T = std::min(m.T, n_next);
+    if (T <= 0) return false;
+    // the pump's token array must not be dereferenced after its call returns (a cancel/re-admit replaces the
+    // request's tokens): gather from a copy.
+    m.ple_pf_tokens.assign(next_tokens, next_tokens + T);
+    m.ple_pf_pv[0] = m.ss->ple_prev[0];
+    m.ple_pf_pv[1] = m.ss->ple_prev[1];
+    const int buf = m.ple_up ^ 1;   // the buffer the last run() chunk did not upload from
+    // that buffer's previous upload must be done before the gather overwrites it (the in-call discipline; a
+    // never-recorded event syncs to success)
+    if (cudaEventSynchronize(m.ple_copied[buf]) != cudaSuccess) { cudaGetLastError(); return false; }
+    m.ple_pf_buf = buf;
+    m.ple_pf_n = T;
+    const int32_t p0 = m.ple_pf_pv[0], p1 = m.ple_pf_pv[1];
+    m.ple_pf = std::async(std::launch::async, [&m, T, buf, p0, p1] {
+        const int32_t pv[2] = {p0, p1};
+        return ple_gather_impl(m, m.ple_pf_tokens.data(), T, pv, buf, m.ple_pf_err);
+    });
+    ++stats_.ple_pf_spawned;
+    return true;
+}
+
+void Prefill::ple_prefetch_drain() {
+    // Wait, do not consume: a matching next run() still uses the prefetched rows; a mismatching one drops them.
+    if (impl_->ple_pf.valid()) impl_->ple_pf.wait();
 }
 
 bool Prefill::chain_wait(std::string& err) {
