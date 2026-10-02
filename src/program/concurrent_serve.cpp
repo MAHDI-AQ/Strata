@@ -1019,7 +1019,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         if (overlap && prev.valid &&
             std::find(prev.ready.begin(), prev.ready.end(), &s) != prev.ready.end()) return false;
         if (s.position.load() >= c.context) return false;
-        if (s.generated >= s.request.max_new) return false;        return true;
+        if (s.generated >= s.request.max_new) return false;
+        return true;
     };
     // LANE alloc-empty: STRATA_SLOT_LAZY's deferred per-slot bring-up.  Same calls in the same order as
     // the boot-time creation (prepare()'s per-slot block, then run()'s), so an on-demand slot is
