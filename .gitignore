@@ -53,3 +53,5 @@ tests/concurrency/*.obj
 /build-concurrency/
 /run-concurrency-local.ps1
 
+# acceptance harness selftest scratch (tools/acceptance/selftest_acceptance.sh)
+tools/acceptance/tmp/
