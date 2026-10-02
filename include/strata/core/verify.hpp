@@ -263,7 +263,7 @@ private:
     std::vector<BatchGraph> batch_graphs_;
     int batch_cache_limit_ = 8, batch_reserve_mib_ = 0;
     bool batch_parallel_ = false;
-    cudaEvent_t batch_fork_ = nullptr, batch_join_[8] = {};
+    cudaEvent_t batch_fork_ = nullptr, batch_join_[16] = {};   ///< batch-parallel member events, one per request (16 = the M2 request lattice)
     cudaGraphExec_t batch_replay_ = nullptr;
     static constexpr int kProfPer = 32;              // stamps per layer
     bool prof_on_ = false;

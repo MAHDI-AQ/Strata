@@ -461,7 +461,7 @@ void usage() {
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
-                 "  --concurrency N      experimental shared-model serving, 1..8 requests (default 1)\n"
+                 "  --concurrency N      experimental shared-model serving, 1..16 requests (default 1)\n"
                  "  --batch-rows N       target rows across requests, 1..24 (default 8)\n"
                  "  --batch-graphs N     cached batch layouts, 1..64 (default 8; respects VRAM reserve)\n"
                  "  --batch-padding N    stabilize verification shapes with discarded padding, 0|1 (default 0)\n"
@@ -1217,13 +1217,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata serve: conversation parking does not yet support --layer-split; disable parking with --conversation-cache-mib 0\n");
         return 2;
     }
-    if (o.concurrency < 1 || o.concurrency > 8 || o.batch_rows < 1 ||
+    if (o.concurrency < 1 || o.concurrency > 16 || o.batch_rows < 1 ||
         o.batch_rows > (int) strata::kernels::cpu::MAXT ||
         o.batch_graphs < 1 || o.batch_graphs > 64 ||
         o.batch_padding < 0 || o.batch_padding > 1 ||
         o.batch_parallel < 0 || o.batch_parallel > 1 ||
         (o.batch_policy != "fair" && o.batch_policy != "depth") || o.concurrent_prefill < 256 || o.concurrent_prefill > 4096) {
-        std::fprintf(stderr, "strata: --concurrency 1..8, --batch-rows 1..24, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..4096\n");
+        std::fprintf(stderr, "strata: --concurrency 1..16, --batch-rows 1..24, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..4096\n");
         return 2;
     }
     if (o.concurrency > 1) {
