@@ -17,7 +17,7 @@ int main() {
     int checks = 0;
     for (int a = 1; a <= 8; ++a) for (int b = 1; b <= 8; ++b)
     for (int c = 1; c <= 8; ++c) for (int d = 1; d <= 8; ++d)
-    for (int budget = 1; budget <= 16; ++budget) for (bool depth : {false, true}) {
+    for (int budget = 1; budget <= 24; ++budget) for (bool depth : {false, true}) {
         std::vector<int> wanted{a,b,c,d};
         const auto rows = schedule_rows(wanted, budget, depth);
         assert(std::accumulate(rows.begin(), rows.end(), 0) == std::min(budget, a+b+c+d));
@@ -34,15 +34,31 @@ int main() {
         }
         for (int n : progress) assert(n == 1);
     }
-    for (int invalid : {0,17,32}) {
+    // The envelope raise: budget 24 (MAXT rows) is accepted, 25 is refused - failing closed above.
+    for (int invalid : {0,25,32}) {
         bool rejected = false;
         try { schedule_rows({4,4}, invalid, false); } catch (const std::invalid_argument&) { rejected = true; }
         assert(rejected);
     }
     {
+        // The full 24-row envelope allocates across the agents: 3 x 8 = 24 rows (240 entries at k = 10).
+        assert((schedule_rows({8,8,8}, 24, false) == std::vector<int>{8,8,8}));
+        // With the five-agent wanted [4,...], 20 rows: the envelope no longer truncates a slot.
+        assert((schedule_rows({4,4,4,4,4}, 24, false) == std::vector<int>{4,4,4,4,4}));
+        // With eight agents the 24 rows spread evenly.
+        assert((schedule_rows({8,8,8,8,8,8,8,8}, 24, false) == std::vector<int>{3,3,3,3,3,3,3,3}));
+    }
+    {
         // The pair-combine raise: 8 requests are accepted, 9 are not.
         bool rejected = false;
-        try { schedule_rows(std::vector<int>(9, 1), 16, false); } catch (const std::invalid_argument&) { rejected = true; }
+        try { schedule_rows(std::vector<int>(9, 1), 24, false); } catch (const std::invalid_argument&) { rejected = true; }
+        assert(rejected);
+    }
+    {
+        // The per-window bound (kVerifyMaxT = 8) did NOT move with the row envelope: a 9-token window is
+        // refused, so no batch member can exceed the fixed per-window tables.
+        bool rejected = false;
+        try { schedule_rows({9,1}, 24, false); } catch (const std::invalid_argument&) { rejected = true; }
         assert(rejected);
     }
     std::cout << checks << " schedule cases passed\n";

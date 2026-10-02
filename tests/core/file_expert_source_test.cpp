@@ -185,6 +185,51 @@ void test_native_variable_layout() {
 }
 #endif
 
+// THE VERIFY WINDOW'S ENTRY ENVELOPE.  The pool accepts a call whose n_tok * k fits kMaxWindowEntries
+// (240 at this model's k = 10 and MAXT = 24) and refuses anything above it BEFORE any per-entry work -
+// the guard is what keeps the fixed window tables inside their bound.  24 x 10 = 240 is the last legal
+// window; 25 tokens trips the token guard and 24 x 11 = 264 trips the entry guard.  The legal probe runs
+// with a stub source whose blob() cannot be produced, so reaching the SOURCE message proves the envelope
+// accepted the call; a refusal names its own guard instead.
+struct StubSource : strata::core::ExpertSource {
+    const uint8_t* blob(int64_t, int64_t) override { return nullptr; }
+};
+
+strata::core::ExpertDispatch probe_window(strata::core::ExpertSource& src, int64_t n_tok, int64_t k) {
+    using namespace strata::kernels::cpu;
+    strata::core::ExpertDispatch d;
+    d.src = &src;
+    std::vector<float> x((size_t) n_tok * H);
+    std::vector<int32_t> ids((size_t) n_tok * k, 0);
+    std::vector<float> out((size_t) n_tok * k * H);
+    strata::core::expert_pool_dispatch_multi(d, x.data(), ids.data(), n_tok, k, out.data());
+    return d;
+}
+
+void test_window_envelope() {
+    using namespace strata::core;
+    TempDirectory dir;
+    std::string err;
+    require(strata::kernels::cpu::expert_layout_load(dir.path.string(), 2, 3, err),
+            "could not load canonical layout: " + err);
+    StubSource source;
+
+    // 24 x 10 = 240: exactly the guard's bound - accepted, and the call reaches the source.
+    const ExpertDispatch legal = probe_window(source, 24, 10);
+    require(legal.failed && std::string(legal.fail ? legal.fail : "").find("could not produce a blob") != std::string::npos,
+            "24 tokens x 10 experts (240 entries) was refused by the window envelope");
+    // 25 x 10 = 250: one token past MAXT - refused by the token guard.
+    const ExpertDispatch too_many_tokens = probe_window(source, 25, 10);
+    require(too_many_tokens.failed &&
+                std::string(too_many_tokens.fail ? too_many_tokens.fail : "").find("more tokens than") != std::string::npos,
+            "25 tokens were not refused by the token envelope");
+    // 24 x 11 = 264: one entry past kMaxWindowEntries - refused by the tables guard.
+    const ExpertDispatch too_many_entries = probe_window(source, 24, 11);
+    require(too_many_entries.failed &&
+                std::string(too_many_entries.fail ? too_many_entries.fail : "").find("window tables") != std::string::npos,
+            "264 window entries were not refused by the entry envelope");
+}
+
 void test_complement_plan() {
     using namespace strata::core::detail;
     std::vector<uint64_t> offsets;
@@ -300,6 +345,7 @@ int main() {
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif
+        test_window_envelope();
         std::cout << "file_expert_source_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {
