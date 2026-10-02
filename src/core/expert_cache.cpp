@@ -9,13 +9,6 @@
 
 namespace strata::core {
 
-// MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of 256 (the
-// down product's 640-value rows); a slot read in place through the zero-copy path (STRATA_MMQ_BLOB) must have
-// finite bytes behind its blob.  Every byte outside a filled slot is the zero from `open`'s memset, but the LAST
-// slot's own tail would otherwise leave the allocation: this pad (== strata::prefill::mmq::kReadOverTail) keeps
-// the over-read inside the zeroed arena.
-constexpr uint64_t kMmqReadPad = 4096;
-
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -104,7 +97,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         return false;
     }
 
-    const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes + kMmqReadPad;
+    const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
 
     // ---- **THE ALLOCATION IS CHECKED AGAINST THE CARD, NOT AGAINST THE REQUEST.**
     //
