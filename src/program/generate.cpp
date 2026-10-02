@@ -467,7 +467,7 @@ void usage() {
                  "  --batch-padding N    stabilize verification shapes with discarded padding, 0|1 (default 0)\n"
                  "  --batch-parallel N   overlap independent request projections, 0|1 (default 0)\n"
                  "  --batch-policy P     fair (shorter windows) or depth (rotate longer windows)\n"
-                 "  --concurrent-prefill N  bounded prompt chunk, 256..1024 (default 256)\n"
+                 "  --concurrent-prefill N  bounded prompt chunk, 256..4096 (default 256)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
@@ -1222,8 +1222,8 @@ int main(int argc, char** argv) {
         o.batch_graphs < 1 || o.batch_graphs > 64 ||
         o.batch_padding < 0 || o.batch_padding > 1 ||
         o.batch_parallel < 0 || o.batch_parallel > 1 ||
-        (o.batch_policy != "fair" && o.batch_policy != "depth") || o.concurrent_prefill < 256 || o.concurrent_prefill > 1024) {
-        std::fprintf(stderr, "strata: --concurrency 1..8, --batch-rows 1..24, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..1024\n");
+        (o.batch_policy != "fair" && o.batch_policy != "depth") || o.concurrent_prefill < 256 || o.concurrent_prefill > 4096) {
+        std::fprintf(stderr, "strata: --concurrency 1..8, --batch-rows 1..24, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..4096\n");
         return 2;
     }
     if (o.concurrency > 1) {
