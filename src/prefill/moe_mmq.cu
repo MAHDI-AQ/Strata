@@ -85,6 +85,18 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
+// P4 zero-copy (STRATA_MMQ_BLOB): a table-carrying launch goes through the vendor's ADDITIVE
+// `mul_mat_q_case_ptrs` variant (per-channel absolute bases); everything else runs the stock symbols,
+// which the vendor patch leaves byte-untouched (decode-neutral by object-level construction).
+template <ggml_type t>
+void case_or_ptrs(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s, const char* const* xtab) {
+    if (xtab != nullptr) {
+        mul_mat_q_case_ptrs<t>(ctx, a, s, xtab);
+    } else {
+        mul_mat_q_case<t>(ctx, a, s);
+    }
+}
+
 }  // namespace
 
 bool built() { return true; }
@@ -130,19 +142,20 @@ void Context::run(const Product& p, void* stream) {
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows, (const char * const *) p.w_tab};
+                        p.max_rows, p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
+    const char* const* xtab = (const char* const*) p.w_tab;
     switch (t) {
-        case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, a, s); break;
-        case GGML_TYPE_IQ3_XXS: mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, a, s); break;
-        case GGML_TYPE_IQ3_S: mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, a, s); break;
-        case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
-        case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
-        case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+        case GGML_TYPE_Q2_0: case_or_ptrs<GGML_TYPE_Q2_0>(ctx, a, s, xtab); break;
+        case GGML_TYPE_IQ2_XXS: case_or_ptrs<GGML_TYPE_IQ2_XXS>(ctx, a, s, xtab); break;
+        case GGML_TYPE_IQ2_XS: case_or_ptrs<GGML_TYPE_IQ2_XS>(ctx, a, s, xtab); break;
+        case GGML_TYPE_IQ2_S: case_or_ptrs<GGML_TYPE_IQ2_S>(ctx, a, s, xtab); break;
+        case GGML_TYPE_IQ3_XXS: case_or_ptrs<GGML_TYPE_IQ3_XXS>(ctx, a, s, xtab); break;
+        case GGML_TYPE_IQ3_S: case_or_ptrs<GGML_TYPE_IQ3_S>(ctx, a, s, xtab); break;
+        case GGML_TYPE_IQ4_NL: case_or_ptrs<GGML_TYPE_IQ4_NL>(ctx, a, s, xtab); break;
+        case GGML_TYPE_IQ4_XS: case_or_ptrs<GGML_TYPE_IQ4_XS>(ctx, a, s, xtab); break;
+        case GGML_TYPE_Q8_0: case_or_ptrs<GGML_TYPE_Q8_0>(ctx, a, s, xtab); break;
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
             std::exit(1);

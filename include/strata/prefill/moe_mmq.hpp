@@ -46,7 +46,8 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
-    /// Zero-copy weights (the MoE blobs read in place through the vendor mmq.cuh's `x_ptrs`): a device array of
+    /// Zero-copy weights (the MoE blobs read in place through the additive vendor `mul_mat_q_case_ptrs`
+    /// variant): a device array of
     /// `n` absolute per-expert bases for this product's matrix - the [gate|up] span at the expert blob's base, or
     /// the down span at blob + the format's down_off.  The bytes are exactly what `gather_native` would have
     /// copied, so the product is bit-identical; when set, `w`, `expert_bytes` and the uniform channel stride are

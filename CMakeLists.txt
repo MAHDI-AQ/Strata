@@ -729,12 +729,14 @@ if(STRATA_NATIVE_EXPERTS)
       GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
       GIT_TAG 3cf03257f219afbe7334045ff7c6a06ac68c627d
       GIT_SHALLOW FALSE
-      # Strata fork: the zero-copy MoE read path (STRATA_MMQ_BLOB) needs per-channel absolute bases in MMQ
-      # (mmq.cuh: mmq_args.x_ptrs).  The clone is patched here, idempotently: a reverse-check first, so a
-      # re-populate of an already-patched tree is a no-op, and a FAILED apply aborts the configure rather than
-      # leaving an engine silently unpatched.  An already-populated build dir: run the same command by hand in
-      # <build>/_deps/strata_llamacpp-src before building (see patches/README).
-      PATCH_COMMAND sh -c "git apply -R --check '${CMAKE_CURRENT_SOURCE_DIR}/patches/strata-llamacpp-mmq-x-ptrs.patch' 2>/dev/null || git apply '${CMAKE_CURRENT_SOURCE_DIR}/patches/strata-llamacpp-mmq-x-ptrs.patch'")
+      # Strata fork: the zero-copy MoE read path (STRATA_MMQ_BLOB) needs per-channel absolute bases in MMQ.
+      # The patch is ADDITIVE: it appends a `mul_mat_q_case_ptrs` variant and leaves every stock kernel/launcher
+      # body byte-untouched, so a build that never takes the blob path executes the stock symbols unchanged.
+      # The clone is patched here, idempotently: a reverse-check first, so a re-populate of an already-patched
+      # tree is a no-op, and a FAILED apply aborts the configure rather than leaving an engine silently
+      # unpatched.  An already-populated build dir: run the same command by hand in <build>/_deps/strata_llamacpp-src
+      # before building (see patches/README; restore a tree that still carries the SUPERSEDED non-additive patch first).
+      PATCH_COMMAND sh -c "git apply -R --check '${CMAKE_CURRENT_SOURCE_DIR}/patches/strata-llamacpp-mmq-x-ptrs-additive.patch' 2>/dev/null || git apply '${CMAKE_CURRENT_SOURCE_DIR}/patches/strata-llamacpp-mmq-x-ptrs-additive.patch'")
     FetchContent_GetProperties(strata_llamacpp)
     if(NOT strata_llamacpp_POPULATED)
       FetchContent_Populate(strata_llamacpp)

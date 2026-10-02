@@ -456,7 +456,8 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // (single-sourced: mmq::kReadOverTail; the zero-copy path reads blobs in place and must honor the same contract).
 constexpr size_t MMQ_TAIL = mmq::kReadOverTail;
 // P4 zero-copy MMQ (STRATA_MMQ_BLOB, default off): a resident expert's weights are read in place from its VRAM
-// cache slot through the per-group pointer table (moe_mmq.cu `w_tab` -> the vendor mmq.cuh's `x_ptrs`) instead of
+// cache slot through the per-group pointer table (moe_mmq.cu `w_tab` -> the additive vendor
+// `mul_mat_q_case_ptrs` variant) instead of
 // being gathered into grp_gu/grp_d; a streamed expert still gathers (its staging slot's bytes are consumed by that
 // copy, keeping today's lifetime).  Same bytes, same arithmetic: bit-exact by construction; off = the gathered
 // path, byte-for-byte.  The same-binary A/B arm is STRATA_MMQ_BLOB=0/1.
