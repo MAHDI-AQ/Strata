@@ -1,0 +1,177 @@
+{
+ "schema": "strata-acceptance-envelope/1",
+ "program": "M&F AI Lab Strata serving lane - N-scaling acceptance (M0 instruments)",
+ "authority": [
+  "master plan 2026-10-02-strata-agentic-engine-acceleration-master-plan.md section 11.5 (finish line + channel conventions)",
+  "scratch/lane-sglang-target/report.md sections 3 (envelope) and 4 (harness extensions)"
+ ],
+ "reading": {
+  "convention": "WALL",
+  "per_agent_prefill": "engine prompt tokens of that agent's request / (client first streamed token time - fire time), full fleet loaded",
+  "aggregate": "same-run sum over agents; burst leg: sum(prompt tokens) / fleet wall until last prompt completes; pump cross-check: sum(prompt tokens) / sum(engine prompt_ms) (equal for the serial pump)",
+  "per_agent_decode": "committed tokens over the steady decode window (done-line channel), full fleet active",
+  "ttft": "submit -> first streamed token (client)",
+  "retained_ttft": "the same on a re-sent conversation turn whose prefix the engine already holds",
+  "shapes": "declared in ENGINE tokens, asserted within +-2 percent every run",
+  "busy_reading": "engine-busy arithmetic is a diagnostic only, never a gate (a reruling divides every cell by N identically)",
+  "decode_channels_binding": "every decode claim NAMES its channel: deep-streak | sustained-steady | all-retained (master plan 11.5)"
+ },
+ "channels": {
+  "deep-streak": "1024-token concurrent single-shot burst; statistic = per-request engine done-line decode tok/s; judged as min-agent + cross-agent median (recorded class: 65.4/65.6 flipped, 43.3 bounded, R1 61.3/61.6 vs 42.9/42.4)",
+  "sustained-steady": "multi-turn workload instrument; per-agent p50 of done-line decode over the post-ramp steady window (turns >= steady_min_turn, default 4) -> cross-agent median; variants reported: post-ramp (turns >= 3), turns 4-6, all-retained (recorded: 53.5/51.2 t4-6; 48.8/48.4 post-ramp)",
+  "all-retained": "multi-turn workload instrument; per-agent p50 of done-line decode over retained turns (turn >= 2, ok; gen_tokens >= 128 filter with <20-qualifying-rows fallback) -> cross-agent median (recorded: 36.0/38.9; the decision-grade sustained channel)"
+ },
+ "calibration": {
+  "est_to_engine_factor": 0.729,
+  "tolerance_pct": 2,
+  "anchors": [
+   "est 120000 -> engine 87473..87852 (coder IQ1_M pack; measured on 2026-10-02 receipts)",
+   "a receipt sized at engine_target/0.729 must land within +-2 percent or the run recalibrates the factor"
+  ],
+  "legacy_landmines": [
+   "run_baseline_5x128.sh Phase A '5x128K' = est-space 122880 -> ~89.6K engine tokens; Phase B '8x96000' -> ~70K engine tokens - never score legacy receipts as 128K/96K",
+   "sustained kit defaults (ctx-cap 122880 / steady 102400 est) are the legacy values; calibrated sizes come from THIS file"
+  ]
+ },
+ "decode_windows": {
+  "steady_min_turn_default": 4,
+  "post_ramp_min_turn": 3,
+  "gen_min_tokens": 128,
+  "gen_min_fallback_rows": 20
+ },
+ "fairness": {
+  "share_band_pct": 15,
+  "zero_floor_pct": 70,
+  "burst_spread_max_n_le_8": 1.3,
+  "burst_spread_max_n16": 1.5,
+  "itl_p99_over_p50_max": 2.5
+ },
+ "retention": {
+  "coverage_pct_min": 90,
+  "reused_ratio_min": 0.95,
+  "retained_ttft_p50_s_max": 1.0,
+  "retained_ttft_p95_s_max": 2.0
+ },
+ "integrity": {
+  "require_g1": true,
+  "fault_patterns": [
+   "copy_i32",
+   "gather_native",
+   "illegal",
+   "stalled",
+   "watchdog"
+  ],
+  "memory_bounds": {
+   "rss_span_mib_max": 512,
+   "gpu_span_mib_max": 256
+  }
+ },
+ "falsifiers": {
+  "agg_flat_n8_prefill_max_tps": 5400,
+  "note": "pre-registered master plan 11.5: aggregate flat <= ~5400 at N=8 = 'still the fork, not the architecture'"
+ },
+ "cells": {
+  "5x87.5K": {
+   "n": 5,
+   "ctx_engine": 87500,
+   "est_ctx_cap": 120000,
+   "rung": "R1",
+   "prefill": {
+    "per_agent_wall_min_tps": 1500,
+    "agg_min_tps": 7500
+   },
+   "decode": {
+    "per_agent_min_tps": 50,
+    "agg_min_tps": 250
+   },
+   "ttft_fresh_bound_s": 58.3,
+   "capacity": "OK",
+   "committed": true
+  },
+  "5x128K": {
+   "n": 5,
+   "ctx_engine": 128000,
+   "est_ctx_cap": 175600,
+   "rung": "R1",
+   "prefill": {
+    "per_agent_wall_min_tps": 1500,
+    "agg_min_tps": 7500
+   },
+   "decode": {
+    "per_agent_min_tps": 50,
+    "agg_min_tps": 250
+   },
+   "ttft_fresh_bound_s": 85.3,
+   "capacity": "OK; 91.1% resident at the pre-6144 era, byte-fill/balance to 100%",
+   "committed": true
+  },
+  "8x87.5K": {
+   "n": 8,
+   "ctx_engine": 87500,
+   "est_ctx_cap": 120000,
+   "rung": "R3",
+   "prefill": {
+    "per_agent_wall_min_tps": 1500,
+    "agg_min_tps": 12000
+   },
+   "decode": {
+    "per_agent_min_tps": 50,
+    "agg_min_tps": 400
+   },
+   "ttft_fresh_bound_s": 58.3,
+   "capacity": "fits [E]; residency ~85-90% [E]",
+   "committed": true
+  },
+  "8x128K": {
+   "n": 8,
+   "ctx_engine": 128000,
+   "est_ctx_cap": 175600,
+   "rung": "R3",
+   "prefill": {
+    "per_agent_wall_min_tps": 1500,
+    "agg_min_tps": 12000
+   },
+   "decode": {
+    "per_agent_min_tps": 50,
+    "agg_min_tps": 400
+   },
+   "ttft_fresh_bound_s": 85.3,
+   "capacity": "borderline (+0.5 GiB [E]); measure as risk arm",
+   "committed": true
+  },
+  "16x87.5K": {
+   "n": 16,
+   "ctx_engine": 87500,
+   "est_ctx_cap": 120000,
+   "rung": "R3",
+   "prefill": {
+    "per_agent_wall_min_tps": 750,
+    "agg_min_tps": 12000
+   },
+   "decode": {
+    "per_agent_min_tps": 25,
+    "agg_min_tps": 400
+   },
+   "ttft_fresh_bound_s": 116.7,
+   "capacity": "tight: ~2.7 GiB over raw [E]; cap-16 lattice + reclaim first",
+   "committed": true
+  },
+  "16x128K": {
+   "n": 16,
+   "ctx_engine": 128000,
+   "est_ctx_cap": 175600,
+   "rung": "R3",
+   "prefill": {
+    "per_agent_wall_min_tps": 750,
+    "agg_min_tps": 12000
+   },
+   "decode": {
+    "per_agent_min_tps": 25,
+    "agg_min_tps": 400
+   },
+   "ttft_fresh_bound_s": 170.7,
+   "capacity": "EXCLUDED today (-8.3 GiB [E]); unpark = host KV/session tier (S2) or ctx <= ~100K",
+   "committed": false
+  }
+ }
+}
