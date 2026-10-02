@@ -333,6 +333,13 @@ struct Prefill::Impl {
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
+    // lane pipeline-prefill (STRATA_PREFILL_CHAIN, default off): the deferred stage-1 future, its error and
+    // the hand parity persist across run() calls, so the next chunk's stage-0 pass runs while this chunk's
+    // stage-1 still does.  Invalid/empty when the feature is off.
+    std::future<bool> chain_run;
+    std::string chain_err;
+    int chain_hand = 0;
+    bool chain_defer = false;
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -947,10 +954,24 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
     // the next stage reads chunk c on a thread while this one reads chunk c + 1 (declared first: an early return
-    // waits for it before anything it reads goes away)
-    std::string next_err;
-    std::future<bool> next_run;
-    int hand_buf = 0;
+    // waits for it before anything it reads goes away).  Lane pipeline-prefill (STRATA_PREFILL_CHAIN, default
+    // off): the concurrent pump calls run() once per 256-token chunk (n == m.T), so the in-call pipeline
+    // degenerated to spawn-then-wait (the drain at the end of this function ran every call).  The chain arm
+    // keeps the future, its error and the hand parity in the Impl: the NEXT chunk's stage-0 pass runs while
+    // this chunk's stage-1 still does, the next spawn waits it (the same wait the multi-chunk loop always
+    // had), and chain_wait() drains the last chunk before the pump publishes read == position.  OFF: the
+    // locals, byte-for-byte the old path.
+    std::string next_err_local;
+    std::future<bool> next_run_local;
+    int hand_buf_local = 0;
+    static const bool chain_env = [] {
+        const char* v = std::getenv("STRATA_PREFILL_CHAIN");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    const bool chain = chain_env && m.chain_defer && next_ != nullptr;
+    std::string& next_err = chain ? m.chain_err : next_err_local;
+    std::future<bool>& next_run = chain ? m.chain_run : next_run_local;
+    int& hand_buf = chain ? m.chain_hand : hand_buf_local;
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
@@ -1928,7 +1949,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             host_chunk_ms += ms_since(toc2);
         }
     }
-    if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
+    // lane pipeline-prefill: the chain arm leaves the LAST chunk's stage-1 in flight (the concurrent pump
+    // drains it via chain_wait before it publishes the slot's prompt as read); the default arm drains here.
+    if (!chain && next_run.valid() && !next_run.get()) { err = next_err; return false; }
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
@@ -1992,5 +2015,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     }
     return true;
 }
+
+bool Prefill::chain_wait(std::string& err) {
+    Impl& m = *impl_;
+    if (!m.chain_run.valid()) return true;
+    if (!m.chain_run.get()) { err = m.chain_err; return false; }
+    return true;
+}
+
+void Prefill::set_chain_defer(bool on) { impl_->chain_defer = on; }
 
 }  // namespace strata::prefill
