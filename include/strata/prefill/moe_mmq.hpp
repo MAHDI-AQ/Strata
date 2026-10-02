@@ -14,6 +14,12 @@ namespace strata::prefill::mmq {
 bool built();
 /// MMQ covers this ggml type (the i-quants and Q2_0 the packs use; IQ1_M is not covered).
 bool supported(int ggml_type);
+/// MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of 256 (the
+/// down product's 640-value rows).  Those weights meet zero activations and are harmless only if they decode to
+/// finite numbers - llama.cpp zero-pads after every tensor.  Anything handing MMQ a matrix read in place must
+/// keep this many finite bytes behind it: the group buffers' tail memset (and the per-group next-slot zeroing),
+/// the expert cache's arena pad (expert_cache.cpp).
+constexpr size_t kReadOverTail = 4096;
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
@@ -40,6 +46,12 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    /// Zero-copy weights (the MoE blobs read in place through the vendor mmq.cuh's `x_ptrs`): a device array of
+    /// `n` absolute per-expert bases for this product's matrix - the [gate|up] span at the expert blob's base, or
+    /// the down span at blob + the format's down_off.  The bytes are exactly what `gather_native` would have
+    /// copied, so the product is bit-identical; when set, `w`, `expert_bytes` and the uniform channel stride are
+    /// not read.  Null = the gathered group-buffer layout (`w` + the `expert_bytes` stride).
+    const void* const* w_tab = nullptr;
 };
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
