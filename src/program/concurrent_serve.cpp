@@ -602,6 +602,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         const char* v = std::getenv("STRATA_CONCURRENT_RETAIN");
         return v != nullptr && std::atoi(v) != 0;
     }();
+    // LANE spec-fuse: STRATA_DRAFT_WAVEFRONT - retire_unit defers every slot's draft past its prints and
+    // position updates, then launches all slots' chains before waiting any (per-slot drafter state is
+    // disjoint; each chain runs on its own drafter stream).  Default off: unset, retire_unit's per-slot
+    // commit->draft order is byte-preserved.
+    const bool wavefront = [] {
+        const char* v = std::getenv("STRATA_DRAFT_WAVEFRONT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
     // P1-cache-revive: the concurrent path parks nothing yet (host-RAM snapshots); live retention is
     // separate from parking and the P1 refusal above stays in force for conversation_cache_mib > 0.
     // The DONE trailer field now carries the live-retention reuse count (was hardcoded 0).
@@ -953,6 +961,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // The serial round loop's tail, once per retired unit: acceptance, commit, the printed tokens
     // and the next window's drafts.  Both paths run exactly this.
     auto retire_unit = [&](Unit& u) -> bool {
+        // S1c-fix: the fused draft cap's budget term - the round's fair per-slot row allocation
+        // (schedule_rows' round-robin floor over the served slots).  An INPUT of the window allocator,
+        // never an output of any window the chain sized, so it cannot feed back into L and lock (the
+        // first build's T-1 term did exactly that).  The step path ignores it; same value for all slots.
+        const int alloc_share = (int) std::max<int64_t>(1, (int64_t) c.rows / (int64_t) std::max<size_t>(1, u.ready.size()));
         // LANE hostloop (commit batch): phase 1 decides acceptance and LAUNCHES every slot's commit
         // chain; phase 2 waits each chain and finishes that slot's epilogue (prints, drafts).  The
         // per-slot order (commit -> its own draft) and the print order are unchanged; the commit
@@ -984,6 +997,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             commit_ms += elapsed(commit_start);
         }
+        struct DraftJob { Impl::Slot* s; int keep; int64_t p; };
+        std::vector<DraftJob> jobs;   // wavefront: the deferred drafts (launched after every slot's prints)
         for (auto& p : trail) {
             auto& s = *p.s;
             const int keep = p.keep;
@@ -1010,6 +1025,18 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             // Catch-up consumes the verified window; limit the extra speculative chain near the context boundary.
             s.draft->set_max_drafts((int) std::min<int64_t>(c.mtp_window_rows - 1, c.context - (s.position.load() + keep)));
+            s.draft->set_alloc_share(alloc_share);   // S1c-fix: the fused cap's budget term for this round
+            if (wavefront) {
+                // STRATA_DRAFT_WAVEFRONT: this slot's chain is launched below, after EVERY slot's commit,
+                // prints and position update; its cell base is THIS window's start, and the per-slot
+                // drafter state is disjoint, so the chains overlap on their own streams.
+                jobs.push_back({&s, keep, s.position.load()});
+                s.policy.observe(s.lookup, s.count, keep - 1, s.match, elapsed(u.t_start));
+                s.current = s.output[keep - 1];
+                s.position.store(s.position.load() + keep);
+                s.read.store(s.position.load());
+                continue;
+            }
             const auto draft_start = Clock::now();
             if (!s.draft->draft(s.count, s.output, s.position.load(), keep - 1, s.drafts, err, s.probability, s.request.spec_min_p)) return false;
             draft_ms += elapsed(draft_start);
@@ -1017,6 +1044,16 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             s.current = s.output[keep - 1];
             s.position.store(s.position.load() + keep);
             s.read.store(s.position.load());   // prompt done; read tracks position until the next turn
+        }
+        if (!jobs.empty()) {
+            // all launches -> all waits (STRATA_DRAFT_WAVEFRONT): every slot's chain runs on its own
+            // drafter stream, so the launches overlap instead of serializing per slot.
+            const auto wave_start = Clock::now();
+            for (auto& j : jobs)
+                if (!j.s->draft->draft_begin(j.s->count, j.s->output, j.p, j.keep - 1, err)) return false;
+            for (auto& j : jobs)
+                if (!j.s->draft->draft_end(j.s->drafts, err, j.s->probability, j.s->request.spec_min_p, nullptr)) return false;
+            draft_ms += elapsed(wave_start);
         }
         if (overlap)
             // The drafts are asynchronous on the drafter's stream.  The serial round had a whole

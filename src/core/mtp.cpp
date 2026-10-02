@@ -30,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -58,6 +59,20 @@ bool mapped(size_t bytes, void** h, void** d) {
     if (cudaHostAlloc(h, bytes, cudaHostAllocMapped) != cudaSuccess) return false;
     std::memset(*h, 0, bytes);
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
+}
+
+// LANE spec-fuse: the spec-path env switches, resolved once per process (never per round).  With both
+// unset every call sequence below is the pre-change one (see draft() = draft_begin + draft_end).
+//   STRATA_MTP_FUSE_CHAIN : one fused graph per (T, L) - the whole chain, one sync, one readback.
+//   STRATA_DRAFT_WAVEFRONT: the serve loop launches every slot's chain before waiting any; read here only
+//                            so the draft_ms accounting follows that mode (the loop owns the wall).
+bool fuse_chain_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MTP_FUSE_CHAIN"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+bool wavefront_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DRAFT_WAVEFRONT"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
 }
 
 strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
@@ -108,6 +123,8 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : round_exec_c_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_c_) if (e) cudaGraphExecDestroy(e);
+    for (auto& row : fused_exec_) for (auto& e : row) if (e) cudaGraphExecDestroy(e);
+    for (auto& row : fused_exec_c_) for (auto& e : row) if (e) cudaGraphExecDestroy(e);
     if (cparams_) cudaFree(cparams_);
     if (cring_) cudaFree(cring_);
     if (dinv_) cudaFree(dinv_);
@@ -691,6 +708,61 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
 
+// LANE spec-fuse (STRATA_MTP_FUSE_CHAIN): the whole draft chain as ONE graph per (T, L) - the same ops in
+// the same order as capture_round + capture_step(1..L-1), recorded back to back on the one stream, with
+// every step's cell/position staged before the single launch.  One sync + one mapped readback per
+// slot/round replace the per-step host re-entry (k-1 syncs + readbacks + relaunches).  The inter-step
+// chain lives in Rin_[0]/tok_[0] through mtp_select exactly as the step path leaves it, so the graph is
+// capture-clean by construction (all ops already capture today); captured on demand, like step_exec_.
+bool MtpDrafter::capture_fused(int T, int L, bool coupled, std::string& err) {
+    cudaGraphExec_t& exec = coupled ? fused_exec_c_[T][L] : fused_exec_[T][L];
+    if (exec) return true;
+    using namespace strata::kernels;
+    const int64_t HCN = g_->hc * g_->n_embd;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    bool ok = true;
+    const int ra = 2 * max_t_ - 1;
+    // coupled: the request's chain and the penalty history's base, for this round's drafts
+    if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
+    copy_i32_from_mapped(tok_, m_tok_, T, cs_);
+    copy_i32_from_mapped(step_, m_step_, (int64_t) 2 * T * 4, cs_);
+    copy_i32_from_mapped(pos_, m_pos_, (int64_t) 2 * T * g_->n_head, cs_);
+    copy_i32_from_mapped(row_, m_row_, 2, cs_);
+    copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
+    // the catch-up: K/V for the window's T cells, then the full layer for row a only (its cell's K/V is
+    // written again, identically), staged by the host in step row 2*max_t - 1; then chain steps 1..L-1
+    ok = record_forward(T, -1, cs_, err);
+    if (ok) mtp_select(Rin_, HCN, tok_, row_, Rin_, tok_, nullptr, 0, cs_);
+    if (ok) {
+        copy_i32_from_mapped(step_ + ra * 4, m_step_ + ra * 4, 4, cs_);
+        copy_i32_from_mapped(pos_ + ra * g_->n_head, m_pos_ + ra * g_->n_head, g_->n_head, cs_);
+        coupled_rec_ = coupled;
+        coupled_j_ = 0;
+        ok = record_forward(1, ra, cs_, err);
+        coupled_rec_ = false;
+    }
+    if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    for (int j = 1; ok && j < L; ++j) {
+        const int row = max_t_ + j - 1;
+        copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
+        copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
+        coupled_rec_ = coupled;
+        coupled_j_ = j;
+        ok = record_forward(1, row, cs_, err);
+        coupled_rec_ = false;
+        if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    }
+    return finish_capture(cs_, ok, exec, coupled ? "fused chain (coupled)" : "fused chain", err);
+}
+
+void MtpDrafter::put_row(int row, int64_t cell) {
+    h_step_[row * 4 + 0] = (int32_t) cell;
+    h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+    h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+    h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+    for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[row * g_->n_head + h] = (int32_t) cell;
+}
+
 void MtpDrafter::kv_restore(int64_t upto) {
     const OnDevice on_device(device_);
     if (st_.kv_mode != 2 || upto <= 0) return;
@@ -792,31 +864,74 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
+    if (!draft_begin(T, tokens, p, a, err)) return false;
+    return draft_end(drafts, err, probs, min_p, n_drafts);
+}
+
+// Stage the inputs and LAUNCH: the whole fused chain for L drafts (STRATA_MTP_FUSE_CHAIN), or the round
+// graph the step chain continues in draft_end.  The one round of host work before the launch is staging.
+bool MtpDrafter::draft_begin(int T, const int32_t* tokens, int64_t p, int a, std::string& err) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
-    if (!capture_round(T, cp, err)) return false;
+    const bool fused = fuse_chain_env();
+    int L = 1;
+    if (fused) {
+        // S1c-FIXED (the first build's L was a downward ratchet; boot receipts scratch/lane-spec-boots/
+        // report section 4): the cap reads the round's fair per-slot row allocation (alloc_share_, set by
+        // the serve loop from the row budget and the served-slot count) - a quantity this chain can never
+        // influence.  The old `T - 1` term read the row count of the window just verified, which the cap
+        // itself sized (that window's count <= L + 1), so L could only fall and L = 1 was absorbing.
+        // L = 1 now happens only when the envelope or the allocation genuinely offers nothing past
+        // draft 0 (max_t_ <= 2, max_drafts_ <= 1 / context exhausted, or a 1-row share).  Draft 0 rides
+        // the captured round (its catch-up K/V the next window needs regardless).  L keys the graph.
+        L = std::max(1, std::min(std::min(max_t_ - 1, max_drafts_), alloc_share_));
+        if (!capture_fused(T, L, cp, err)) return false;
+    } else if (!capture_round(T, cp, err)) return false;
     const Clock::time_point t0 = Clock::now();
-    const int64_t NH = g_->n_head;
-    auto put = [&](int row, int64_t cell) {
-        h_step_[row * 4 + 0] = (int32_t) cell;
-        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
-        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
-        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
-    };
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
-        put(t, p + t);
+        put_row(t, p + t);
     }
-    put(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // p + a: draft 0's cell
+    put_row(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // p + a: draft 0's cell
+    for (int j = 1; fused && j < L; ++j) put_row(max_t_ + j - 1, coupled_draft_cell(p, a, j));   // p + a + j
     h_row_[0] = a;
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess ||
-        cudaStreamSynchronize(cs_) != cudaSuccess) {
+    const cudaGraphExec_t exec = fused ? (cp ? fused_exec_c_[T][L] : fused_exec_[T][L])
+                                       : (cp ? round_exec_c_[T] : round_exec_[T]);
+    if (cudaGraphLaunch(exec, cs_) != cudaSuccess) {
         err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
         return false;
+    }
+    pending_ = true; pending_fused_ = fused; pending_L_ = L; pending_p_ = p; pending_a_ = a; pending_t0_ = t0;
+    return true;
+}
+
+// Sync and read the chain back: the fused path reads all L drafts its graph produced in one go; the step
+// path stops the chain when the last draft's probability < min_p (the window builder reads the
+// probabilities either way - that is where the min-p continuation test now lives for the fused chain).
+bool MtpDrafter::draft_end(int32_t* drafts, std::string& err, float* probs, float min_p, int* n_drafts) {
+    const OnDevice on_device(device_);
+    if (!pending_) { err = "mtp: draft_end without a launched chain"; return false; }
+    const bool cp = coupled_active_;
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        pending_ = false;
+        err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    if (pending_fused_) {
+        const int L = pending_L_;
+        for (int j = 0; j < L; ++j) {
+            drafts[j] = ((volatile int32_t*) h_out_)[j];
+            if (probs) probs[j] = ((volatile float*) h_prob_)[j];
+        }
+        for (int j = L; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
+        if (n_drafts) *n_drafts = L;
+        pending_ = pending_fused_ = false;
+        if (!wavefront_env()) ms_draft += ms_since(pending_t0_);   // the wavefront block owns draft_ms there
+        ++rounds;
+        return true;
     }
     drafts[0] = ((volatile int32_t*) h_out_)[0];
     float pj = ((volatile float*) h_prob_)[0];
@@ -824,11 +939,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     int n = 1;
     // the chain continues while the last draft is likely enough to be verified
     for (int j = 1; j < std::min(max_t_ - 1, max_drafts_) && pj >= min_p; ++j) {
-        if (!capture_step(j, cp, err)) return false;
-        put(max_t_ + j - 1, coupled_draft_cell(p, a, j));   // p + a + j; coupled: drawn at counter cell + 1
+        if (!capture_step(j, cp, err)) { pending_ = false; return false; }
+        put_row(max_t_ + j - 1, coupled_draft_cell(pending_p_, pending_a_, j));   // p + a + j; coupled: drawn at counter cell + 1
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess ||
             cudaStreamSynchronize(cs_) != cudaSuccess) {
+            pending_ = false;
             err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
@@ -839,7 +955,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
-    ms_draft += ms_since(t0);
+    pending_ = false;
+    if (!wavefront_env()) ms_draft += ms_since(pending_t0_);   // the wavefront block owns draft_ms there
     ++rounds;
     return true;
 }
