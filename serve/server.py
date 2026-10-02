@@ -59,6 +59,7 @@ CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > co
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
 RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
+MULTIPLEX_DONE_DRAIN_S = 2.0  # bounded drain-to-DONE for an early-stopped multiplex stream (stop token / cancel / disconnect)
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -369,6 +370,28 @@ class StrataEngine:
                     done = True
                     raise ValueError(line[4:].strip())
         finally:
+            if sent and not done:                     # stopped early (stop token, cancel, disconnect)
+                # Drain to THIS request's DONE while the channel is still registered, mirroring the serial
+                # path's drain: the engine prints DONE right after the final T, so in the stop-token case it
+                # is already queued or arrives within ms; a genuine mid-generation disconnect misses and
+                # falls through to CSTOP exactly as before.
+                deadline = time.monotonic() + MULTIPLEX_DONE_DRAIN_S
+                while time.monotonic() < deadline:
+                    try:
+                        payload = channel.get(timeout=0.25)
+                    except queue.Empty:
+                        continue
+                    if payload is None:               # engine gone
+                        break
+                    if payload.startswith("DONE "):
+                        try:
+                            self._parse_done(payload)
+                            self.last["queue_wait_ms"] = self._shared_queue_wait.get(number)
+                            done = True
+                        except ValueError:
+                            pass
+                        break
+                    # T / PP / ERR lines after the stop: the request is over; skip them.
             with self._channels_lock:
                 self._channels.pop(number, None)
             self._shared_progress.pop(number, None)          # lock-free (see progress)
