@@ -32,6 +32,12 @@ struct PrefillStats {
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     double ms_ple = 0;
+    /// Lane prefill R2 (STRATA_PLE_PREFETCH, default off): cross-call PLE gathers spawned / consumed by the
+    /// next call / gathered inline / drained stale.  All zero when the feature is off.
+    int64_t ple_pf_spawned = 0;
+    int64_t ple_pf_consumed = 0;
+    int64_t ple_pf_inline = 0;
+    int64_t ple_pf_wasted = 0;
 };
 
 }  // namespace strata::prefill
@@ -112,12 +118,25 @@ public:
     /// Wait the deferred stage-1 run (a no-op when none is in flight).  false with `err` on stage-1 failure.
     bool chain_wait(std::string& err);
 
+    /// Lane prefill R2 (STRATA_PLE_PREFETCH, default off): prefetch the PLE rows of a successor chunk on a
+    /// thread, into the Impl's other host buffer (the concurrent pump calls it after a mid-prompt chunk).
+    /// The next `run` consumes it when the count, the tokens and the two before them still match; any other
+    /// key is drained and dropped, and that call gathers inline.  The tokens are copied, so the caller's
+    /// array need not outlive the call.  false: feature off, one already outstanding, or not this stage.
+    bool ple_prefetch_next(const int64_t* next_tokens, int64_t n_next);
+    /// Drain an in-flight prefetch (a no-op when none): the pump fences and ~Prefill call it for quiescence.
+    void ple_prefetch_drain();
+
 private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     struct Impl;
+    /// R2: the PLE gather both paths run (the inline path and the cross-call prefetch share it: the identical
+    /// rows and bytes by construction).  Defined in prefill.cpp.
+    static bool ple_gather_impl(Impl& m, const int64_t* tok, int64_t T, const int32_t pv0[2], int buf,
+                                std::string& err);
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
 };

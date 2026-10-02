@@ -659,6 +659,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         std::printf("R %llu PP %lld %zu\n", (unsigned long long) s.request.id, (long long) (read0 + n),
                     s.request.tokens.size());
         std::fflush(stdout);
+        // R2 (STRATA_PLE_PREFETCH, default off; a no-op without the env): this slot still has prompt left, so
+        // its next run() call will want the next chunk's PLE rows - gather them on a thread now, while the
+        // rotation runs the other slots.  The token window stays inside the request (read0 + n + n_next <=
+        // position <= tokens.size()) and is copied inside the call; stage 0 owns layer 1, the PLE block's layer.
+        if (const int64_t pos = s.position.load(std::memory_order_relaxed); read0 + n < pos)
+            s.stages[0].prompt.ple_prefetch_next(s.request.tokens.data() + read0 + n,
+                                                 std::min<int64_t>(c.prefill_chunk, pos - (read0 + n)));
         return true;
     };
     std::jthread pump;
@@ -715,8 +722,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // quiescence (session_zero, cache swaps), so they drain the deferred chains too.  A no-op when the
     // feature is off (no chain future is ever valid then).
     auto chain_drain_all = [&]() -> bool {
-        for (auto& ptr : m.slots)
+        for (auto& ptr : m.slots) {
+            ptr->stages[0].prompt.ple_prefetch_drain();   // R2: no prefetch thread outlives a fence or exit
             if (!ptr->stages[0].prompt.chain_wait(err)) return false;
+        }
         return true;
     };
     // Hold the pump at a chunk boundary: it may not START another chunk; one already in flight finishes.
