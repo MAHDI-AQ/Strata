@@ -105,6 +105,13 @@ public:
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
 
+    /// Lane pipeline-prefill (STRATA_PREFILL_CHAIN, default off): allow `run` to leave its last chunk's
+    /// stage-1 run in flight when it returns; the concurrent pump drains it with `chain_wait` before it
+    /// publishes the slot's prompt as read.  Only the concurrent path opts in; a leaked env is inert.
+    void set_chain_defer(bool on);
+    /// Wait the deferred stage-1 run (a no-op when none is in flight).  false with `err` on stage-1 failure.
+    bool chain_wait(std::string& err);
+
 private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;

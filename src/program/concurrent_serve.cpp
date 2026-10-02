@@ -400,6 +400,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (!s.stages[st].prompt.init(*sg.wt, g, *s.stages[st].state, source, sg.cache, sg.host_res,
                                           c.prefill_chunk, (void*) m.stage_rt[st].prompt_stream, err,
                                           m.stage_rt[st].prompt_workspace, m.stage_rt[st].prompt_bytes)) return 1;
+            // Lane pipeline-prefill: this pump may leave a chunk's stage-1 run in flight between chunks
+            // (STRATA_PREFILL_CHAIN=1).  Only this path opts in, so a leaked env is inert elsewhere.
+            s.stages[st].prompt.set_chain_defer(true);
         }
         // The drafter reads the chain's last residual and the LAST stage's weights/head (generate.cpp:3750).
         if (!s.draft->bind(*m.stages.back().wt, m.stages.back().head, s.stages[0].verify.final_R_all(), err)) return 1;
@@ -575,6 +578,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         const int64_t n = std::min<int64_t>(c.prefill_chunk, s.position.load(std::memory_order_relaxed) - read0);
         const auto start = Clock::now();
         if (!s.stages[0].prompt.run(s.request.tokens.data() + read0, n, read0, chunk_err)) return false;
+        // Lane pipeline-prefill: the chunk that completes this slot's prompt must drain the deferred
+        // stage-1 run BEFORE read reaches position - the decode loop reads the slot only at read ==
+        // position, and stage-1 is what writes this chunk's layers' KV/GDN state (and the drafter's
+        // K/V).  A mid-prompt chunk leaves stage-1 in flight by design.
+        if (read0 + n >= s.position.load(std::memory_order_relaxed) &&
+            !s.stages[0].prompt.chain_wait(chunk_err)) return false;
         for (int64_t t = 0; t < n; ++t) s.consumed.push_back((int32_t) s.request.tokens[(size_t) (read0 + t)]);
         const double chunk_ms = elapsed(start);
         s.prompt_ms.fetch_add(chunk_ms);
@@ -636,15 +645,24 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
         });
     }
+    // Lane pipeline-prefill: with STRATA_PREFILL_CHAIN a chunk boundary can still have stage-1 runs in
+    // flight (that is the overlap).  The fences below guard admission/CSTOP/adapt/exit, which need FULL
+    // quiescence (session_zero, cache swaps), so they drain the deferred chains too.  A no-op when the
+    // feature is off (no chain future is ever valid then).
+    auto chain_drain_all = [&]() -> bool {
+        for (auto& ptr : m.slots)
+            if (!ptr->stages[0].prompt.chain_wait(err)) return false;
+        return true;
+    };
     // Hold the pump at a chunk boundary: it may not START another chunk; one already in flight finishes.
     auto pump_fence = [&]() -> bool {
-        if (!pump.joinable()) return true;
+        if (!pump.joinable()) return chain_drain_all();
         std::unique_lock<std::mutex> lock(m.pump_mutex);
         m.pump_paused = true;
         m.pump_cv.notify_all();
         m.pump_cv.wait(lock, [&] { return !m.pump_busy || m.pump_failed.load(std::memory_order_acquire); });
         if (m.pump_failed.load(std::memory_order_acquire)) { err = m.pump_err; return false; }
-        return true;
+        return chain_drain_all();
     };
     auto pump_resume = [&]() {
         if (!pump.joinable()) return;
@@ -1406,6 +1424,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         rotation = (rotation + 1) % m.slots.size();
     }
     if (pump.joinable()) { pump.request_stop(); m.pump_cv.notify_all(); pump.join(); }   // the stop_callback also wakes it
+    if (!chain_drain_all()) return 1;   // lane pipeline-prefill: deferred stage-1 runs finish before teardown
     if (!pump_check()) return 1;
     for (auto& s : m.slots) if (s->active.load()) finish(*s, "cancel");
     for (const auto& r : pending) error(r.id, "server shutting down");
