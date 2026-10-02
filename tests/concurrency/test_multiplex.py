@@ -30,6 +30,8 @@ def engine():
     value._channels_lock = threading.Lock()
     value._channels = {}
     value._request_number = 0
+    value._shared_progress = {}
+    value._shared_queue_wait = {}
     value.multiplex = True
     value.ended = False
     value.lines = queue.Queue()
@@ -152,6 +154,24 @@ class MultiplexTests(unittest.TestCase):
         b.join(2)
         self.assertEqual(result, [22])
         self.assertNotIn("CSTOP 2", self.engine.proc.stdin.getvalue())
+
+    def test_early_close_drains_the_done_before_the_channel_goes(self):
+        # Service.run's stop-token break closes the generator while the engine's DONE is already
+        # queued: the drain must deliver it, and no CSTOP is needed once DONE was consumed.
+        got = []
+        gen = self.engine.generate([1], 8, {}, threading.Event())
+        worker = threading.Thread(target=lambda: got.append(next(gen)))
+        worker.start()
+        wait_for(lambda: 1 in self.engine._channels)
+        self.emit("R 1 T 42")
+        worker.join(2)
+        self.assertEqual(got, [42])                  # the stop token: the consumer stops here
+        self.emit("R 1 DONE 1 3 12.5 44.0 stop 1 1 5")
+        gen.close()
+        self.assertEqual(self.engine.last.get("prompt_ms"), 12.5)
+        self.assertEqual(self.engine.last.get("reused"), 5)
+        self.assertNotIn("CSTOP 1\n", self.engine.proc.stdin.getvalue())
+        self.assertEqual(self.engine._channels, {})
 
     def test_slow_client_does_not_block_other_streams(self):
         slow, fast = queue.Queue(maxsize=256), queue.Queue(maxsize=256)
