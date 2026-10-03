@@ -773,6 +773,52 @@ void MtpDrafter::kv_restore(int64_t upto) {
     cudaStreamSynchronize(cs_);
 }
 
+bool MtpDrafter::fork_from(const MtpDrafter& parent, int64_t prefix_tokens, std::string& err) {
+    const OnDevice on_device(device_);
+    const strata::kernels::QsaShapes s = shapes_of(*g_);
+    const int64_t cells = std::min<int64_t>(prefix_tokens, st_.max_cells);
+    const int64_t pages = (cells + s.page_size - 1) / s.page_size;
+    const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
+    if (cells > 0) {
+        if (st_.kv_q4 && parent.st_.k_q4 && st_.k_q4) {
+            const size_t bytes = rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+            cudaMemcpyAsync(st_.k_q4, parent.st_.k_q4, bytes, cudaMemcpyDeviceToDevice, cs_);
+            cudaMemcpyAsync(st_.v_q4, parent.st_.v_q4, bytes, cudaMemcpyDeviceToDevice, cs_);
+        } else if (st_.kv_int8 && parent.st_.k_q && st_.k_q) {
+            const size_t bytes = rows * s.n_head_kv * s.head_dim;
+            const size_t sc_bytes = rows * s.n_head_kv * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+            cudaMemcpyAsync(st_.k_q, parent.st_.k_q, bytes, cudaMemcpyDeviceToDevice, cs_);
+            cudaMemcpyAsync(st_.v_q, parent.st_.v_q, bytes, cudaMemcpyDeviceToDevice, cs_);
+            cudaMemcpyAsync(st_.k_scale, parent.st_.k_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs_);
+            cudaMemcpyAsync(st_.v_scale, parent.st_.v_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs_);
+        } else if (parent.st_.k_pool && st_.k_pool) {
+            const size_t bytes = rows * s.n_head_kv * s.head_dim * 2;
+            cudaMemcpyAsync(st_.k_pool, parent.st_.k_pool, bytes, cudaMemcpyDeviceToDevice, cs_);
+            cudaMemcpyAsync(st_.v_pool, parent.st_.v_pool, bytes, cudaMemcpyDeviceToDevice, cs_);
+        }
+        if (st_.kv_mode == 2 && parent.st_.host.present() && st_.host.present()) {
+            if (st_.kv_q4 && parent.st_.host.k_q4 && st_.host.k_q4) {
+                const size_t bytes = rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+                std::memcpy(st_.host.k_q4, parent.st_.host.k_q4, bytes);
+                std::memcpy(st_.host.v_q4, parent.st_.host.v_q4, bytes);
+            } else if (st_.kv_int8 && parent.st_.host.k_q && st_.host.k_q) {
+                const size_t bytes = rows * s.n_head_kv * s.head_dim;
+                const size_t sc_bytes = rows * s.n_head_kv * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                std::memcpy(st_.host.k_q, parent.st_.host.k_q, bytes);
+                std::memcpy(st_.host.v_q, parent.st_.host.v_q, bytes);
+                std::memcpy(st_.host.k_scale, parent.st_.host.k_scale, sc_bytes);
+                std::memcpy(st_.host.v_scale, parent.st_.host.v_scale, sc_bytes);
+            }
+        }
+    }
+    prompt_len_ = prefix_tokens;
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "mtp: fork_from stream sync failed";
+        return false;
+    }
+    return true;
+}
+
 bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();

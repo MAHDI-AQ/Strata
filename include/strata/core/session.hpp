@@ -94,6 +94,9 @@ struct SessionState {
 /// [layer_lo, layer_hi) carves only that range's per-layer state (a split stage runs a slice of the model);
 /// the default full range is byte-identical to the old whole-model carve.  Pure arithmetic - safe to call for
 /// a candidate range before anything is allocated, which is how the layer-split search prices a placement.
+uint64_t gdn_state_floats(const ModelGeometry& g);
+uint64_t ple_hist_bytes();
+
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
                        int64_t layer_hi = -1);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
@@ -102,6 +105,16 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
+
+/// plan v0.3 P4 / Sprint 1: forks running state from  to  up to .
+/// Copies GDN state, PLE history, and QSA attention pools + indexer on .
+bool session_fork(const SessionState& parent, SessionState& child, const ModelGeometry& g,
+                  int64_t prefix_tokens, void* stream, std::string& err,
+                  const float* parent_R = nullptr,
+                  const float* parent_gdn = nullptr,
+                  const float* parent_ple = nullptr,
+                  const int32_t* parent_ple_prev = nullptr,
+                  int32_t parent_ple_token = -1);
 
 /// One token: layers 0..47 in order, each a `block_layer`, and the residual is updated in place.
 ///
