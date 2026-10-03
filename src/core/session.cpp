@@ -1,3 +1,5 @@
+#include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q8.hpp"
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
 #include "strata/core/session.hpp"
 #include "strata/core/progress.hpp"
@@ -37,16 +39,16 @@ uint64_t align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
 /// The floats one GDN layer's recurrent + conv state needs.  `gdn_buffers_bytes` carves them for ONE layer and
 /// `GdnBuffers::state`/`conv_state` point INTO that carve, so a session with 36 GDN layers has to give each one
 /// its own - they cannot share, because the recurrence is the whole point.
+}  // namespace
+
 uint64_t gdn_state_floats(const ModelGeometry& g) {
     return (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
            (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
 }
 
-}  // namespace
-
 /// `NG_HIST` rows of `hc_dim` floats: the PLE conv's history, which is the ONLY PLE state that lives in the
 /// session arena.  The table and the weights are model-level and the caller owns them.
-static uint64_t ple_hist_bytes() {
+uint64_t ple_hist_bytes() {
     return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
@@ -151,6 +153,97 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     s.ple_prev[0] = -1;
     s.ple_prev[1] = -1;
     s.ple_token = -1;
+}
+
+bool session_fork(const SessionState& parent, SessionState& child, const ModelGeometry& g,
+                  int64_t prefix_tokens, void* stream, std::string& err,
+                  const float* parent_R, const float* parent_gdn, const float* parent_ple,
+                  const int32_t* parent_ple_prev, int32_t parent_ple_token) {
+    cudaStream_t cs = (cudaStream_t) stream;
+    if (child.gdn_alloc != parent.gdn_alloc || child.qsa_alloc != parent.qsa_alloc ||
+        child.gdn_ord0 != parent.gdn_ord0 || child.qsa_ord0 != parent.qsa_ord0) {
+        err = "session_fork: incompatible session carve";
+        return false;
+    }
+    // 1. Residual block.R
+    const float* src_R = parent_R ? parent_R : parent.block.R;
+    if (src_R && child.block.R) {
+        cudaMemcpyAsync(child.block.R, src_R, (size_t) g.hc * g.n_embd * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs);
+    }
+    // 2. GDN recurrence and conv history across all owned GDN layers
+    const float* src_gdn = parent_gdn ? parent_gdn : parent.gdn_state;
+    if (child.gdn_alloc > 0 && src_gdn && child.gdn_state) {
+        cudaMemcpyAsync(child.gdn_state, src_gdn,
+                        (size_t) child.gdn_alloc * gdn_state_floats(g) * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs);
+    }
+    // 3. PLE conv history and token window
+    const float* src_ple = parent_ple ? parent_ple : parent.ple_hist;
+    if (src_ple && child.ple_hist) {
+        cudaMemcpyAsync(child.ple_hist, src_ple, (size_t) ple_hist_bytes(),
+                        cudaMemcpyDeviceToDevice, cs);
+    }
+    if (parent_ple_prev) {
+        child.ple_prev[0] = parent_ple_prev[0];
+        child.ple_prev[1] = parent_ple_prev[1];
+    } else {
+        child.ple_prev[0] = parent.ple_prev[0];
+        child.ple_prev[1] = parent.ple_prev[1];
+    }
+    child.ple_token = (parent_ple_token != -1) ? parent_ple_token : parent.ple_token;
+
+    // 4. QSA attention layers: copy KV pools and indexer up to prefix_tokens
+    const int64_t cells = std::min<int64_t>(prefix_tokens, child.max_cells);
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.n_head = g.n_head;
+    s.n_head_kv = g.n_head_kv;
+    s.head_dim = g.head_dim;
+    s.idx_n_head = g.idx_q_heads;
+    s.idx_dim = g.idx_key_dim;
+    const int64_t pages = (cells + s.page_size - 1) / s.page_size;
+    const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
+    for (int64_t j = 0; j < child.qsa_alloc; ++j) {
+        const QsaState& pst = parent.qsa_states[parent.qsa_ord0 + j];
+        QsaState& cst = child.qsa_states[child.qsa_ord0 + j];
+        if (cells > 0) {
+            if (cst.kv_hybrid) {
+                const size_t k_bytes = rows * s.head_dim;
+                const size_t sc_bytes = rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                const size_t v_bytes = rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+                if (pst.k_q && cst.k_q) cudaMemcpyAsync(cst.k_q, pst.k_q, k_bytes, cudaMemcpyDeviceToDevice, cs);
+                if (pst.k_scale && cst.k_scale) cudaMemcpyAsync(cst.k_scale, pst.k_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
+                if (pst.v_q4 && cst.v_q4) cudaMemcpyAsync(cst.v_q4, pst.v_q4, v_bytes, cudaMemcpyDeviceToDevice, cs);
+            } else if (cst.kv_q4) {
+                const size_t bytes = rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+                if (pst.k_q4 && cst.k_q4) cudaMemcpyAsync(cst.k_q4, pst.k_q4, bytes, cudaMemcpyDeviceToDevice, cs);
+                if (pst.v_q4 && cst.v_q4) cudaMemcpyAsync(cst.v_q4, pst.v_q4, bytes, cudaMemcpyDeviceToDevice, cs);
+            } else if (cst.kv_int8) {
+                const size_t bytes = rows * s.head_dim;
+                const size_t sc_bytes = rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                if (pst.k_q && cst.k_q) cudaMemcpyAsync(cst.k_q, pst.k_q, bytes, cudaMemcpyDeviceToDevice, cs);
+                if (pst.v_q && cst.v_q) cudaMemcpyAsync(cst.v_q, pst.v_q, bytes, cudaMemcpyDeviceToDevice, cs);
+                if (pst.k_scale && cst.k_scale) cudaMemcpyAsync(cst.k_scale, pst.k_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
+                if (pst.v_scale && cst.v_scale) cudaMemcpyAsync(cst.v_scale, pst.v_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
+            } else {
+                const size_t bytes = rows * s.head_dim * 2;
+                if (pst.k_pool && cst.k_pool) cudaMemcpyAsync(cst.k_pool, pst.k_pool, bytes, cudaMemcpyDeviceToDevice, cs);
+                if (pst.v_pool && cst.v_pool) cudaMemcpyAsync(cst.v_pool, pst.v_pool, bytes, cudaMemcpyDeviceToDevice, cs);
+            }
+            // Indexer tail and dead states
+            const size_t tail_bytes = (size_t) (s.idx_block - 1) * s.idx_dim * sizeof(float);
+            const size_t dead_bytes = (size_t) s.idx_dim * sizeof(float);
+            if (pst.idx_tail && cst.idx_tail) cudaMemcpyAsync(cst.idx_tail, pst.idx_tail, tail_bytes, cudaMemcpyDeviceToDevice, cs);
+            if (pst.idx_dead && cst.idx_dead) cudaMemcpyAsync(cst.idx_dead, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
+            if (pst.idx_block_pos && cst.idx_block_pos) cudaMemcpyAsync(cst.idx_block_pos, pst.idx_block_pos, sizeof(int32_t), cudaMemcpyDeviceToDevice, cs);
+            const int64_t pooled_rows = prefix_tokens / s.idx_block;
+            if (pooled_rows > 0 && pst.idx_pooled && cst.idx_pooled) {
+                cudaMemcpyAsync(cst.idx_pooled, pst.idx_pooled, (size_t) pooled_rows * s.idx_dim * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+                cudaMemcpyAsync(cst.idx_pooled + (size_t) pooled_rows * s.idx_dim, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
+            }
+        }
+    }
+    return true;
 }
 
 /// Sets `s.gdn.state`/`conv_state` for `layer`, which is what makes one layer's GDN state its own.  Shared by
