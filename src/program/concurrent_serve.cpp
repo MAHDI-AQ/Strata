@@ -272,14 +272,17 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
     // extra slots stay empty then does not displace expert-cache slots (measured at 5x87.5K: the c8 boot's
     // three empty slots cost the whole 1.73x prefill wall through the expert cache they shrink).  The
     // carve makes the released pairs stream, and the residency updates before the next plan keep the
-    // captured graphs safe (adapt()'s doctrine); the round discipline stays serial, so the overlap and
-    // per-member-stream modes are refused.  Default off: unset, every allocation below is the boot-time
-    // one it always was and the engine is byte-identical.
+    // captured graphs safe (adapt()'s doctrine).  The stage hand-off stays serial, so the cross-device
+    // stage-overlap mode stays refused (structural - its two in-flight units ride plans published before
+    // a mid-serve carve); --batch-parallel composes (lane lazy-enabler): it forks per-member streams
+    // WITHIN one round on one plan, so the carve's ordering is unchanged - its extra resource is the
+    // per-slot PLE scratch, allocated for each slot below.  Default off: unset, every allocation below
+    // is the boot-time one it always was and the engine is byte-identical.
     m.lazy_slots = [] { const char* v = std::getenv("STRATA_SLOT_LAZY"); return v != nullptr && std::atoi(v) != 0; }();
     if (m.lazy_slots) {
         const char* ov = std::getenv("STRATA_STAGE_OVERLAP_CROSSDEV");
-        if (c.parallel_batch || (ov != nullptr && std::atoi(ov) != 0)) {
-            err = "concurrency: STRATA_SLOT_LAZY needs the serial round discipline (unset --batch-parallel and STRATA_STAGE_OVERLAP_CROSSDEV)";
+        if (ov != nullptr && std::atoi(ov) != 0) {
+            err = "concurrency: STRATA_SLOT_LAZY needs the serial stage hand-off (unset STRATA_STAGE_OVERLAP_CROSSDEV)";
             return false;
         }
         m.deferred_bytes.assign(stages.size(), 0);
@@ -305,6 +308,13 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
                 // in scope; `gs.state` is the same owned state the eager branch points at.
                 gs.state = &gs.owned;
                 m.deferred_bytes[st] = (int64_t) core::session_bytes(g, c.context, primary.k, stages[st].lb, stages[st].le);
+                // lane lazy-enabler: under --batch-parallel each slot's member stream needs its own PLE
+                // scratch - the exact allocation the eager branch below makes; bringup_slot wires it.  It
+                // is tiny (~0.25 MiB) and spent here BEFORE every cache sizing, so it is already netted
+                // out of the free figures the sizers read - never add it to a reserve or to deferred_bytes.
+                if (st == 0 && c.parallel_batch && primary.ple.ready()) {
+                    if (!gpu_alloc(&gs.ple_scratch, (size_t) core::ple_run_scratch_bytes(), c.reserve_mib, err)) return false;
+                }
             } else {
                 // C4 follow-up (C5 reconciliation): an owned stage session carves ONLY its stage's layers -
                 // same range convention as the CLI's per-stage carve (le == -1 resolves to the end).
@@ -1147,7 +1157,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 gs.owned.ple.hist = gs.owned.ple_hist;
                 gs.owned.ple.prev = gs.owned.ple_prev;
                 gs.owned.ple.token = &gs.owned.ple_token;
-                // --batch-parallel is refused for this mode (prepare), so the member-stream scratch stays absent.
+                // lane lazy-enabler: --batch-parallel composes with this mode; its per-slot scratch was
+                // allocated in prepare - point the member stream at it (absent = the serial path, which
+                // keeps the primary's scratch pointer exactly as before).
+                if (gs.ple_scratch) gs.owned.ple.scratch = static_cast<float*>(gs.ple_scratch);
             }
         }
         // The drafter: prepare()'s block, including the shared head on the first owned slot that loads it.
