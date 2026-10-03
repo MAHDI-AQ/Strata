@@ -462,7 +462,7 @@ void usage() {
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --concurrency N      experimental shared-model serving, 1..16 requests (default 1)\n"
-                 "  --batch-rows N       target rows across requests, 1..24 (default 8)\n"
+                 "  --batch-rows N       target rows across requests, 1..48 (default 8)\n"
                  "  --batch-graphs N     cached batch layouts, 1..64 (default 8; respects VRAM reserve)\n"
                  "  --batch-padding N    stabilize verification shapes with discarded padding, 0|1 (default 0)\n"
                  "  --batch-parallel N   overlap independent request projections, 0|1 (default 0)\n"
@@ -1223,7 +1223,7 @@ int main(int argc, char** argv) {
         o.batch_padding < 0 || o.batch_padding > 1 ||
         o.batch_parallel < 0 || o.batch_parallel > 1 ||
         (o.batch_policy != "fair" && o.batch_policy != "depth") || o.concurrent_prefill < 256 || o.concurrent_prefill > 4096) {
-        std::fprintf(stderr, "strata: --concurrency 1..16, --batch-rows 1..24, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..4096\n");
+        std::fprintf(stderr, "strata: --concurrency 1..16, --batch-rows 1..48, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..4096\n");
         return 2;
     }
     if (o.concurrency > 1) {

@@ -214,29 +214,29 @@ void test_window_envelope() {
             "could not load canonical layout: " + err);
     StubSource source;
 
-    // 25 x 10 = 250: one token past MAXT - refused by the token guard (fires BEFORE any per-entry work).
-    const ExpertDispatch too_many_tokens = probe_window(source, 25, 10);
+    // 49 x 10 = 490: one token past MAXT (48) - refused by the token guard (fires BEFORE any per-entry work).
+    const ExpertDispatch too_many_tokens = probe_window(source, 49, 10);
     require(too_many_tokens.failed &&
                 std::string(too_many_tokens.fail ? too_many_tokens.fail : "").find("more tokens than") != std::string::npos,
-            "25 tokens were not refused by the token envelope");
-    // 24 x 11 = 264: one entry past kMaxWindowEntries - refused by the tables guard.
-    const ExpertDispatch too_many_entries = probe_window(source, 24, 11);
+            "49 tokens were not refused by the token envelope");
+    // 48 x 11 = 528: one entry past kMaxWindowEntries (480) - refused by the tables guard.
+    const ExpertDispatch too_many_entries = probe_window(source, 48, 11);
     require(too_many_entries.failed &&
                 std::string(too_many_entries.fail ? too_many_entries.fail : "").find("window tables") != std::string::npos,
-            "264 window entries were not refused by the entry envelope");
-    // 24 x 10 = 240: exactly the guard's bound - accepted, and the call reaches the source.  The probe
+            "528 window entries were not refused by the entry envelope");
+    // 48 x 10 = 480: exactly the guard's bound - accepted, and the call reaches the source.  The probe
     // crosses INTO the pool kernels, which require AVX-512 (VNNI/VBMI); a host without them must be
     // REFUSED rather than run (expert.hpp) - per the pool_test/pool_stress convention the probe is
     // SKIPPED there (never a green-on-nothing: the refusal probes above still ran and are checked).
     const strata::kernels::cpu::CpuFeatures feat_env = strata::kernels::cpu::cpu_features();
     if (!feat_env.usable()) {
-        std::cout << "  window envelope legal-240 probe SKIPPED (CPU lacks " << feat_env.reason()
+        std::cout << "  window envelope legal-480 probe SKIPPED (CPU lacks " << feat_env.reason()
                   << "; VNNI kernels refused by design) - refusals above DID run and were checked\n";
         return;
     }
-    const ExpertDispatch legal = probe_window(source, 24, 10);
+    const ExpertDispatch legal = probe_window(source, 48, 10);
     require(legal.failed && std::string(legal.fail ? legal.fail : "").find("could not produce a blob") != std::string::npos,
-            "24 tokens x 10 experts (240 entries) was refused by the window envelope");
+            "48 tokens x 10 experts (480 entries) was refused by the window envelope");
 }
 
 void test_complement_plan() {

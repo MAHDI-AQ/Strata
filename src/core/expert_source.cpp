@@ -970,9 +970,9 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 namespace {
 // the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
 // are fixed arrays of this many entries: MAXT tokens of the model's 10 routed experts must fit, and a larger k is
-// refused at run time rather than written past them.  The envelope raise takes this to MAXT x 10 = 240, so a
-// full 24-row batch round is legal at this model's k = 10; the tables below are MAXT x 16 = 384 and unchanged.
-constexpr int64_t kMaxWindowEntries = 240;
+// refused at run time rather than written past them.  The envelope raise scales to MAXT x 10 (480 at MAXT=48), so
+// batch rounds up to 48 rows are legal at this model's k = 10; the tables below are MAXT x 16 = 768.
+constexpr int64_t kMaxWindowEntries = strata::kernels::cpu::MAXT * 10;
 static_assert(kMaxWindowEntries <= strata::kernels::cpu::MAXT * 16, "the window tables must cover the entry guard");
 }  // namespace
 
