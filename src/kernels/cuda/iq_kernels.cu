@@ -702,7 +702,7 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 // native_gu_kernel with the group's entries taken GRP_NC at a time, each weight part decoded once per pass.
 // A group has at most one entry per token of the window (kVerifyMaxT = 8; setup writes --spec 4, and a split window
 // has halves of <= 4), so 4 takes such windows in one pass; 8 would take ~64-80 registers against ~48 (ptxas -v).
-constexpr int GRP_NC = 4;
+constexpr int GRP_NC = 8;
 
 template<int TG>
 __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
