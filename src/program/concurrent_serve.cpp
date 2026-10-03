@@ -1208,7 +1208,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             return slot->draft->prefill(residual, next.data(), n, position, e);
         };
         s.brought_up = true;
-        std::fprintf(stderr, "strata concurrent: slot-lazy: slot sessions carved from the expert caches' tails\n");
+        size_t f0 = 0, t0 = 0, f1 = 0, t1 = 0;
+        { const core::OnDevice on0(0); cudaMemGetInfo(&f0, &t0); }
+        { const core::OnDevice on1(1); cudaMemGetInfo(&f1, &t1); }
+        std::fprintf(stderr, "strata concurrent: slot-lazy: slot sessions carved from the expert caches' tails (CUDA0 free %zu MiB, CUDA1 free %zu MiB)\n", f0 >> 20, f1 >> 20);
         return true;
     };
     // P4: one slot's admission - the exact sequence the loop always ran (bookkeeping, per-stage reset

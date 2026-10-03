@@ -2138,9 +2138,15 @@ int main(int argc, char** argv) {
         // C4 integration (design IN-3 / M6): the later stages run their own batch coordinators and
         // per-stage graph caches after this sizing; mirror the CUDA0 concurrency term so their caches
         // leave the same room the single-GPU path reserves (else run_batch refuses loudly at first use).
-        const int64_t conc_slot_mib = (int64_t) (lazy_slots ? std::max(2, o.concurrency - 3) : o.concurrency) * 256;
-        const int64_t concurrency_mib = (later && o.concurrency > 1) ? 512 + conc_slot_mib +
-            (int64_t) o.batch_rows * 8 + (int64_t) o.batch_graphs * 16 : 0;
+        const int64_t conc_slot_mib = (int64_t) (lazy_slots ? std::max(2, o.concurrency - 2) : o.concurrency) * 256;
+        // Lane m1m2 / lazy-enabler: later stages host independent per-slot drafter replicas (104 MiB/slot),
+        // concurrent prompt workspace (~1986 MiB at chunk 2048), and batch graph caches.
+        // Account for them here so the later stage leaves full room for batch verify rounds.
+        const int64_t extra_drafters_mib = (later && o.concurrency > 1) ? (int64_t) (o.concurrency - 1) * 104 : 0;
+        const int64_t conc_ws_mib = (later && o.concurrency > 1 && o.concurrent_prefill > 0) ? 1986 : 0;
+        const int64_t conc_graphs_mib = (later && o.concurrency > 1) ? (int64_t) std::max(8, o.batch_graphs) * 32 : 0;
+        const int64_t concurrency_mib = (later && o.concurrency > 1) ? 512 + conc_slot_mib + extra_drafters_mib +
+            conc_ws_mib + conc_graphs_mib + (int64_t) o.batch_rows * 8 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib : 0) +
                                  (drafter ? kDrafterMib : 0) + concurrency_mib) << 20;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
@@ -2530,7 +2536,7 @@ int main(int argc, char** argv) {
         // share to the expert cache (the sessions themselves are carved from the caches' tails; the fixed
         // items - graph metadata, the first slots' verifiers, the draft head - stay covered at full
         // occupancy: measured need 7x(104+149)+890 = 2661 MiB against 2844 MiB reserved at c8).
-        const int64_t conc_slot_mib = (int64_t) (lazy_slots ? std::max(2, o.concurrency - 3) : o.concurrency) * 256;   // lazy_slots: read once above stage_room
+        const int64_t conc_slot_mib = (int64_t) (lazy_slots ? std::max(2, o.concurrency - 2) : o.concurrency) * 256;   // lazy_slots: read once above stage_room
         const int64_t concurrent_mib = concurrent ? 512 + conc_slot_mib +
             (int64_t) o.batch_rows * 8 + (int64_t) o.batch_graphs * 16 : 0;
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
