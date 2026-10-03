@@ -1020,16 +1020,28 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     if (d.plan != nullptr && n <= kMaxWindowEntries) {
-        int64_t distinct[max_entries], first_of[max_entries];
+        int64_t distinct[max_entries];
         int nd = 0, nmiss = 0;
+        int16_t expert_first[1024];
+        int16_t expert_tail[1024];
+        int16_t next_occ[max_entries];
+        const size_t n_exp = (size_t) std::min<int64_t>(1024, d.n_expert);
+        std::memset(expert_first, -1, n_exp * sizeof(int16_t));
+        std::memset(expert_tail, -1, n_exp * sizeof(int16_t));
+        std::memset(next_occ, -1, (size_t) n * sizeof(int16_t));
+
         for (int64_t i = 0; i < n; ++i) {
-            first_of[i] = i;
-            for (int64_t j = 0; j < i; ++j)
-                if (ids[j] == ids[i]) { first_of[i] = first_of[j]; break; }
-            if (first_of[i] == i) {
-                distinct[nd++] = i;
-                const int32_t e = ids[i];
-                if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0) ++nmiss;
+            const int32_t e = ids[i];
+            if (e >= 0 && (size_t) e < n_exp) {
+                if (expert_first[e] == -1) {
+                    expert_first[e] = (int16_t) i;
+                    expert_tail[e] = (int16_t) i;
+                    distinct[nd++] = i;
+                    if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0) ++nmiss;
+                } else {
+                    next_occ[expert_tail[e]] = (int16_t) i;
+                    expert_tail[e] = (int16_t) i;
+                }
             }
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
@@ -1062,17 +1074,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ++miss_rank;
                 }
             }
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd;
+            for (int16_t cur = (int16_t) i0; cur != -1; cur = next_occ[cur])
+                kind[cur] = kd;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
-                    P.dst[entries] = (int32_t) i;
-                    P.tok[entries] = (int32_t) (i / k);
-                    ++entries;
-                }
+            for (int16_t cur = (int16_t) i0; cur != -1; cur = next_occ[cur]) {
+                P.dst[entries] = (int32_t) cur;
+                P.tok[entries] = (int32_t) (cur / k);
+                ++entries;
+            }
             ++groups;
         }
         P.start[groups] = entries;
@@ -1082,12 +1093,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
             P.start2[q] = entries;
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
-                    P.dst[entries] = (int32_t) i;
-                    P.tok[entries] = (int32_t) (i / k);
-                    ++entries;
-                }
+            for (int16_t cur = (int16_t) i0; cur != -1; cur = next_occ[cur]) {
+                P.dst[entries] = (int32_t) cur;
+                P.tok[entries] = (int32_t) (cur / k);
+                ++entries;
+            }
             ++d.pcie_experts;
         }
         P.start2[fetches] = entries;
@@ -1116,14 +1126,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     const auto c1 = std::chrono::steady_clock::now();
-    if (native && lay.fmt[(size_t) d.layers].gu_type == 42)   // a native Q2_0 pack: the Q2_0 kernels' activations
-        for (int64_t t = 0; t < n_tok; ++t) act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
-    else if (native)
-        for (int64_t t = 0; t < n_tok; ++t)
-            native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
-    else
-        for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
-    const auto c2 = std::chrono::steady_clock::now();
     int njobs = 0;
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
@@ -1166,6 +1168,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++jb.nt;
             ++d.multi_entries;
         }
+    const auto c2 = std::chrono::steady_clock::now();
+    if (njobs > 0) {
+        if (native && lay.fmt[(size_t) d.layers].gu_type == 42)   // a native Q2_0 pack: the Q2_0 kernels' activations
+            for (int64_t t = 0; t < n_tok; ++t) act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+        else if (native)
+            for (int64_t t = 0; t < n_tok; ++t)
+                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+        else
+            for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+    }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
