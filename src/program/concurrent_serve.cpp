@@ -1357,6 +1357,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
             }
             for (size_t st = 0; st < m.stage_rt.size(); ++st) {
+                const core::OnDevice on(m.stages[st].device);
                 if (cudaStreamSynchronize(m.stage_rt[st].prompt_stream) != cudaSuccess) { err = "concurrency: fork stream sync failed"; return false; }
             }
             if (s.draft && parent->draft) {
