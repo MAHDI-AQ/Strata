@@ -837,7 +837,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
         }
     });
-    core::RadixTree radix_tree(2);
+    core::RadixTree radix_tree(4);
     auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens) {
         if (prefix_len < 256 || tokens.size() < (size_t) prefix_len) return;
         s.saved_prefix = prefix_len;
@@ -885,7 +885,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             r_R.push_back(s.stages[st].R_saved ? s.stages[st].R_saved : s.stages[st].state->block.R);
             r_streams.push_back((void*) m.stage_rt[st].prompt_stream);
         }
-        radix_tree.evict_lru(2);
+        radix_tree.evict_lru(4);
         auto r_node = radix_tree.insert(tokens.data(), tokens.size(), prefix_len, r_devs, r_states, r_R, g, r_streams);
         if (r_node) {
             if (s.radix_node && s.radix_node != r_node) radix_tree.release(s.radix_node);
@@ -1365,13 +1365,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
                 s.draft->kv_restore(reused);
             }
-            save_slot_snapshot(s, reused, s.consumed);
             std::fprintf(stderr, "strata concurrent: cross-slot fork: slot forks %lld tokens from parent (saved=%lld)\n",
                          (long long) reused, (long long) parent->saved_prefix);
         } else {
             // Intra-slot retention (slot continues itself)
             s.draft->kv_restore(reused);
-            save_slot_snapshot(s, reused, s.consumed);
             std::fprintf(stderr, "strata concurrent: live retention: slot resumes %lld tokens\n", (long long) reused);
         }
         s.draft->set_prompt_len((int64_t) s.request.tokens.size());
