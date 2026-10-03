@@ -736,13 +736,7 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
     }
 }
 
-__global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
-                                      long long n) {
-    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
-}
+// swiglu_entries_kernel fused into fused_swiglu_quantize_q8_1_kernel
 
 template<int TD>
 __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long long* __restrict__ grp_ptr,
@@ -801,6 +795,25 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float xi = x[i];
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    }
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const long long ib = i / 32, iqs = i % 32;
+    y[ib].qs[iqs] = q;
+    if (iqs == 0) y[ib].ds = make_half2(d, sum);
+}
+
+__global__ void fused_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                                                  block_q8_1* __restrict__ y, long long n) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = gate[i];
+    const float xi = (g / (1.0f + __expf(-g))) * up[i];
     float amax = fabsf(xi), sum = xi;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -1134,7 +1147,7 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
 
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
-    return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
+    return 2 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
 }
 
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
@@ -1145,8 +1158,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;
     float* up = (float*) ((uint8_t*) scratch + fa);
-    float* h = (float*) ((uint8_t*) scratch + 2 * fa);
-    block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
+    block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 2 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
     switch (L.gu_type) {
@@ -1162,8 +1174,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
-    swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
-    quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+    fused_swiglu_quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, hq, nh);
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     switch (L.d_type) {
         case 20: launch_down<20>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
