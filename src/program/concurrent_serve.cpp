@@ -885,7 +885,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             r_R.push_back(s.stages[st].R_saved ? s.stages[st].R_saved : s.stages[st].state->block.R);
             r_streams.push_back((void*) m.stage_rt[st].prompt_stream);
         }
-        radix_tree.evict_lru(2, 1024);
+        radix_tree.evict_lru(2);
         auto r_node = radix_tree.insert(tokens.data(), tokens.size(), prefix_len, r_devs, r_states, r_R, g, r_streams);
         if (r_node) {
             if (s.radix_node && s.radix_node != r_node) radix_tree.release(s.radix_node);
@@ -1338,7 +1338,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (s.radix_node && s.radix_node != radix_parent) radix_tree.release(s.radix_node);
             s.radix_node = radix_parent;
             radix_tree.acquire(s.radix_node);
-            save_slot_snapshot(s, reused, s.consumed);
             std::fprintf(stderr, "strata concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld\n", (long long) reused, (long long) radix_parent->id);
         } else if (parent != nullptr && parent != &s) {
             // SPRINT 1: Cross-slot prefix fork from parent slot snapshot
