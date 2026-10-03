@@ -104,7 +104,9 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         return false;
     }
 
-    const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes + kMmqReadPad;
+    const uint64_t pad = blob_bytes == 1 ? 0 : kMmqReadPad;
+    const uint64_t slot_stride = ((uint64_t) blob_bytes + pad + 255) / 256 * 256;
+    const uint64_t want = (uint64_t) n_slots * slot_stride + (blob_bytes == 1 ? kMmqReadPad : 0);
 
     // ---- **THE ALLOCATION IS CHECKED AGAINST THE CARD, NOT AGAINST THE REQUEST.**
     //
@@ -129,6 +131,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
 
     if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
         base_ = nullptr;
+    slot_stride_ = 0;
         char buf[256];
         std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
                       (double) want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
@@ -148,6 +151,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     blob_ = blob_bytes;
+    slot_stride_ = (int64_t) slot_stride;
 #if defined(STRATA_USE_HIP)
     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
         close();
@@ -175,7 +179,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
     for (size_t i = 0; i < slot_bytes.size(); ++i) {
         // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it
-        off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
+        off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + kMmqReadPad + 255) / 256 * 256;
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
     }
     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
@@ -204,7 +208,7 @@ int64_t ExpertCache::release_tail_bytes(int64_t need_bytes, int64_t floor_slots,
     // slots carry per-slot offsets, uniform slots are blob-strided.
     auto tail_bytes = [&](int64_t first) -> int64_t {
         if (!off_.empty()) return (int64_t) off_[(size_t) slots_] - (int64_t) off_[(size_t) first];
-        return (slots_ - first) * blob_;
+        return (slots_ - first) * (slot_stride_ > 0 ? slot_stride_ : blob_);
     };
     int64_t first = slots_;
     while (first > floor_slots && tail_bytes(first) < need_bytes) --first;
@@ -283,13 +287,13 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
 uint8_t* ExpertCache::device_slot(int32_t slot) {
     if (slot < 0 || slot >= slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
-    return base_ + (size_t) slot * (size_t) blob_;
+    return base_ + (size_t) slot * (size_t) (slot_stride_ > 0 ? slot_stride_ : blob_);
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     if (slot < 0 || slot >= slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
-    return base_ + (size_t) slot * (size_t) blob_;
+    return base_ + (size_t) slot * (size_t) (slot_stride_ > 0 ? slot_stride_ : blob_);
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {

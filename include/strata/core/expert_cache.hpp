@@ -79,7 +79,7 @@ public:
     /// Slots actually claimed.  Not the same as `slots()` - the cache does not evict, so a run that routes
     /// fewer distinct experts than there are slots leaves the rest empty.
     int64_t resident() const { return per_layer_ ? admitted_ : next_free_; }
-    int64_t bytes() const { return off_.empty() ? slots_ * blob_ : (int64_t) off_.back(); }
+    int64_t bytes() const { return off_.empty() ? slots_ * (slot_stride_ > 0 ? slot_stride_ : blob_) : (int64_t) off_.back(); }
     double gib() const { return (double) bytes() / 1073741824.0; }
 
     /// **STRATA_SLOT_LAZY: HAND THE TAIL TO ANOTHER OWNER WITHOUT RETURNING IT TO THE DRIVER.**
@@ -163,6 +163,7 @@ private:
     int64_t n_layers_ = 0;
     int64_t n_expert_ = 0;
     int64_t blob_ = 0;
+    int64_t slot_stride_ = 0;
     int64_t next_free_ = 0;
     int64_t fills_ = 0;
     /// R4.2g.  `per_layer_` off (the default) leaves `next_free_` as the only admission counter, so the
