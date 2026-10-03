@@ -1615,9 +1615,26 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             input_done = true;
             if (quit) break;
         }
+        // Micro-batch partitioning for stage overlap:
+        // When overlap is enabled and nothing is currently in flight (!prev.valid),
+        // partition the eligible slots into two micro-batches so that Unit A and Unit B
+        // can ping-pong across Stage 0 (GPU 1) and Stage 1 (GPU 0) concurrently.
+        size_t max_unit_slots = m.slots.size();
+        if (overlap && !prev.valid) {
+            size_t eligible = 0;
+            for (size_t j = 0; j < m.slots.size(); ++j) {
+                const auto& s = *m.slots[j];
+                if (s.active.load() && s.read.load(std::memory_order_acquire) >= s.position.load() &&
+                    s.position.load() < c.context && s.generated < s.request.max_new)
+                    ++eligible;
+            }
+            if (eligible >= 2) max_unit_slots = (eligible + 1) / 2;
+        }
+
         std::vector<Impl::Slot*> ready;
         std::vector<int> wanted;
         for (size_t j = 0; j < m.slots.size(); ++j) {
+            if (ready.size() >= max_unit_slots) break;
             auto& s = *m.slots[(rotation + j) % m.slots.size()];
             // Acquire: the pump's release store of `read` publishes its consumed rows and session writes.
             if (!s.active.load() || s.read.load(std::memory_order_acquire) < s.position.load()) continue;
