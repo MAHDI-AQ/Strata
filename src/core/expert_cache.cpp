@@ -104,9 +104,10 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         return false;
     }
 
-    const uint64_t pad = blob_bytes == 1 ? 0 : kMmqReadPad;
-    const uint64_t slot_stride = ((uint64_t) blob_bytes + pad + 255) / 256 * 256;
-    const uint64_t want = (uint64_t) n_slots * slot_stride + (blob_bytes == 1 ? kMmqReadPad : 0);
+    const uint64_t slot_stride = (blob_bytes == 1)
+        ? 1
+        : (((uint64_t) blob_bytes + kMmqReadPad + 255) / 256 * 256);
+    const uint64_t want = (uint64_t) n_slots * slot_stride;
 
     // ---- **THE ALLOCATION IS CHECKED AGAINST THE CARD, NOT AGAINST THE REQUEST.**
     //
