@@ -184,6 +184,8 @@ Verifier::~Verifier() {
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
+    if (skip_) cudaFree(skip_);
+    if (slot_off_d_) cudaFree(slot_off_d_);
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
@@ -813,7 +815,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
         } else {
             wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
             stamp(l, 23, grp);
-            if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
+            if (dec_batch || p_counts != nullptr)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
                 copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
                                       p_dst, p_counts + 1, cs);
             else
@@ -1226,8 +1228,8 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
     if (total > max_t_) { err = "batch verify: row budget exceeded"; return false; }
     for (const auto& b : batch)
         if (!b.verifier->stage_inputs(b.count, b.tokens, b.position, err) || !b.verifier->capture_commit(err)) return false;
-    // Expert-only coordinator always uses the host plan. Member graphs never publish doorbells.
-    device_plan_ = false;
+    // E-6: a layer whose routed experts are all resident is planned on the device
+    device_plan_ = (skip_ != nullptr);
     graph_exec = nullptr;
     for (auto it = batch_graphs_.begin(); it != batch_graphs_.end(); ++it) if (it->shape == shape && it->parity == parity_) {
         graph_exec = it->graph;
@@ -1289,6 +1291,11 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
             if (!ok) break;
             if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + 28), cs_);
             doorbell_publish(mixed_, ids_, w_, total * N, total * K, m_x_, m_ids_, m_w_, m_seq_, cs_);
+            if (device_plan_) {
+                resident_plan(ids_, total * (int) K, (int) K, hits_.d_res + l * g_->n_expert, (int) g_->n_expert,
+                              hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                              plan_, (long long) max_t_ * K, skip_, (uint32_t) (l - lb_ + 1), cs_);
+            }
             if (strata::kernels::cpu::expert_layout().native)
                 quantize_q8_1_rows(mixed_, total, N, nat_xq_, cs_);
             else { err = "batch verify: requires native experts"; ok = false; break; }
