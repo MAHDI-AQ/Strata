@@ -837,7 +837,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
         }
     });
-    core::RadixTree radix_tree(8);
+    core::RadixTree radix_tree(2);
     auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens) {
         if (prefix_len < 256 || tokens.size() < (size_t) prefix_len) return;
         s.saved_prefix = prefix_len;
@@ -885,6 +885,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             r_R.push_back(s.stages[st].R_saved ? s.stages[st].R_saved : s.stages[st].state->block.R);
             r_streams.push_back((void*) m.stage_rt[st].prompt_stream);
         }
+        radix_tree.evict_lru(2, 1024);
         auto r_node = radix_tree.insert(tokens.data(), tokens.size(), prefix_len, r_devs, r_states, r_R, g, r_streams);
         if (r_node) {
             if (s.radix_node && s.radix_node != r_node) radix_tree.release(s.radix_node);

@@ -463,12 +463,24 @@ void RadixTree::collect_unreferenced_leaves(
     }
 }
 
-size_t RadixTree::evict_lru(size_t max_snapshots, size_t) {
+size_t RadixTree::evict_lru(size_t max_snapshots, size_t min_free_vram_mib) {
     size_t evicted = 0;
-    while (cached_snapshots_ > max_snapshots) {
+    auto should_evict = [&]() -> bool {
+        if (cached_snapshots_ > max_snapshots) return true;
+        if (min_free_vram_mib > 0) {
+            size_t free0 = 0, tot0 = 0, free1 = 0, tot1 = 0;
+            { const core::OnDevice on(0); cudaMemGetInfo(&free0, &tot0); }
+            { const core::OnDevice on(1); cudaMemGetInfo(&free1, &tot1); }
+            const size_t reserve_bytes = min_free_vram_mib * 1048576ULL;
+            if (free0 < reserve_bytes || free1 < reserve_bytes) return true;
+        }
+        return false;
+    };
+
+    while (cached_snapshots_ > 0 && should_evict()) {
         std::vector<std::shared_ptr<RadixNode>> leaves;
         collect_unreferenced_leaves(root_, leaves);
-        if (leaves.empty()) break;
+        if (leaves.empty()) break; // All leaves actively in use
 
         std::sort(leaves.begin(), leaves.end(), [](const auto& a, const auto& b) {
             return a->last_accessed < b->last_accessed;
