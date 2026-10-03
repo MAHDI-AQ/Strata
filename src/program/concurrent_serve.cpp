@@ -138,6 +138,12 @@ struct ConcurrentServe::Impl {
             core::Verifier verify;
             prefill::Prefill prompt;
             void* ple_scratch = nullptr;   // only the stage that holds layer 1 (stage 0 for any legal split)
+            // SPRINT 1: Snapshot buffers for cross-slot prefix sharing
+            float* gdn_saved = nullptr;
+            float* ple_saved = nullptr;
+            float* R_saved = nullptr;
+            int32_t ple_prev_saved[2] = {-1, -1};
+            int32_t ple_token_saved = -1;
             // TODO(C4 run-side): per-stage destruction guard (a core::OnDevice member) is deferred - OnDevice
             // is neither default-constructible nor movable, and StageSlot lives in a std::vector.
         };
@@ -177,10 +183,17 @@ struct ConcurrentServe::Impl {
         float probability[8]{};
         std::atomic<double> prompt_ms{0};
         Clock::time_point decode_start{};
+        int64_t saved_prefix = 0;
+        std::vector<int32_t> saved_consumed;
         ~Slot() {
             // TODO(C4 run-side): free under OnDevice(last stage / stage device) once stages can be non-zero.
             if (history_device) cudaFree(history_device);
-            for (auto& gs : stages) if (gs.ple_scratch) cudaFree(gs.ple_scratch);
+            for (auto& gs : stages) {
+                if (gs.ple_scratch) cudaFree(gs.ple_scratch);
+                if (gs.gdn_saved) cudaFree(gs.gdn_saved);
+                if (gs.ple_saved) cudaFree(gs.ple_saved);
+                if (gs.R_saved) cudaFree(gs.R_saved);
+            }
         }
     };
     ConcurrentConfig config;
@@ -822,7 +835,45 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
         }
     });
+    auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens) {
+        if (prefix_len < 256 || tokens.size() < (size_t) prefix_len) return;
+        s.saved_prefix = prefix_len;
+        s.saved_consumed.assign(tokens.begin(), tokens.begin() + prefix_len);
+        for (size_t st = 0; st < m.stages.size(); ++st) {
+            auto& ss = s.stages[st];
+            const core::OnDevice on(m.stages[st].device);
+            if (!ss.gdn_saved && ss.state->gdn_alloc > 0) {
+                cudaMalloc(&ss.gdn_saved, (size_t) ss.state->gdn_alloc * core::gdn_state_floats(g) * sizeof(float));
+            }
+            if (ss.gdn_saved && ss.state->gdn_state) {
+                cudaMemcpyAsync(ss.gdn_saved, ss.state->gdn_state,
+                                (size_t) ss.state->gdn_alloc * core::gdn_state_floats(g) * sizeof(float),
+                                cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
+            }
+            if (!ss.ple_saved && ss.state->ple_hist) {
+                cudaMalloc(&ss.ple_saved, (size_t) core::ple_hist_bytes());
+            }
+            if (ss.ple_saved && ss.state->ple_hist) {
+                cudaMemcpyAsync(ss.ple_saved, ss.state->ple_hist, (size_t) core::ple_hist_bytes(),
+                                cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
+            }
+            if (!ss.R_saved && ss.state->block.R) {
+                cudaMalloc(&ss.R_saved, (size_t) g.hc * g.n_embd * sizeof(float));
+            }
+            if (ss.R_saved && ss.state->block.R) {
+                cudaMemcpyAsync(ss.R_saved, ss.state->block.R, (size_t) g.hc * g.n_embd * sizeof(float),
+                                cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
+            }
+            ss.ple_prev_saved[0] = ss.state->ple_prev[0];
+            ss.ple_prev_saved[1] = ss.state->ple_prev[1];
+            ss.ple_token_saved = ss.state->ple_token;
+        }
+        for (size_t st = 0; st < m.stage_rt.size(); ++st) {
+            cudaStreamSynchronize(m.stage_rt[st].prompt_stream);
+        }
+    };
     auto finish = [&](Impl::Slot& s, const char* reason) {
+        save_slot_snapshot(s, (int64_t) s.consumed.size(), s.consumed);
         const double decode = s.first ? 0 : elapsed(s.decode_start);
         // P4: the trailing field is reused_prefix_tokens (server.py _parse_done maps it to
         // `reused`/cached_tokens). Live retention fills it with the tokens this request resumed;
@@ -1218,7 +1269,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // on each stage's device, drafter re-arm), plus the live-retention arm. `reused` = tokens of this
     // request the slot's sessions already hold (0 = fresh: zero every stage, today's path). The caller
     // has moved the request in and holds the pump fence; the pump only sees the slot after pump_resume.
-    auto admit_slot = [&](Impl::Slot& s, int64_t reused) -> bool {
+    auto admit_slot = [&](Impl::Slot& s, int64_t reused, Impl::Slot* parent = nullptr) -> bool {
         if (m.lazy_slots && !s.brought_up && !bringup_slot(s, err)) return false;
         s.read.store(reused); s.generated = s.offered = s.accepted = 0;
         s.prompt_ms.store(0); s.first = true; s.active.store(true);
@@ -1227,35 +1278,53 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         s.reused_prefix = reused;
         if (retain) s.session = s.request.session;   // D1: keep the slot's conversation key current
         if (reused == 0) s.consumed.clear();
-        // reused > 0: `consumed` already IS request.tokens[0..reused) - the match proved it, and the
-        // pump appends [reused, n-1) to it as it reads, so penalty/suffix state see the same n-1
-        // tokens a fresh admission would have accumulated by the first window.
         std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
         s.suffix.reset(); s.policy = spec::DraftPolicy{c.window};
         for (auto token : s.request.tokens) s.suffix.append((int32_t) token);
-        // P1-cache-revive hook note: the parking lift (host-RAM snapshots) attaches HERE, at the
-        // admission boundary only - never mid-round (a ~1-2 GiB memcpy at 100K q4_0 would stall
-        // decode). Per-slot per-stage sessions: capture/restore every stage's state on its device
-        // under OnDevice, stamp the carve (layer_lo/hi) and reject cross-carve restores, re-seed
-        // per-stage PLE scratch, invalidate on prefix divergence. Live retention (the `reused` arm
-        // below) is its first tier; parking adds the cross-slot/evicted cases.
+
         if (reused == 0) {
             for (size_t st = 0; st < m.stages.size(); ++st) {   // C4: every stage's state resets on its device
                 const core::OnDevice on(m.stages[st].device);
                 core::session_zero(*s.stages[st].state, g, nullptr, m.stage_rt[st].prompt_stream);
             }
             for (size_t st = 0; st < m.stage_rt.size(); ++st) {
-                core::progress_at("concurrency: resetting a stage", (int64_t) st);   // the watchdog's view
+                core::progress_at("concurrency: resetting a stage", (int64_t) st);
                 if (cudaStreamSynchronize(m.stage_rt[st].prompt_stream) != cudaSuccess) { err = "concurrency: reset failed"; return false; }
             }
             s.draft->reset();
+        } else if (parent != nullptr && parent != &s) {
+            // SPRINT 1: Cross-slot prefix fork from parent slot snapshot
+            s.consumed.assign(parent->saved_consumed.begin(), parent->saved_consumed.begin() + reused);
+            for (size_t st = 0; st < m.stages.size(); ++st) {
+                const core::OnDevice on(m.stages[st].device);
+                std::string fork_err;
+                const auto& ps = parent->stages[st];
+                if (!core::session_fork(*ps.state, *s.stages[st].state, g, reused,
+                                        (void*) m.stage_rt[st].prompt_stream, fork_err,
+                                        ps.R_saved, ps.gdn_saved, ps.ple_saved,
+                                        ps.ple_prev_saved, ps.ple_token_saved)) {
+                    err = "concurrency: cross-slot fork failed on stage " + std::to_string(st) + ": " + fork_err;
+                    return false;
+                }
+            }
+            for (size_t st = 0; st < m.stage_rt.size(); ++st) {
+                if (cudaStreamSynchronize(m.stage_rt[st].prompt_stream) != cudaSuccess) { err = "concurrency: fork stream sync failed"; return false; }
+            }
+            if (s.draft && parent->draft) {
+                std::string draft_err;
+                if (!s.draft->fork_from(*parent->draft, reused, draft_err)) {
+                    err = "concurrency: fork draft failed: " + draft_err;
+                    return false;
+                }
+                s.draft->kv_restore(reused);
+            }
+            save_slot_snapshot(s, reused, s.consumed);
+            std::fprintf(stderr, "strata concurrent: cross-slot fork: slot forks %lld tokens from parent (saved=%lld)\n",
+                         (long long) reused, (long long) parent->saved_prefix);
         } else {
-            // The drafter continues the same sequence: keep its state (reset() would zero the KV the
-            // retained cells live in) and tell it the valid length, exactly as the serial path does
-            // (generate.cpp:4702 mtp.kv_restore(resume); a no-op on resident K/V). set_prompt_len
-            // re-bases its window skip; cells past `reused` were speculative and are overwritten
-            // before any read (verify.hpp:18's own contract).
+            // Intra-slot retention (slot continues itself)
             s.draft->kv_restore(reused);
+            save_slot_snapshot(s, reused, s.consumed);
             std::fprintf(stderr, "strata concurrent: live retention: slot resumes %lld tokens\n", (long long) reused);
         }
         s.draft->set_prompt_len((int64_t) s.request.tokens.size());
@@ -1327,6 +1396,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // Off (default): this pre-pass is dead code and the walk is byte-identical.
         constexpr size_t kAdmissionScanQueue = 32;   // the pending deque's own cap (see the overflow check above; M2 raise 16->32 for burst headroom)
         const auto admit_start = retain ? Clock::now() : Clock::time_point{};
+        std::vector<Impl::Slot*> admitted_this_round;
         while (retain && !pending.empty()) {
             Impl::Slot* pick = nullptr;
             size_t pick_q = 0;
@@ -1340,8 +1410,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 Impl::Slot* cand = nullptr;
                 int64_t candL = 0;
                 if (pending[q].session != 0) {
-                    // The hint: the first idle slot of this session is THE keyed slot - use it when it
-                    // matches; otherwise (busy, unusable length, or diverged) fall back to longest-match.
                     for (auto& ptr : m.slots) {
                         const auto& held = *ptr;
                         if (held.active.load() || held.session != pending[q].session) continue;
@@ -1358,7 +1426,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         const auto& held = *ptr;
                         if (held.active.load()) continue;
                         const int64_t L = (int64_t) held.consumed.size();
-                        if (L < 1 || L > nmax || L <= candL) continue;   // length prefilter: must beat the best
+                        if (L < 1 || L > nmax || L <= candL) continue;
                         bool same = true;
                         for (int64_t i = 0; i < L && same; ++i) same = held.consumed[(size_t) i] == (int32_t) tokens[(size_t) i];
                         if (same) { candL = L; cand = ptr.get(); }
@@ -1366,11 +1434,60 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
                 if (cand != nullptr && candL > best) { best = candL; pick = cand; pick_q = q; }
             }
-            if (pick == nullptr) break;   // no live match anywhere in the queue: the normal walk admits
+            if (pick == nullptr) break;
             auto& s = *pick;
             s.request = std::move(pending[pick_q]); pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
-            if (!admit_slot(s, best)) return 1;
+            if (!admit_slot(s, best, nullptr)) return 1;
+            admitted_this_round.push_back(&s);
         }
+
+        // SPRINT 1: Cross-slot prefix fork pass.
+        // If there are still idle slots and pending requests, fork prefix state from any parent slot
+        // that holds a matching prefix snapshot (whether the parent is currently idle or active).
+        while (retain && !pending.empty()) {
+            Impl::Slot* pick_child = nullptr;
+            for (auto& ptr : m.slots) {
+                if (!ptr->active.load()) {
+                    pick_child = ptr.get();
+                    break;
+                }
+            }
+            if (pick_child == nullptr) break;
+
+            Impl::Slot* pick_parent = nullptr;
+            size_t pick_q = 0;
+            int64_t best = 0;
+            const size_t qn = std::min<size_t>(pending.size(), kAdmissionScanQueue);
+            for (size_t q = 0; q < qn; ++q) {
+                const auto& tokens = pending[q].tokens;
+                const int64_t nmax = (int64_t) tokens.size() - 1;
+                if (nmax < 1) continue;
+                if (nmax <= best) continue;
+
+                for (auto& p_ptr : m.slots) {
+                    auto* p = p_ptr.get();
+                    if (p == pick_child) continue;
+                    const int64_t valid_len = p->saved_prefix;
+                    if (valid_len < 256 || valid_len > nmax || valid_len <= best) continue;
+                    bool same = true;
+                    for (int64_t i = 0; i < valid_len && same; ++i) {
+                        same = (p->saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
+                    }
+                    if (same) {
+                        best = valid_len;
+                        pick_parent = p;
+                        pick_q = q;
+                    }
+                }
+            }
+            if (pick_parent == nullptr || best == 0) break;
+
+            auto& s = *pick_child;
+            s.request = std::move(pending[pick_q]);
+            pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
+            if (!admit_slot(s, best, pick_parent)) return 1;
+        }
+
         if (retain && admitting) {   // D1 falsifier: the whole-queue scan's added stall at the safe point
             const double ms = elapsed(admit_start);
             ++admit_scans; admit_ms_sum += ms;
@@ -1380,7 +1497,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         for (auto& ptr : m.slots) if (!ptr->active.load() && !pending.empty()) {
             auto& s = *ptr;
             s.request = std::move(pending.front()); pending.pop_front();
-            if (!admit_slot(s, 0)) return 1;
+            if (!admit_slot(s, 0, nullptr)) return 1;
         }
 
         pump_resume();   // new prefillable slots are announced here (a no-op when the pump is off)
