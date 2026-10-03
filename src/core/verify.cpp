@@ -890,6 +890,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                 return false;
             }
         }
+        if (phase == 40) return true;
         if (head_ != nullptr && head_->loaded()) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
@@ -1313,12 +1314,58 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
         // C2-A4: the same cumulative offsets as the capture head; chained stages hand the rows
         // on (phase 5), the last stage runs the head (phase 4).
         int row_out = 0;
-        for (const auto& b : batch) if (ok) {
-            ok = chained ? b.verifier->record_window(b.count, cs_, err, 5, 0, row_out)
-                         : b.verifier->record_window(b.count, cs_, err, 4);
-            row_out += b.count;
+        static const bool batch_head = [] {
+            const char* v = std::getenv("STRATA_BATCH_HEAD");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (!chained && head_ != nullptr && head_->loaded() && batch_head) {
+            for (const auto& b : batch) if (ok) {
+                ok = b.verifier->record_window(b.count, cs_, err, 40);
+                copy(head_mixed_ + (size_t) row_out * N, b.verifier->head_mixed_,
+                     (size_t) b.count * N * sizeof(float), cs_);
+                row_out += b.count;
+            }
+            if (ok && row_out == total) {
+                try {
+                    quantize_q8_1_rows(head_mixed_, total, N, nat_xq_, cs_);
+                    for (int r = 0; r < total; r += 8) {
+                        const int cur = std::min(8, total - r);
+                        const void* x_chunk = (const uint8_t*) nat_xq_ + (size_t) r * (N / 32) * 36;
+                        float* log_chunk = head_logits_ + (size_t) r * n_vocab_;
+                        native_mmvq(head_->type(), head_->weights(), x_chunk, log_chunk,
+                                    (int) N, (int) n_vocab_, cur, cs_);
+                    }
+                    SamplerParams sp;
+                    sp.greedy = true;
+                    sp.temperature = 0.0f;
+                    int r_member = 0;
+                    for (const auto& b : batch) {
+                        sample_tokens(head_logits_ + (size_t) r_member * n_vocab_, b.count,
+                                      (int) n_vocab_, nullptr, 0, sp, b.verifier->m_out_, cs_);
+                        if (b.verifier->head_sampling_) {
+                            copy(b.verifier->head_logits_, head_logits_ + (size_t) r_member * n_vocab_,
+                                 (size_t) b.count * n_vocab_ * sizeof(float), cs_);
+                        }
+                        r_member += b.count;
+                    }
+                } catch (const std::exception& e) {
+                    err = std::string("verify head batch: ") + e.what();
+                    ok = false;
+                }
+            } else if (!ok) {
+                // err already set
+            } else {
+                err = "batch verify: row mapping broken (head)";
+                ok = false;
+            }
+        } else {
+            for (const auto& b : batch) if (ok) {
+                ok = chained ? b.verifier->record_window(b.count, cs_, err, 5, 0, row_out)
+                             : b.verifier->record_window(b.count, cs_, err, 4);
+                row_out += b.count;
+            }
+            if (ok && row_out != total) { err = "batch verify: row mapping broken (out)"; return false; }
         }
-        if (ok && row_out != total) { err = "batch verify: row mapping broken (out)"; return false; }
         if (prof_on_) gpu_stamp(prof_, (int) (g_->n_layers * kProfPer + 3), cs_);
         cudaGraph_t graph = nullptr;
         const cudaError_t end = cudaStreamEndCapture(cs_, &graph);
