@@ -1189,6 +1189,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (!s.stages[st].prompt.init(*sg.wt, g, *s.stages[st].state, source, sg.cache, sg.host_res,
                                           c.prefill_chunk, (void*) m.stage_rt[st].prompt_stream, err,
                                           m.stage_rt[st].prompt_workspace, m.stage_rt[st].prompt_bytes)) return false;
+            s.stages[st].prompt.set_chain_defer(true);
+            if (st == 0) s.stages[st].prompt.set_chain_gate(&m.chain_gate);
         }
         if (!s.draft->bind(*m.stages.back().wt, m.stages.back().head, s.stages[0].verify.final_R_all(), err)) return false;
         s.history.resize((size_t) c.window * 4096, -1);
