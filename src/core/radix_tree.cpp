@@ -441,6 +441,7 @@ bool RadixTree::fork_to_session(
         }
     }
     for (size_t st = 0; st < n_stages; ++st) {
+        const core::OnDevice on(stage_devices[st]);
         if (cudaStreamSynchronize((cudaStream_t) streams[st]) != cudaSuccess) {
             err = "radix_fork: cudaStreamSynchronize failed";
             return false;
