@@ -159,6 +159,7 @@ const void* MtpDrafter::q8(const char* name) const {
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window, const MtpDrafter* shared_weights) {
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
+    std::fprintf(stderr, "strata mtp: drafter loaded on CUDA%d (shared=%d)\n", device_, shared_weights != nullptr);
     g_ = &g;
     ss_ = &ss;
     max_t_ = max_t;
