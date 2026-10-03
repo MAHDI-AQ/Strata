@@ -1342,7 +1342,8 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
                     for (const auto& b : batch) {
                         sample_tokens(head_logits_ + (size_t) r_member * n_vocab_, b.count,
                                       (int) n_vocab_, nullptr, 0, sp, b.verifier->m_out_, cs_);
-                        if (b.verifier->head_sampling_) {
+                        if (b.verifier->head_sampling_ &&
+                            ((!b.verifier->sampling_.greedy && b.verifier->sampling_.temperature > 0.0f) || b.verifier->hist_d_ != nullptr)) {
                             copy(b.verifier->head_logits_, head_logits_ + (size_t) r_member * n_vocab_,
                                  (size_t) b.count * n_vocab_ * sizeof(float), cs_);
                         }
