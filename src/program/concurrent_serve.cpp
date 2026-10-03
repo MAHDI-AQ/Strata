@@ -11,6 +11,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/draft_policy.hpp"
+#include "strata/core/radix_tree.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -184,6 +185,7 @@ struct ConcurrentServe::Impl {
         std::atomic<double> prompt_ms{0};
         Clock::time_point decode_start{};
         int64_t saved_prefix = 0;
+        std::shared_ptr<core::RadixNode> radix_node = nullptr;
         std::vector<int32_t> saved_consumed;
         ~Slot() {
             // TODO(C4 run-side): free under OnDevice(last stage / stage device) once stages can be non-zero.
@@ -835,6 +837,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
         }
     });
+    core::RadixTree radix_tree(8);
     auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens) {
         if (prefix_len < 256 || tokens.size() < (size_t) prefix_len) return;
         s.saved_prefix = prefix_len;
@@ -871,6 +874,23 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         for (size_t st = 0; st < m.stage_rt.size(); ++st) {
             cudaStreamSynchronize(m.stage_rt[st].prompt_stream);
         }
+        // SPRINT 4: Dynamic RadixTree insert
+        std::vector<int> r_devs;
+        std::vector<const core::SessionState*> r_states;
+        std::vector<const float*> r_R;
+        std::vector<void*> r_streams;
+        for (size_t st = 0; st < m.stages.size(); ++st) {
+            r_devs.push_back(m.stages[st].device);
+            r_states.push_back(s.stages[st].state);
+            r_R.push_back(s.stages[st].R_saved ? s.stages[st].R_saved : s.stages[st].state->block.R);
+            r_streams.push_back((void*) m.stage_rt[st].prompt_stream);
+        }
+        auto r_node = radix_tree.insert(tokens.data(), tokens.size(), prefix_len, r_devs, r_states, r_R, g, r_streams);
+        if (r_node) {
+            if (s.radix_node && s.radix_node != r_node) radix_tree.release(s.radix_node);
+            s.radix_node = r_node;
+            radix_tree.acquire(s.radix_node);
+        }
     };
     auto finish = [&](Impl::Slot& s, const char* reason) {
         save_slot_snapshot(s, (int64_t) s.consumed.size(), s.consumed);
@@ -882,6 +902,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     (long long) s.generated, s.request.tokens.size(), s.prompt_ms.load(), decode, reason,
                     (long long) s.accepted, (long long) s.offered, (long long) s.reused_prefix);
         std::fflush(stdout);
+        if (s.radix_node) {
+            radix_tree.release(s.radix_node);
+            s.radix_node = nullptr;
+        }
         live.erase(s.request.id);
         s.active.store(false);
         // LANE sched-impl P1 (admission wake; T4 L7/L13 micro): a freed slot is re-admitted at the
@@ -1269,7 +1293,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // on each stage's device, drafter re-arm), plus the live-retention arm. `reused` = tokens of this
     // request the slot's sessions already hold (0 = fresh: zero every stage, today's path). The caller
     // has moved the request in and holds the pump fence; the pump only sees the slot after pump_resume.
-    auto admit_slot = [&](Impl::Slot& s, int64_t reused, Impl::Slot* parent = nullptr) -> bool {
+    auto admit_slot = [&](Impl::Slot& s, int64_t reused, Impl::Slot* parent = nullptr, std::shared_ptr<core::RadixNode> radix_parent = nullptr) -> bool {
         if (m.lazy_slots && !s.brought_up && !bringup_slot(s, err)) return false;
         s.read.store(reused); s.generated = s.offered = s.accepted = 0;
         s.prompt_ms.store(0); s.first = true; s.active.store(true);
@@ -1292,6 +1316,29 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 if (cudaStreamSynchronize(m.stage_rt[st].prompt_stream) != cudaSuccess) { err = "concurrency: reset failed"; return false; }
             }
             s.draft->reset();
+        } else if (radix_parent != nullptr) {
+            // SPRINT 4: Dynamic RadixTree prefix fork
+            s.consumed.clear();
+            for (int64_t i = 0; i < reused; ++i) s.consumed.push_back((int32_t) s.request.tokens[(size_t) i]);
+            std::vector<int> r_devs;
+            std::vector<core::SessionState*> r_child_states;
+            std::vector<void*> r_streams;
+            for (size_t st = 0; st < m.stages.size(); ++st) {
+                r_devs.push_back(m.stages[st].device);
+                r_child_states.push_back(s.stages[st].state);
+                r_streams.push_back((void*) m.stage_rt[st].prompt_stream);
+            }
+            std::string fork_err;
+            if (!radix_tree.fork_to_session(radix_parent, reused, r_devs, r_child_states, g, r_streams, fork_err)) {
+                err = "concurrency: radix tree fork failed: " + fork_err;
+                return false;
+            }
+            if (s.draft) s.draft->kv_restore(reused);
+            if (s.radix_node && s.radix_node != radix_parent) radix_tree.release(s.radix_node);
+            s.radix_node = radix_parent;
+            radix_tree.acquire(s.radix_node);
+            save_slot_snapshot(s, reused, s.consumed);
+            std::fprintf(stderr, "strata concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld\n", (long long) reused, (long long) radix_parent->id);
         } else if (parent != nullptr && parent != &s) {
             // SPRINT 1: Cross-slot prefix fork from parent slot snapshot
             s.consumed.assign(parent->saved_consumed.begin(), parent->saved_consumed.begin() + reused);
@@ -1439,6 +1486,40 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             s.request = std::move(pending[pick_q]); pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
             if (!admit_slot(s, best, nullptr)) return 1;
             admitted_this_round.push_back(&s);
+        }
+
+        // SPRINT 4: Dynamic RadixTree prefix fork pass
+        while (retain && !pending.empty()) {
+            Impl::Slot* pick_child = nullptr;
+            for (auto& ptr : m.slots) {
+                if (!ptr->active.load()) {
+                    pick_child = ptr.get();
+                    break;
+                }
+            }
+            if (pick_child == nullptr) break;
+
+            size_t pick_q = 0;
+            int64_t best = 0;
+            std::shared_ptr<core::RadixNode> best_node = nullptr;
+            const size_t qn = std::min<size_t>(pending.size(), kAdmissionScanQueue);
+            for (size_t q = 0; q < qn; ++q) {
+                const auto& tokens = pending[q].tokens;
+                const int64_t nmax = (int64_t) tokens.size() - 1;
+                if (nmax < 256 || nmax <= best) continue;
+                auto match = radix_tree.match_prefix(tokens.data(), tokens.size());
+                if (match.matched_tokens >= 256 && match.matched_tokens <= nmax && match.matched_tokens > best && match.node) {
+                    best = match.matched_tokens;
+                    best_node = match.node;
+                    pick_q = q;
+                }
+            }
+            if (best_node == nullptr || best == 0) break;
+
+            auto& s = *pick_child;
+            s.request = std::move(pending[pick_q]);
+            pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
+            if (!admit_slot(s, best, nullptr, best_node)) return 1;
         }
 
         // SPRINT 1: Cross-slot prefix fork pass.

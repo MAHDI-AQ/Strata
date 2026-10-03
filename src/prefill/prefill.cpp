@@ -339,6 +339,7 @@ struct Prefill::Impl {
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
+    cudaEvent_t hand_event[2] = {};
     // lane pipeline-prefill (STRATA_PREFILL_CHAIN, default off): the deferred stage-1 future, its error and
     // the hand parity persist across run() calls, so the next chunk's stage-0 pass runs while this chunk's
     // stage-1 still does.  Invalid/empty when the feature is off.
@@ -412,6 +413,7 @@ Prefill::~Prefill() {
     }
     for (int b = 0; b < 2; ++b) {
         if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
+        if (impl_->hand_event[b]) cudaEventDestroy(impl_->hand_event[b]);
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
     }
@@ -528,11 +530,16 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
-    for (int b = 0; next_ != nullptr && b < 2; ++b)
+    for (int b = 0; next_ != nullptr && b < 2; ++b) {
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
+        if (!m.hand_event[b] && cudaEventCreateWithFlags(&m.hand_event[b], cudaEventDisableTiming) != cudaSuccess) {
+            err = "prefill: hand-off event creation failed";
+            return false;
+        }
+    }
     if (m.tok_dev == nullptr) {
         if (cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)) != cudaSuccess) {
             err = "prefill: the token id buffer";
@@ -2057,31 +2064,31 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         stats_.tokens += T;
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {
-            // the rows to the host buffer the next stage read two chunks ago (it has finished: waited below)
+            // SPRINT 5: Disaggregated async stage hand-off pipeline
             float* h = m.hand[hand_buf];
-            if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
-                cudaStreamSynchronize(m.cs) != cudaSuccess) {
+            if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess) {
                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
-            // this stage's state is at the chunk's end now (synced) and moves on with the next chunk below
+            if (cudaEventRecord(m.hand_event[hand_buf], m.cs) != cudaSuccess) {
+                err = "prefill: hand-off event record failed";
+                return false;
+            }
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
-            // lane w3-chaingate: at most ONE deferred stage-1 run in flight engine-wide.  Every slot's
-            // stage-1 prompt shares one workspace and stream (concurrent_serve.cpp stage_rt), so two
-            // overlapping stage-1 runs alias every buffer - the K<24 `prefill copy_i32` illegal-access
-            // fault.  The wait is at this SPAWN point and only in the chain arm; the spawned run releases
-            // the gate when it completes.  This slot's own previous stage-1 was drained just above, so the
-            // intended chain (S0(c+1) under a live S1(c)) is untouched: the gate serializes stage-1 runs
-            // ACROSS slots, never this slot's own two chunks.
             ChainGate* gate = chain ? chain_gate_ : nullptr;
             if (gate != nullptr) gate->acquire();
             next_->hand_in_ = h;
-            next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err, gate] {
+            cudaEvent_t ev = m.hand_event[hand_buf];
+            next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err, gate, ev] {
                 struct GateRelease {
                     ChainGate* g;
                     ~GateRelease() { if (g != nullptr) g->release(); }
                 } release{gate};
+                if (cudaEventSynchronize(ev) != cudaSuccess) {
+                    next_err = "prefill: hand-off event sync failed";
+                    return false;
+                }
                 return next_->run(tokens + c0, T, p0, next_err);
             });
             hand_buf ^= 1;
