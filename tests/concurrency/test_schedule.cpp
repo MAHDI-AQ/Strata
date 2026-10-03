@@ -17,7 +17,7 @@ int main() {
     int checks = 0;
     for (int a = 1; a <= 8; ++a) for (int b = 1; b <= 8; ++b)
     for (int c = 1; c <= 8; ++c) for (int d = 1; d <= 8; ++d)
-    for (int budget = 1; budget <= 24; ++budget) for (bool depth : {false, true}) {
+    for (int budget = 1; budget <= 48; ++budget) for (bool depth : {false, true}) {
         std::vector<int> wanted{a,b,c,d};
         const auto rows = schedule_rows(wanted, budget, depth);
         assert(std::accumulate(rows.begin(), rows.end(), 0) == std::min(budget, a+b+c+d));
@@ -34,8 +34,8 @@ int main() {
         }
         for (int n : progress) assert(n == 1);
     }
-    // The envelope raise: budget 24 (MAXT rows) is accepted, 25 is refused - failing closed above.
-    for (int invalid : {0,25,32}) {
+    // The envelope raise: budget 48 (MAXT rows) is accepted, 49 is refused - failing closed above.
+    for (int invalid : {0,49,64}) {
         bool rejected = false;
         try { schedule_rows({4,4}, invalid, false); } catch (const std::invalid_argument&) { rejected = true; }
         assert(rejected);
@@ -43,10 +43,12 @@ int main() {
     {
         // The full 24-row envelope allocates across the agents: 3 x 8 = 24 rows (240 entries at k = 10).
         assert((schedule_rows({8,8,8}, 24, false) == std::vector<int>{8,8,8}));
-        // With the five-agent wanted [4,...], 20 rows: the envelope no longer truncates a slot.
-        assert((schedule_rows({4,4,4,4,4}, 24, false) == std::vector<int>{4,4,4,4,4}));
-        // With eight agents the 24 rows spread evenly.
-        assert((schedule_rows({8,8,8,8,8,8,8,8}, 24, false) == std::vector<int>{3,3,3,3,3,3,3,3}));
+        // Sprint 2: 5 agents with 8 speculative rows each = 40 rows:
+        assert((schedule_rows({8,8,8,8,8}, 40, false) == std::vector<int>{8,8,8,8,8}));
+        // Sprint 2: 6 agents with 8 speculative rows each = 48 rows:
+        assert((schedule_rows({8,8,8,8,8,8}, 48, false) == std::vector<int>{8,8,8,8,8,8}));
+        // With eight agents the 48 rows spread evenly (8 x 6 = 48).
+        assert((schedule_rows({8,8,8,8,8,8,8,8}, 48, false) == std::vector<int>{6,6,6,6,6,6,6,6}));
     }
     // LANE m1m2 (M2 request lattice 8 -> 16): the c16 battery - the same 196,608-case shape as the
     // recorded 24-row envelope point (8^4 x 24 budgets x 2 policies), now over a 16-member wanted
@@ -56,7 +58,7 @@ int main() {
     int checks16 = 0;
     for (int a = 1; a <= 8; ++a) for (int b = 1; b <= 8; ++b)
     for (int c = 1; c <= 8; ++c) for (int d = 1; d <= 8; ++d)
-    for (int budget = 1; budget <= 24; ++budget) for (bool depth : {false, true}) {
+    for (int budget = 1; budget <= 48; ++budget) for (bool depth : {false, true}) {
         const int quad[4] = {a, b, c, d};
         std::vector<int> wanted(16);
         for (int i = 0; i < 16; ++i) wanted[(size_t) i] = quad[(i < 8 ? i : 15 - i) % 4];
@@ -76,9 +78,9 @@ int main() {
         }
         for (int n : progress) assert(n == 1);
     }
-    // The full 24-row envelope spreads across 16 members: 8 get 2 rows, 8 get 1.
-    assert((schedule_rows(std::vector<int>(16, 8), 24, false) ==
-            std::vector<int>{2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1}));
+    // The full 48-row envelope spreads across 16 members: all 16 get 3 rows (16 x 3 = 48).
+    assert((schedule_rows(std::vector<int>(16, 8), 48, false) ==
+            std::vector<int>(16, 3)));
     {
         // The request lattice: 16 requests are accepted, 17 are not (M2 raise).  (The 8-legal case the
         // old pair-combine test asserted is now covered by the 16-wide sweep and the named 16 case.)

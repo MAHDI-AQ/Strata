@@ -135,7 +135,7 @@ void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScr
 /// the split hand-off row count and the `--batch-rows` CLI bound all follow it.  A cap is a lattice:
 /// raise it only with every fixed array sized to it audited (the 16 -> 24 raise audited the verify
 /// `groups_` table, the hand-off row bound and the resident/pool tables).
-inline constexpr int MAXT = 24;
+inline constexpr int MAXT = 48;
 /// Plan v0.3 P4: the expert in row ranges, so several threads can share one expert.  `s2_expert_gu_rows` writes
 /// ff[r] = silu(gate_r . x) * (up_r . x) for r in [r0, r1) (of FF); `s2_expert_down_rows` writes out[r] for r in
 /// [r0, r1) (of H) from the intermediate's quantized image.  Together with `act_quant_q8_1(ff, FF, a2)` in
