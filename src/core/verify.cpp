@@ -1394,7 +1394,7 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
             cudaGraphExecDestroy(graph_exec);
             err = "batch verify: cannot query free VRAM"; return false;
         }
-        const auto reserve_bytes = (size_t) std::min<int>(batch_reserve_mib_, 48) * 1048576;
+        const auto reserve_bytes = (size_t) std::min<int>(batch_reserve_mib_, 16) * 1048576;
         while (!batch_graphs_.empty() && (batch_graphs_.size() >= (size_t) batch_cache_limit_ || free_bytes < reserve_bytes)) {
             cudaGraphExecDestroy(batch_graphs_.front().graph);
             batch_graphs_.erase(batch_graphs_.begin());

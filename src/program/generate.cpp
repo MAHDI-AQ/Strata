@@ -2143,7 +2143,7 @@ int main(int argc, char** argv) {
         const int64_t conc_slot_mib = (concurrent == nullptr) ? (int64_t) (lazy_slots ? std::max(2, o.concurrency - 2) : o.concurrency) * 256 : 0;
         const int64_t extra_drafters_mib = (later && o.concurrency > 1 && concurrent == nullptr) ? (int64_t) (o.concurrency - 1) * 104 : 0;
         const int64_t conc_ws_mib = (later && o.concurrency > 1 && o.concurrent_prefill > 0 && concurrent == nullptr) ? 1986 : 0;
-        const int64_t conc_graphs_mib = (later && o.concurrency > 1) ? (int64_t) std::max(8, o.batch_graphs) * 32 : 0;
+        const int64_t conc_graphs_mib = (later && o.concurrency > 1) ? (int64_t) std::max(8, o.batch_graphs) * 16 : 0;
         const int64_t concurrency_mib = (later && o.concurrency > 1) ? 512 + conc_slot_mib + extra_drafters_mib +
             conc_ws_mib + conc_graphs_mib + (int64_t) o.batch_rows * 8 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib : 0) +
