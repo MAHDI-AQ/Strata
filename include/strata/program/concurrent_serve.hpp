@@ -59,6 +59,11 @@ public:
     // the per-round publish targets the C4 loops refresh.
     int run(const std::vector<ServeStage>& stages, core::ExpertSource* source,
             core::PoolMultiFn pool, void* user, core::GpuPlanSink** stage_plans, std::string&);
+    // LANE m1m2 (M1 telemetry): the per-stage prompt workspaces' total device bytes, as sized and
+    // allocated in prepare().  The boot budget lines print it so a boot's cache counts can be read
+    // against the whole concurrent allocation (the workspaces spend BEFORE the expert caches are
+    // sized, so the sizing's free figures already net them out).
+    int64_t prompt_workspace_bytes() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -461,8 +461,8 @@ void usage() {
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
-                 "  --concurrency N      experimental shared-model serving, 1..8 requests (default 1)\n"
-                 "  --batch-rows N       target rows across requests, 1..24 (default 8)\n"
+                 "  --concurrency N      experimental shared-model serving, 1..16 requests (default 1)\n"
+                 "  --batch-rows N       target rows across requests, 1..48 (default 8)\n"
                  "  --batch-graphs N     cached batch layouts, 1..64 (default 8; respects VRAM reserve)\n"
                  "  --batch-padding N    stabilize verification shapes with discarded padding, 0|1 (default 0)\n"
                  "  --batch-parallel N   overlap independent request projections, 0|1 (default 0)\n"
@@ -1217,13 +1217,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata serve: conversation parking does not yet support --layer-split; disable parking with --conversation-cache-mib 0\n");
         return 2;
     }
-    if (o.concurrency < 1 || o.concurrency > 8 || o.batch_rows < 1 ||
+    if (o.concurrency < 1 || o.concurrency > 16 || o.batch_rows < 1 ||
         o.batch_rows > (int) strata::kernels::cpu::MAXT ||
         o.batch_graphs < 1 || o.batch_graphs > 64 ||
         o.batch_padding < 0 || o.batch_padding > 1 ||
         o.batch_parallel < 0 || o.batch_parallel > 1 ||
         (o.batch_policy != "fair" && o.batch_policy != "depth") || o.concurrent_prefill < 256 || o.concurrent_prefill > 4096) {
-        std::fprintf(stderr, "strata: --concurrency 1..8, --batch-rows 1..24, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..4096\n");
+        std::fprintf(stderr, "strata: --concurrency 1..16, --batch-rows 1..48, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..4096\n");
         return 2;
     }
     if (o.concurrency > 1) {
@@ -2123,6 +2123,12 @@ int main(int argc, char** argv) {
     // the wrong accounting for c8+/128K planning.  Account the replicas here (+416 MiB at c5; c1 keeps
     // the old reservation).
     const int64_t kDrafterMib = 1000 + (int64_t) std::max(0, o.concurrency - 1) * 104;
+    // STRATA_SLOT_LAZY (lane alloc-empty; read once here so every sizing site shares one value): per-slot
+    // resources are created at a slot's first admission, so the per-slot margin keeps only max(2, N-3)
+    // slots' worth and the rest is credited to the expert caches.  LANE m1m2 (M1): before this change only
+    // the CUDA0 auto count used the credit while every later stage's stage_room kept the full N*256 term,
+    // so the two cards budgeted the same deferred slots differently.  One formula, both stages.
+    const bool lazy_slots = [] { const char* v = std::getenv("STRATA_SLOT_LAZY"); return v != nullptr && std::atoi(v) != 0; }();
     auto stage_room = [&](int dev, bool later, bool drafter) -> int64_t {
         const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
@@ -2132,8 +2138,15 @@ int main(int argc, char** argv) {
         // C4 integration (design IN-3 / M6): the later stages run their own batch coordinators and
         // per-stage graph caches after this sizing; mirror the CUDA0 concurrency term so their caches
         // leave the same room the single-GPU path reserves (else run_batch refuses loudly at first use).
-        const int64_t concurrency_mib = (later && o.concurrency > 1) ? 512 + (int64_t) o.concurrency * 256 +
-            (int64_t) o.batch_rows * 8 + (int64_t) o.batch_graphs * 16 : 0;
+        const int64_t conc_slot_mib = (int64_t) (lazy_slots ? std::max(2, o.concurrency - 2) : o.concurrency) * 256;
+        // Lane m1m2 / lazy-enabler: later stages host independent per-slot drafter replicas (104 MiB/slot),
+        // concurrent prompt workspace (~1986 MiB at chunk 2048), and batch graph caches.
+        // Account for them here so the later stage leaves full room for batch verify rounds.
+        const int64_t extra_drafters_mib = (later && o.concurrency > 1) ? (int64_t) (o.concurrency - 1) * 104 : 0;
+        const int64_t conc_ws_mib = (later && o.concurrency > 1 && o.concurrent_prefill > 0) ? 1986 : 0;
+        const int64_t conc_graphs_mib = (later && o.concurrency > 1) ? (int64_t) std::max(8, o.batch_graphs) * 32 : 0;
+        const int64_t concurrency_mib = (later && o.concurrency > 1) ? 512 + conc_slot_mib + extra_drafters_mib +
+            conc_ws_mib + conc_graphs_mib + (int64_t) o.batch_rows * 8 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib : 0) +
                                  (drafter ? kDrafterMib : 0) + concurrency_mib) << 20;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
@@ -2523,8 +2536,7 @@ int main(int argc, char** argv) {
         // share to the expert cache (the sessions themselves are carved from the caches' tails; the fixed
         // items - graph metadata, the first slots' verifiers, the draft head - stay covered at full
         // occupancy: measured need 7x(104+149)+890 = 2661 MiB against 2844 MiB reserved at c8).
-        const bool lazy_slots = [] { const char* v = std::getenv("STRATA_SLOT_LAZY"); return v != nullptr && std::atoi(v) != 0; }();
-        const int64_t conc_slot_mib = (int64_t) (lazy_slots ? std::max(2, o.concurrency - 3) : o.concurrency) * 256;
+        const int64_t conc_slot_mib = (int64_t) (lazy_slots ? std::max(2, o.concurrency - 2) : o.concurrency) * 256;   // lazy_slots: read once above stage_room
         const int64_t concurrent_mib = concurrent ? 512 + conc_slot_mib +
             (int64_t) o.batch_rows * 8 + (int64_t) o.batch_graphs * 16 : 0;
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
@@ -2535,9 +2547,15 @@ int main(int argc, char** argv) {
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
-        std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
-                             "draft head) -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
+        // LANE m1m2 (M1 telemetry; memory-lane fidelity item): print the FULL reserve this sizing actually
+        // credited - the old line showed only the base and a by-hand subtraction was needed to reproduce a
+        // boot.  (The concurrent prompt workspace is named separately, below, for every cache path.)
+        std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %lld MiB reserved "
+                             "(base %d + concurrent %lld + prefill %lld) (+%lld MiB for the draft head) -> %d slots\n",
+                     (double) free_b / 1073741824.0,
+                     (long long) ((int64_t) o.vram_reserve_mib + concurrent_mib + prefill_mib),
+                     o.vram_reserve_mib, (long long) concurrent_mib, (long long) prefill_mib,
+                     (long long) (mtp_bind >> 20), o.expert_cache);
         if (o.expert_cache == 0)   // the verify window cannot start without it (#174): say what makes room
             std::fprintf(stderr, "strata generate: no VRAM is left for the expert cache: lower --max-context, use "
                                  "--kv k8v4, run images on the CPU, or close other programs that use the GPU\n");
@@ -2557,6 +2575,18 @@ int main(int argc, char** argv) {
             o.expert_cache = (int) fit;
         }
     }
+    // LANE m1m2 (M1 telemetry): the concurrent prompt workspace is allocated per stage in prepare() -
+    // BEFORE any cache sizing - so every free figure above already nets it out and no reserve formula may
+    // add it again (adding it would silently shrink the caches by the workspace twice).  Name it here so
+    // a boot's residency can be read against the whole concurrent allocation; W-scaling it is the widest
+    // single boot-time term after the sessions (1.21 GiB/stage at W=2048, c1gap's measured width cost).
+    if (concurrent) {
+        const int64_t ws_bytes = concurrent->prompt_workspace_bytes();
+        if (ws_bytes > 0)
+            std::fprintf(stderr, "strata generate: concurrent prompt workspace: %lld MiB across %zu stage(s) "
+                                 "(allocated in prepare(), before this sizing; already netted out of free)\n",
+                         (long long) (ws_bytes >> 20), serve_stages.size());
+    }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
     std::vector<int64_t> sized_slots;
@@ -2569,15 +2599,18 @@ int main(int argc, char** argv) {
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         // `auto` sized `o.expert_cache` slots of the LARGEST blob against free-minus-reserve, so that
-        // reserve holds only while the count does not grow: with per-pair sizes the same byte budget
-        // packs MORE pairs (the ladder-B boot packed 7921 into 6082 slots' budget; the fill left 683 MiB
-        // free, below the 700 MiB the batch path needs, and every batch round refused).  Under `auto` the
-        // count is capped at min(slots, profile size): per-pair blobs pack MORE pairs into the same
-        // byte budget (the ladder-B boot packed 7921 into 6082 slots' budget; the fill left 683 MiB
-        // free, below the 700 MiB the batch path needs, and every batch round refused), so an
-        // explicit --expert-cache N keeps at most N pairs too.
+        // reserve holds only while the count does not grow: per-pair blobs pack MORE pairs into the same
+        // byte budget (the ladder-B boot packed 7921 into 6082 slots' budget and spent into the batch
+        // path's floor).  The byte `cap` below - min of the auto count's own byte grant and live room - is
+        // the operative guard against that class; a count clamp is not.
+        // LANE m1m2 (M1; memory-lane R1 code arm): under `auto` the count was only the uniform-blob
+        // estimate of the byte budget, and capping the fill at it left ~3.7 GiB of that budget unspent at
+        // the fleet shape (measured 5,429 of a 6,144-pair grant; 3,769.9 MiB slack).  Auto now fills to
+        // the BYTE budget (still bounded by `cap`, which is reserve-aware); an explicit --expert-cache N
+        // keeps its count contract exactly.
         const size_t pair_cap =
-            (size_t) std::min<int64_t>((int64_t) o.expert_cache, (int64_t) profile.size());
+            auto_cache ? profile.size()
+                       : (size_t) std::min<int64_t>((int64_t) o.expert_cache, (int64_t) profile.size());
         for (const auto& pr : profile) {
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (sized_slots.size() >= pair_cap) break;
