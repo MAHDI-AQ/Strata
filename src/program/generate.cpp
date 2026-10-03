@@ -2128,6 +2128,7 @@ int main(int argc, char** argv) {
     // slots' worth and the rest is credited to the expert caches.  LANE m1m2 (M1): before this change only
     // the CUDA0 auto count used the credit while every later stage's stage_room kept the full N*256 term,
     // so the two cards budgeted the same deferred slots differently.  One formula, both stages.
+    std::unique_ptr<strata::program::ConcurrentServe> concurrent;
     const bool lazy_slots = [] { const char* v = std::getenv("STRATA_SLOT_LAZY"); return v != nullptr && std::atoi(v) != 0; }();
     auto stage_room = [&](int dev, bool later, bool drafter) -> int64_t {
         const strata::core::OnDevice on(dev);
@@ -2138,12 +2139,10 @@ int main(int argc, char** argv) {
         // C4 integration (design IN-3 / M6): the later stages run their own batch coordinators and
         // per-stage graph caches after this sizing; mirror the CUDA0 concurrency term so their caches
         // leave the same room the single-GPU path reserves (else run_batch refuses loudly at first use).
-        const int64_t conc_slot_mib = (int64_t) (lazy_slots ? std::max(2, o.concurrency - 2) : o.concurrency) * 256;
-        // Lane m1m2 / lazy-enabler: later stages host independent per-slot drafter replicas (104 MiB/slot),
-        // concurrent prompt workspace (~1986 MiB at chunk 2048), and batch graph caches.
-        // Account for them here so the later stage leaves full room for batch verify rounds.
-        const int64_t extra_drafters_mib = (later && o.concurrency > 1) ? (int64_t) (o.concurrency - 1) * 104 : 0;
-        const int64_t conc_ws_mib = (later && o.concurrency > 1 && o.concurrent_prefill > 0) ? 1986 : 0;
+        // If concurrent->prepare() already ran, prompt workspace, drafters, and sessions are already allocated in fb.
+        const int64_t conc_slot_mib = (concurrent == nullptr) ? (int64_t) (lazy_slots ? std::max(2, o.concurrency - 2) : o.concurrency) * 256 : 0;
+        const int64_t extra_drafters_mib = (later && o.concurrency > 1 && concurrent == nullptr) ? (int64_t) (o.concurrency - 1) * 104 : 0;
+        const int64_t conc_ws_mib = (later && o.concurrency > 1 && o.concurrent_prefill > 0 && concurrent == nullptr) ? 1986 : 0;
         const int64_t conc_graphs_mib = (later && o.concurrency > 1) ? (int64_t) std::max(8, o.batch_graphs) * 32 : 0;
         const int64_t concurrency_mib = (later && o.concurrency > 1) ? 512 + conc_slot_mib + extra_drafters_mib +
             conc_ws_mib + conc_graphs_mib + (int64_t) o.batch_rows * 8 : 0;
@@ -2380,7 +2379,6 @@ int main(int argc, char** argv) {
         serve_stages[1].le = g.n_layers;
     }
 
-    std::unique_ptr<strata::program::ConcurrentServe> concurrent;
     if (o.concurrency > 1) {
         strata::program::ConcurrentConfig config;
         config.requests = o.concurrency; config.rows = o.batch_rows; config.depth = o.batch_policy == "depth";
@@ -2536,7 +2534,8 @@ int main(int argc, char** argv) {
         // share to the expert cache (the sessions themselves are carved from the caches' tails; the fixed
         // items - graph metadata, the first slots' verifiers, the draft head - stay covered at full
         // occupancy: measured need 7x(104+149)+890 = 2661 MiB against 2844 MiB reserved at c8).
-        const int64_t conc_slot_mib = (int64_t) (lazy_slots ? std::max(2, o.concurrency - 2) : o.concurrency) * 256;   // lazy_slots: read once above stage_room
+        // sessions are already allocated in prepare() before this sizing:
+        const int64_t conc_slot_mib = 0;
         const int64_t concurrent_mib = concurrent ? 512 + conc_slot_mib +
             (int64_t) o.batch_rows * 8 + (int64_t) o.batch_graphs * 16 : 0;
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
@@ -2596,7 +2595,8 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
-        size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
+        const size_t reserve_margin = concurrent ? ((size_t) o.vram_reserve_mib + 160) << 20 : (size_t) o.vram_reserve_mib << 20;
+        size_t free_room = free_b > reserve_margin ? free_b - reserve_margin : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         // `auto` sized `o.expert_cache` slots of the LARGEST blob against free-minus-reserve, so that
         // reserve holds only while the count does not grow: per-pair blobs pack MORE pairs into the same

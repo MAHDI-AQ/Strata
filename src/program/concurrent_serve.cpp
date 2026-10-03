@@ -452,7 +452,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         const core::OnDevice on(sg.device);
         const bool last = st + 1 == m.stages.size();
         auto& b = batch[st];
-        b.set_batch_cache(c.graph_cache, c.reserve_mib);
+        b.set_batch_cache(c.graph_cache, 128);
         b.set_batch_parallel(c.parallel_batch);
         b.set_stage_pingpong(sg.lb, last ? -1 : sg.le,
                              st == 0 ? nullptr : m.hand[st - 1].dev[0], last ? nullptr : m.hand[st].dev[0],
@@ -555,10 +555,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         std::fprintf(stderr, "strata concurrent profile: rounds=%lld tokens=%lld rows=%lld windows=%lld "
                      "offered=%lld accepted=%lld target_ms=%.1f "
                      "draft_ms=%.1f commit_ms=%.1f adapt_ms=%.1f prefill_ms=%.1f "
-                     "target_wait_ms=%.1f target_pool_ms=%.1f target_host_ms=%.1f\n",
+                     "target_wait_ms=%.1f target_pool_ms=%.1f target_host_ms=%.1f "
+                     "dispatch_plan_ms=%.1f actq_ms=%.1f jobs_ms=%.1f run_ms=%.1f\n",
                      (long long) rounds, (long long) produced, (long long) target_rows, (long long) windows_served,
                      (long long) offered_total, (long long) accepted_total, target_ms,
-                     draft_ms, commit_ms, adapt_ms, prefill_ms.load(), wait, pool_ms, host);
+                     draft_ms, commit_ms, adapt_ms, prefill_ms.load(), wait, pool_ms, host,
+                     dispatch.ms_plan, dispatch.ms_actq, dispatch.ms_jobs, dispatch.ms_run);
         std::fflush(stderr);
         std::fprintf(stderr, "strata concurrent detail: captures=%lld capture_ms=%.1f gpu_pre_ms=%.1f "
                      "gpu_experts_ms=%.1f gpu_post_ms=%.1f gpu_head_ms=%.1f\n",
