@@ -940,6 +940,7 @@ std::string Verifier::profile_report() {
 
 bool Verifier::capture(int T, std::string& err) {
     if (exec_[parity_][T] != nullptr) return true;
+    const OnDevice on_device(device_);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;
@@ -1003,6 +1004,7 @@ bool Verifier::capture(int T, std::string& err) {
 
 bool Verifier::capture_commit(std::string& err) {
     if (commit_exec_ != nullptr) return true;
+    const OnDevice on_device(device_);
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
