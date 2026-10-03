@@ -1716,11 +1716,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 // would point the in-flight pass's pool at the wrong sink (empty-plan fallback ->
                 // silently wrong tokens).
                 if (overlap && st > 0) continue;
-                stage_plans[st] = windows.size() == 1 ? win_slots.front()->stages[st].verify.plan_sink()
-                                                      : batch[st].plan_sink();
+                stage_plans[st] = batch[st].plan_sink();
             }
-            dispatch.plan = windows.size() == 1 ? win_slots.front()->stages[0].verify.plan_sink()
-                                                : batch[0].plan_sink();
+            dispatch.plan = batch[0].plan_sink();
             // N1 (C2 acceptance kit, env-gated, default off): the stale-sink negative control -
             // see n1_poison_plan_sinks.  The poison consumes exactly what the refresh above set,
             // so it hits single-window AND batch rounds; the launch-site call below re-applies it
@@ -1730,17 +1728,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
 
             if (!overlap) {
                 Unit u;   // the serial path: one unit, run to completion (the original loop's shape)
-                u.single = windows.size() == 1;
+                u.single = false;
+                u.windows = windows;
                 u.ready = ready;
                 u.t_start = start;
-            if (windows.size() == 1) {
-                const auto& w = windows.front();
-                ok = win_slots.front()->stages[0].verify.run(w.count, w.tokens, w.position, pool, user, w.output, err);
-            } else {
-                // C2 landed: run_batch chains through the stages itself (A1 contiguity, A5 continuation).
-                // The coordinators are chained and share the per-boundary hand buffers (C4 + verify.cpp A2).
+                // Unified: batch coordinator executes all rounds (single and multi-window) with unified
+                // graph caching, device planning, and multi-stage chaining.
                 ok = batch[0].run_batch(windows, pool, user, err);
-            }
             if (!ok || dispatch.failed) {
                 if (dispatch.failed) err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
                 // K1b: a refused batch capture (free VRAM below the reserve) fails THIS round, not
@@ -1780,23 +1774,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 // and run the previous unit's epilogue.  U_i's stage-1 pass is launched at the safe
                 // point below and runs during the NEXT iteration - that is the overlap.
                 Unit u;
-                u.single = windows.size() == 1;
+                u.single = false;
                 u.parity = unit_parity;
                 u.ready = ready;
                 u.t_start = Clock::now();
-                if (u.single) {
-                    Impl::Slot* s0 = win_slots.front();
-                    u.slot = s0;
-                    u.T = s0->count;
-                    u.tokens = s0->window;
-                    u.pos0 = s0->position;
-                    u.out = s0->output;
-                } else {
-                    u.windows = windows;
-                    u.chain.reserve(windows.size());
-                    for (const auto& w : windows)
-                        u.chain.push_back({w.verifier->next(), w.count, w.tokens, w.position, w.output});
-                }
+                u.windows = windows;
+                u.chain.reserve(windows.size());
+                for (const auto& w : windows)
+                    u.chain.push_back({w.verifier->next(), w.count, w.tokens, w.position, w.output});
                 u.lane0 = unit_lane(u, 0);
                 u.lane1 = unit_lane(u, 1);
                 unit_parity_set(u, u.parity);
@@ -1807,8 +1792,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     err = "concurrency: the stage-overlap buffer gate failed";
                     return 1;
                 }
-                ok = u.single ? u.lane0->begin_pass_window(u.T, u.tokens, u.pos0, pool, user, ev0[u.parity], err)
-                              : u.lane0->begin_pass_batch(u.windows, pool, user, ev0[u.parity], err);
+                ok = u.lane0->begin_pass_batch(u.windows, pool, user, ev0[u.parity], err);
                 if (!ok) {
                     // LANE failclean: a capture refused for want of the VRAM reserve fails THIS round;
                     // any other failure keeps fail-stop.  The refused unit launched nothing, so the
@@ -1870,8 +1854,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     // later round reads split_drive.plan[st] - without this second application the
                     // top-of-round poison is overwritten here before any stage-1 dispatch sees it.
                     n1_poison_plan_sinks();
-                    ok = u.single ? u.lane1->begin_pass_window(u.T, u.tokens, u.pos0, pool, user, ev1[u.parity], err)
-                                  : u.lane1->begin_pass_batch(u.chain, pool, user, ev1[u.parity], err);
+                    ok = u.lane1->begin_pass_batch(u.chain, pool, user, ev1[u.parity], err);
                     if (!ok) {
                         // LANE failclean: the same refusal rule as the stage-0 launch above.  This
                         // unit's stage 0 completed (end_pass_batch above) without a commit, and the
