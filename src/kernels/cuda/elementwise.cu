@@ -302,13 +302,17 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
     if (n <= 0) return;
     int dev = -1;
     cudaGetDevice(&dev);
+    const cudaError_t pre = cudaGetLastError();
+    if (pre != cudaSuccess) {
+        std::fprintf(stderr, "copy_i32_from_mapped: PRE-EXISTING ERROR: %s (dev=%d stream=%p dst=%p src=%p n=%lld)\n",
+                     cudaGetErrorString(pre), dev, stream, (void*) dst, (const void*) src, (long long) n);
+    }
     const int blocks = (int) ((n + 127) / 128 < 64 ? (n + 127) / 128 : 64);
     copy_i32_from_mapped_kernel<<<blocks, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "copy_i32_from_mapped launch failed: %s (dst=%p src=%p n=%lld stream=%p dev=%d blocks=%d)\n",
-                     cudaGetErrorString(e), dst, src, (long long) n, stream, dev, blocks);
-        std::exit(1);
+    const cudaError_t post = cudaGetLastError();
+    if (post != cudaSuccess) {
+        std::fprintf(stderr, "copy_i32_from_mapped: LAUNCH ERROR: %s (dev=%d stream=%p dst=%p src=%p n=%lld)\n",
+                     cudaGetErrorString(post), dev, stream, (void*) dst, (const void*) src, (long long) n);
     }
 }
 
