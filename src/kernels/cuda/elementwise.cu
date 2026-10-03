@@ -300,11 +300,16 @@ __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const vol
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
-    // Small control arrays still use one block. Batched serving also uses this
-    // kernel for large device tensors: one block serialized those copies on one SM.
+    int dev = -1;
+    cudaGetDevice(&dev);
     const int blocks = (int) ((n + 127) / 128 < 64 ? (n + 127) / 128 : 64);
     copy_i32_from_mapped_kernel<<<blocks, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
-    check_launch("copy_i32_from_mapped");
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "copy_i32_from_mapped launch failed: %s (dst=%p src=%p n=%lld stream=%p dev=%d blocks=%d)\n",
+                     cudaGetErrorString(e), dst, src, (long long) n, stream, dev, blocks);
+        std::exit(1);
+    }
 }
 
 void doorbell_ring(uint32_t* d_seq, void* stream) {
