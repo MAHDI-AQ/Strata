@@ -16,6 +16,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -154,7 +155,14 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 fn = c.get("function", c)
                 args = fn.get("arguments")
                 if isinstance(args, str):               # the template requires a mapping, not a JSON string
-                    args = json.loads(args) if args.strip() else {}
+                    try:
+                        args = json.loads(args) if args.strip() else {}
+                    except Exception:
+                        try:
+                            import ast
+                            args = ast.literal_eval(args)
+                        except Exception:
+                            args = {"_raw": args}
                 calls.append({"function": {"name": fn.get("name"), "arguments": args or {}}})
             out["tool_calls"] = calls
         messages.append(out)
@@ -298,36 +306,107 @@ def call_end(text: str) -> int:
 
 
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
-    """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
-    when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
-    objects/arrays/numbers/booleans)."""
+    """Robust parser for tool calls: handles `<function=NAME>\n<parameter=P>\nVALUE\n</parameter>...</function>`,
+    raw JSON, markdown code-fenced JSON, and gracefully recovers from truncated parameters without crashing."""
     body = body.strip()
-    if not body.startswith("<function=") or ">" not in body:
-        raise ValueError("malformed tool call: " + body[:80])
-    name = body[len("<function="):body.index(">")]
-    rest = body[body.index(">") + 1:]
+    if body.startswith("```"):
+        lines = body.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        body = "\n".join(lines).strip()
+
+    # 1. JSON tool call recovery
+    if body.startswith("{") and body.endswith("}"):
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict):
+                if "name" in data and ("arguments" in data or "parameters" in data):
+                    return ToolCall(name=str(data["name"]), arguments=data.get("arguments") or data.get("parameters") or {})
+                if "function" in data and isinstance(data["function"], dict):
+                    fn = data["function"]
+                    return ToolCall(name=str(fn.get("name", "")), arguments=fn.get("arguments") or {})
+        except Exception:
+            pass
+
+    # 2. Extract function name
+    name = ""
+    rest = body
+    if "<function=" in body:
+        idx = body.find("<function=") + len("<function=")
+        gt = body.find(">", idx)
+        if gt > 0:
+            name = body[idx:gt].strip()
+            rest = body[gt + 1:]
+    elif "<function name=" in body:
+        m = re.search(r'<function\s+name=["\']?([^"\' >]+)["\']?', body)
+        if m:
+            name = m.group(1).strip()
+            gt = body.find(">", m.end())
+            if gt > 0:
+                rest = body[gt + 1:]
+    elif body.startswith("<function"):
+        gt = body.find(">")
+        if gt > 0:
+            name = body[:gt].replace("<function", "").strip(" =\"'")
+            rest = body[gt + 1:]
+
     props = ((schema or {}).get("parameters") or {}).get("properties") or {}
     args = {}
-    while "<parameter=" in rest:
-        rest = rest[rest.index("<parameter=") + len("<parameter="):]
-        pname = rest[:rest.index(">")]
-        rest = rest[rest.index(">") + 1:]
+
+    while "<parameter=" in rest or "<parameter name=" in rest:
+        tag_pos = rest.find("<parameter=")
+        if tag_pos >= 0:
+            rest = rest[tag_pos + len("<parameter="):]
+            gt = rest.find(">")
+            if gt < 0:
+                break
+            pname = rest[:gt].strip(" \"'")
+            rest = rest[gt + 1:]
+        else:
+            m = re.search(r'<parameter\s+name=["\']?([^"\' >]+)["\']?', rest)
+            if not m:
+                break
+            pname = m.group(1).strip()
+            gt = rest.find(">", m.end())
+            if gt < 0:
+                break
+            rest = rest[gt + 1:]
+
         end = param_end(rest, final=True)
-        value = rest[:end] if end >= 0 else rest
-        rest = rest[end + len(PARAM_END):] if end >= 0 else ""
+        if end >= 0:
+            value = rest[:end]
+            rest = rest[end + len(PARAM_END):]
+        else:
+            end_func = rest.find(FUNC_END)
+            if end_func >= 0:
+                value = rest[:end_func]
+                rest = rest[end_func:]
+            else:
+                value = rest
+                rest = ""
+
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
+
         declared = (props.get(pname) or {}).get("type")
         if declared == "string":
             args[pname] = value
         else:
             try:
                 args[pname] = json.loads(value)
-            except ValueError:
+            except Exception:
                 args[pname] = value
-    return ToolCall(name=name, arguments=args)
+
+    if not name and not args:
+        m = re.search(r'["\']name["\']\s*:\s*["\']([^"\']+)["\']', body)
+        if m:
+            name = m.group(1)
+
+    return ToolCall(name=name or "unknown_tool", arguments=args)
 
 
 class OutputParser:
@@ -471,6 +550,10 @@ class OutputParser:
         out: list[Event] = []
         while True:
             if self.state == "reasoning":
+                if self.buf.startswith("<think>\n"):
+                    self.buf = self.buf[len("<think>\n"):]
+                elif self.buf.startswith("<think>"):
+                    self.buf = self.buf[len("<think>"):]
                 i = self.buf.find(THINK_END)
                 if i < 0:
                     keep = self._hold(self.buf, (THINK_END,))
@@ -484,7 +567,7 @@ class OutputParser:
                 self.state, self.lead = "content", True
             elif self.state == "content":
                 if self.lead:                                   # newlines right after </think> or a call
-                    stripped = self.buf.lstrip("\n")
+                    stripped = self.buf.lstrip("\r\n \t")
                     if not stripped:
                         self.buf = ""
                         return out
@@ -518,8 +601,8 @@ class OutputParser:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
-                name = body.strip()[len("<function="):].split(">", 1)[0]
-                call = parse_tool_call(body, self.schemas.get(name))
+                name = body.strip().split("<function=", 1)[1].split(">", 1)[0].strip() if "<function=" in body else ""
+                call = parse_tool_call(body, self.schemas.get(name) if name else None)
                 if self.scall is not None:
                     call.id = self.scall.id
                 out.append(Event("tool_call", call=call))
@@ -527,15 +610,26 @@ class OutputParser:
                 self.state, self.lead = "content", True
 
     def finish(self) -> list[Event]:
-        """End of generation: flush whatever is held (an unterminated tool call is returned as content)."""
+        """End of generation: flush whatever is held."""
         out = []
-        if self.state == "call" and self.stream_tools and self.scall is not None:
-            out += self._scan()                 # the output ended inside a call that was already announced
-            out += self._close_scan()
-            out.append(Event("tool_call", call=self.scall))
-            self.buf = ""
-            self._reset_scan()
-            return out
+        if self.state == "call":
+            if self.stream_tools and self.scall is not None:
+                out += self._scan()
+                out += self._close_scan()
+                out.append(Event("tool_call", call=self.scall))
+                self.buf = ""
+                self._reset_scan()
+                return out
+            elif self.buf:
+                try:
+                    call = parse_tool_call(self.buf, self.schemas)
+                    if call and call.name != "unknown_tool":
+                        out.append(Event("tool_call", call=call))
+                        self.buf = ""
+                        self._reset_scan()
+                        return out
+                except Exception:
+                    pass
         if self.buf:
             kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf
