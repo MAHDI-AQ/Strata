@@ -166,6 +166,7 @@ def session_hint(ids) -> int:
 
 
 class StrataEngine:
+    multiplex: bool = False
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`. Legacy requests are serialized. A multiplex-capable engine instead accepts request-tagged
     `CGEN`/`CSTOP` commands; one reader routes tagged responses to independent bounded queues.
@@ -531,7 +532,7 @@ class StrataEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
-        if self.multiplex:
+        if getattr(self, "multiplex", False):
             yield from self._generate_multiplex(ids, max_new, sampling, cancel, embeddings)
             return
         self.progress = None
