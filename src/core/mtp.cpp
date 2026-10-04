@@ -318,6 +318,31 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
     }
     if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
+    // SM89 Ada Lovelace: Persistent L2 cache window for MTP drafter scratchpad & intermediate tensors
+    {
+        size_t max_persisting_l2 = 0;
+        const size_t target_window = 40ULL * 1024 * 1024; // 40 MiB
+        if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, target_window) == cudaSuccess) {
+            max_persisting_l2 = target_window;
+        } else {
+            cudaGetLastError();
+        }
+        if (max_persisting_l2 > 0 && arena_ && count.used > 0) {
+            cudaStreamAttrValue attr;
+            std::memset(&attr, 0, sizeof(attr));
+            attr.accessPolicyWindow.base_ptr = arena_;
+            attr.accessPolicyWindow.num_bytes = std::min<size_t>(count.used, max_persisting_l2);
+            attr.accessPolicyWindow.hitRatio = 1.0f;
+            attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+            attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+            if (cudaStreamSetAttribute(cs_, cudaStreamAttributeAccessPolicyWindow, &attr) == cudaSuccess) {
+                std::fprintf(stderr, "strata mtp: SM89 persistent L2 cache window enabled (%.1f MiB on cs)\n",
+                             (double) attr.accessPolicyWindow.num_bytes / 1048576.0);
+            } else {
+                cudaGetLastError();
+            }
+        }
+    }
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     if (shared_weights_) {
         std::fprintf(stderr, "strata mtp: shared immutable weights; %.0f MiB of independent state and buffers\n",
