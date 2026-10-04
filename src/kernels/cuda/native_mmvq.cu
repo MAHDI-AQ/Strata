@@ -151,6 +151,23 @@ __global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
     if (i % Q8K == 0) y[i / Q8K].ds = make_half2(d, sum);
 }
 
+__launch_bounds__(QUANT_THREADS, 1)
+__global__ void native_fused_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate,
+                                                         const float* __restrict__ up,
+                                                         Q81Block* __restrict__ y, int n_in) {
+    const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
+    if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
+    const float g = gate[i];
+    const float u = up[i];
+    const float xi = __fdividef(g, 1.0f + __expf(-g)) * u;
+    const float amax = warp_max(fabsf(xi));
+    const float sum = warp_sum(xi);
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    y[i / Q8K].qs[i % Q8K] = q;
+    if (i % Q8K == 0) y[i / Q8K].ds = make_half2(d, sum);
+}
+
 // Exact pinned vec_dot_q5_K_q8_1_impl_vmmq expression and integer dot order.
 __device__ __forceinline__ float q5_q8_dot_impl(
     const int* __restrict__ vl, const int* __restrict__ vh, const int* __restrict__ u,
@@ -1160,6 +1177,20 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
     native_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0,
                                  static_cast<cudaStream_t>(stream)>>>(x, static_cast<Q81Block*>(x_q8_1), n_total);
+    launch_check();
+}
+
+void native_fused_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    validate_pointer(gate);
+    validate_pointer(up);
+    validate_pointer(x_q8_1);
+    validate_stream(stream);
+    const int n_total = n_in * ncols;
+    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+    native_fused_swiglu_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0,
+                                              static_cast<cudaStream_t>(stream)>>>(
+        gate, up, static_cast<Q81Block*>(x_q8_1), n_total);
     launch_check();
 }
 
