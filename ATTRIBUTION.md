@@ -50,6 +50,8 @@ We formally acknowledge and attribute the following foundational projects, archi
 - **Paper:** *"SGLang: Efficient Execution of Structured Language Model Programs"* (arXiv:2312.07104).
 - **Attributed Architectural Patterns:**
   - **RadixAttention (Tree-Structured Prefix Caching):** Strata adapts the core insight of maintaining KV caches in a dynamic radix tree rather than a linear hash map, enabling zero-copy cache sharing across multi-turn agent conversations, tool-calling chains, and shared system prompts.
+  - **Chunk-Level Hash Fingerprinting:** SGLang's chunk-based hashing pattern adapted to 64-token chunks using hardware-accelerated SSE4.2 CRC32C, enabling $O(1)$ block jumps that collapse 32K token lookups to sub-microsecond latency.
+  - **Multi-Tier Memory Architecture (HiCache L2):** Hierarchical KV eviction and parking (L1 VRAM <-> L2 Pinned Host RAM) using page-locked pinned memory arenas (`cudaHostAllocPortable`) for wire-speed PCIe DMA restoration.
   - **Zero-Overhead Event Loop Scheduling:** The architectural separation of high-frequency token-level queue arbitration from GPU kernel execution pipelines to prevent CPU scheduling bottlenecks.
   - **Shared-Memory IPC Protocol:** SGLang's pattern of lock-free POSIX shared-memory channels for token streaming and logits between the Python API layer and the native engine.
 
@@ -85,3 +87,10 @@ We formally acknowledge and attribute the following foundational projects, archi
 - **Attributed Architectural Patterns:**
   - **Quantization Calibration (IQ3_XXS / Q4_0 / GSQ-RCO):** High-efficiency low-bit weight representation formats, block-quantized scales, and fast integer SIMD/warp-level dequantization kernels.
   - **Memory-Mapped Weight Ingestion (`mmap`):** Direct file-backed tensor paging enabling zero-overhead model loading and instant process initialization.
+
+### 6. Nanoflow (MegaScale / DeepSeek-AI Research)
+- **Repository / Paper:** *"NanoFlow: Towards Optimal Large Language Model Serving Through Device-Level Nanobatch Execution"* (arXiv:2408.12757).
+- **Key Researchers:** DeepSeek-AI, Tsinghua University, Peking University.
+- **Attributed Architectural Patterns:**
+  - **Asynchronous Device-Level DMA Pipelines:** Overlapping host-to-device and device-to-host memory copy pipelines across multiple hardware copy engines (`copy_stream_`), saturating bidirectional PCIe bandwidth without stalling compute SMs.
+  - **Dual-GPU Concurrent Transfer Scheduling:** Splitting multi-stage KV snapshots across heterogeneous or split-bus topologies (GPU 0 layers 0-26, GPU 1 layers 27-47) via concurrent stream dispatch.

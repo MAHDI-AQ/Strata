@@ -166,6 +166,7 @@ RadixTree::RadixTree(size_t max_cached_snapshots, size_t max_host_snapshots)
 RadixTree::~RadixTree() = default;
 
 RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
     RadixMatch best{nullptr, 0};
     std::shared_ptr<RadixNode> curr = root_;
     size_t matched_len = 0;
@@ -177,10 +178,21 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
 
         auto child = it->second;
         const auto& edge = child->edge_tokens;
+        const auto& chunk_hashes = child->edge_chunk_hashes;
         size_t match_edge = 0;
-        while (match_edge < edge.size() &&
-               matched_len + match_edge < n &&
-               edge[match_edge] == tokens[matched_len + match_edge]) {
+        const size_t max_comp = std::min(edge.size(), n - matched_len);
+        const size_t num_chunks = max_comp / kRadixChunkTokens;
+
+        // Task 2.1: 64-token chunk hash comparison
+        size_t c = 0;
+        for (; c < num_chunks && c < chunk_hashes.size(); ++c) {
+            const uint64_t q_hash = compute_token_chunk_hash(tokens + matched_len + c * kRadixChunkTokens, kRadixChunkTokens);
+            if (chunk_hashes[c] != q_hash) break;
+            match_edge += kRadixChunkTokens;
+        }
+
+        // Remainder scalar comparison
+        while (match_edge < max_comp && edge[match_edge] == tokens[matched_len + match_edge]) {
             ++match_edge;
         }
 
@@ -198,6 +210,7 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
 }
 
 RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
     RadixMatch best{nullptr, 0};
     std::shared_ptr<RadixNode> curr = root_;
     size_t matched_len = 0;
@@ -209,10 +222,21 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
 
         auto child = it->second;
         const auto& edge = child->edge_tokens;
+        const auto& chunk_hashes = child->edge_chunk_hashes;
         size_t match_edge = 0;
-        while (match_edge < edge.size() &&
-               matched_len + match_edge < n &&
-               (int64_t) edge[match_edge] == tokens[matched_len + match_edge]) {
+        const size_t max_comp = std::min(edge.size(), n - matched_len);
+        const size_t num_chunks = max_comp / kRadixChunkTokens;
+
+        // Task 2.1: 64-token chunk hash comparison
+        size_t c = 0;
+        for (; c < num_chunks && c < chunk_hashes.size(); ++c) {
+            const uint64_t q_hash = compute_token_chunk_hash(tokens + matched_len + c * kRadixChunkTokens, kRadixChunkTokens);
+            if (chunk_hashes[c] != q_hash) break;
+            match_edge += kRadixChunkTokens;
+        }
+
+        // Remainder scalar comparison
+        while (match_edge < max_comp && (int64_t) edge[match_edge] == tokens[matched_len + match_edge]) {
             ++match_edge;
         }
 
@@ -244,6 +268,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
         return nullptr;
     }
 
+    std::unique_lock<std::shared_mutex> lock(rw_lock_);
     std::shared_ptr<RadixNode> curr = root_;
     size_t matched_len = 0;
 
@@ -255,6 +280,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             new_node->id = next_node_id_++;
             new_node->prefix_len = (int64_t) prefix_len;
             new_node->edge_tokens.assign(tokens + matched_len, tokens + prefix_len);
+            new_node->update_chunk_hashes();
             new_node->parent = curr;
             new_node->last_accessed = std::chrono::steady_clock::now();
             curr->children[next_tok] = new_node;
@@ -280,10 +306,12 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             split_node->id = next_node_id_++;
             split_node->prefix_len = curr->prefix_len + (int64_t) match_edge;
             split_node->edge_tokens.assign(edge.begin(), edge.begin() + match_edge);
+            split_node->update_chunk_hashes();
             split_node->parent = curr;
             split_node->last_accessed = std::chrono::steady_clock::now();
 
             child->edge_tokens.erase(child->edge_tokens.begin(), child->edge_tokens.begin() + match_edge);
+            child->update_chunk_hashes();
             child->parent = split_node;
             split_node->children[child->edge_tokens[0]] = child;
 
@@ -299,6 +327,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
                 new_node->id = next_node_id_++;
                 new_node->prefix_len = (int64_t) prefix_len;
                 new_node->edge_tokens.assign(tokens + matched_len, tokens + prefix_len);
+                new_node->update_chunk_hashes();
                 new_node->parent = split_node;
                 new_node->last_accessed = std::chrono::steady_clock::now();
                 split_node->children[tokens[matched_len]] = new_node;
@@ -439,7 +468,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             cudaStreamSynchronize((cudaStream_t) streams[st]);
         }
         ++cached_snapshots_;
-        evict_lru(max_cached_snapshots_);
+        evict_lru_locked(max_cached_snapshots_);
     }
     return curr;
 }
@@ -461,6 +490,7 @@ bool RadixTree::fork_to_session(
     const std::vector<void*>& streams,
     std::string& err) {
 
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
     if (!node || !node->has_snapshot()) {
         err = "radix_fork: node has no snapshot";
         return false;
@@ -625,6 +655,11 @@ void RadixTree::collect_unreferenced_leaves(
 }
 
 size_t RadixTree::evict_lru(size_t max_snapshots, size_t min_free_vram_mib) {
+    std::unique_lock<std::shared_mutex> lock(rw_lock_);
+    return evict_lru_locked(max_snapshots, min_free_vram_mib);
+}
+
+size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mib) {
     size_t evicted = 0;
     auto should_evict = [&]() -> bool {
         if (cached_snapshots_ > max_snapshots) return true;

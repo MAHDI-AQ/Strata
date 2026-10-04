@@ -12,8 +12,88 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <shared_mutex>
+#include <mutex>
+#include <atomic>
+
+#if defined(__SSE4_2__)
+#include <nmmintrin.h>
+#endif
 
 namespace strata::core {
+
+static constexpr size_t kRadixChunkTokens = 64;
+
+inline uint64_t compute_token_chunk_hash(const int32_t* tokens, size_t count) {
+    uint64_t h1 = 0xFFFFFFFF53545241ULL;
+    uint64_t h2 = 0xCBF29CE484222325ULL;
+    for (size_t i = 0; i < count; ++i) {
+#if defined(__SSE4_2__)
+        h1 = _mm_crc32_u64(h1, static_cast<uint32_t>(tokens[i]));
+#else
+        h1 = (h1 ^ static_cast<uint32_t>(tokens[i])) * 1099511628211ULL;
+#endif
+        h2 = (h2 * 31) + static_cast<uint32_t>(tokens[i]);
+    }
+    return h1 ^ ((h2 << 32) | (h2 >> 32));
+}
+
+inline uint64_t compute_token_chunk_hash(const int64_t* tokens, size_t count) {
+    uint64_t h1 = 0xFFFFFFFF53545241ULL;
+    uint64_t h2 = 0xCBF29CE484222325ULL;
+    for (size_t i = 0; i < count; ++i) {
+#if defined(__SSE4_2__)
+        h1 = _mm_crc32_u64(h1, static_cast<uint32_t>(tokens[i]));
+#else
+        h1 = (h1 ^ static_cast<uint32_t>(tokens[i])) * 1099511628211ULL;
+#endif
+        h2 = (h2 * 31) + static_cast<uint32_t>(tokens[i]);
+    }
+    return h1 ^ ((h2 << 32) | (h2 >> 32));
+}
+
+struct PinnedBuffer {
+    void* ptr_ = nullptr;
+    size_t size_ = 0;
+
+    PinnedBuffer() = default;
+    explicit PinnedBuffer(size_t bytes) { allocate(bytes); }
+    ~PinnedBuffer() { free(); }
+
+    void allocate(size_t bytes) {
+        if (bytes == size_ && ptr_) return;
+        free();
+        if (bytes > 0) {
+            cudaHostAlloc(&ptr_, bytes, cudaHostAllocPortable);
+            size_ = bytes;
+        }
+    }
+    void resize(size_t bytes) { allocate(bytes); }
+    void free() {
+        if (ptr_) {
+            cudaFreeHost(ptr_);
+            ptr_ = nullptr;
+            size_ = 0;
+        }
+    }
+    PinnedBuffer(const PinnedBuffer&) = delete;
+    PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+    PinnedBuffer(PinnedBuffer&& o) noexcept : ptr_(o.ptr_), size_(o.size_) {
+        o.ptr_ = nullptr; o.size_ = 0;
+    }
+    PinnedBuffer& operator=(PinnedBuffer&& o) noexcept {
+        if (this != &o) {
+            free();
+            ptr_ = o.ptr_; size_ = o.size_;
+            o.ptr_ = nullptr; o.size_ = 0;
+        }
+        return *this;
+    }
+    uint8_t* data() noexcept { return static_cast<uint8_t*>(ptr_); }
+    const uint8_t* data() const noexcept { return static_cast<const uint8_t*>(ptr_); }
+    size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return ptr_ == nullptr || size_ == 0; }
+};
 
 struct RadixQsaSlice {
     void* k_q = nullptr;
@@ -57,24 +137,24 @@ struct RadixStageSnapshot {
     void free_device();
 };
 
-// HiCache L2 Tier: Host-RAM parking structures for agent session snapshots
+// HiCache L2 Tier: Host-RAM parking structures with zero-copy pinned DMA memory
 struct RadixQsaHostSlice {
-    std::vector<uint8_t> k_q;
-    std::vector<uint8_t> v_q4;
-    std::vector<uint8_t> k_scale;
-    std::vector<uint8_t> v_scale;
-    std::vector<uint8_t> idx_tail;
-    std::vector<uint8_t> idx_dead;
-    std::vector<uint8_t> idx_pooled;
+    PinnedBuffer k_q;
+    PinnedBuffer v_q4;
+    PinnedBuffer k_scale;
+    PinnedBuffer v_scale;
+    PinnedBuffer idx_tail;
+    PinnedBuffer idx_dead;
+    PinnedBuffer idx_pooled;
     int32_t idx_block_pos_val = 0;
     bool has_idx_block_pos = false;
 };
 
 struct RadixStageHostSnapshot {
     int device = -1;
-    std::vector<uint8_t> gdn_data;
-    std::vector<uint8_t> ple_data;
-    std::vector<uint8_t> R_data;
+    PinnedBuffer gdn_data;
+    PinnedBuffer ple_data;
+    PinnedBuffer R_data;
     int32_t ple_prev_saved[2] = {-1, -1};
     int32_t ple_token_saved = -1;
     int64_t qsa_ord0 = 0;
@@ -86,7 +166,8 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
     int64_t id = 0;
     int64_t prefix_len = 0;
     std::vector<int32_t> edge_tokens;
-    int ref_count = 0;
+    std::vector<uint64_t> edge_chunk_hashes;
+    std::atomic<int> ref_count{0};
     std::chrono::steady_clock::time_point last_accessed;
 
     std::weak_ptr<RadixNode> parent;
@@ -95,6 +176,16 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
     std::vector<RadixStageSnapshot> stage_snapshots;
     std::vector<RadixStageHostSnapshot> stage_host_snapshots;
     bool is_host_parked = false;
+
+    void update_chunk_hashes() {
+        edge_chunk_hashes.clear();
+        const size_t n_chunks = edge_tokens.size() / kRadixChunkTokens;
+        edge_chunk_hashes.reserve(n_chunks);
+        for (size_t c = 0; c < n_chunks; ++c) {
+            edge_chunk_hashes.push_back(
+                compute_token_chunk_hash(edge_tokens.data() + c * kRadixChunkTokens, kRadixChunkTokens));
+        }
+    }
 
     bool has_device_snapshot() const {
         return !stage_snapshots.empty() && stage_snapshots[0].gdn_saved != nullptr;
@@ -165,12 +256,14 @@ public:
         std::string& err);
 
     size_t evict_lru(size_t max_snapshots, size_t min_free_vram_mib = 0);
+    size_t evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mib = 0);
 
     size_t cached_snapshot_count() const { return cached_snapshots_; }
     size_t cached_host_snapshot_count() const { return cached_host_snapshots_; }
     size_t total_nodes() const { return node_count_; }
 
 private:
+    mutable std::shared_mutex rw_lock_;
     std::shared_ptr<RadixNode> root_;
     size_t max_cached_snapshots_ = 4;
     size_t max_host_snapshots_ = 64;

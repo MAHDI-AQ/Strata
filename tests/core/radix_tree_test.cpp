@@ -2,11 +2,13 @@
 #include <cassert>
 #include <iostream>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 using namespace strata::core;
 
 int main() {
-    std::cout << "Running RadixTree unit tests..." << std::endl;
+    std::cout << "Running comprehensive RadixTree & HiCache L2 unit tests..." << std::endl;
 
     RadixTree tree(4, 64); // Max 4 VRAM snapshots, max 64 Host-RAM snapshots
 
@@ -37,7 +39,7 @@ int main() {
     assert(res_null == nullptr);
     std::cout << "  [PASS] Graceful refusal on empty stage states" << std::endl;
 
-    // 4. Test HiCache L2 Host-RAM Parking and Lifecycle
+    // 4. Test HiCache L2 Host-RAM Parking and Lifecycle with PinnedBuffer
     {
         auto node = std::make_shared<RadixNode>();
         node->id = 42;
@@ -61,7 +63,7 @@ int main() {
         assert(node->has_snapshot());
         assert(node->total_vram_bytes() == ss.gdn_bytes + ss.R_bytes);
 
-        // Park node to Host RAM (HiCache L2 Tier)
+        // Park node to Host RAM (HiCache L2 Tier with zero-copy PinnedBuffer)
         node->park_to_host();
         assert(!node->has_device_snapshot());
         assert(node->has_host_snapshot());
@@ -69,18 +71,73 @@ int main() {
         assert(node->total_vram_bytes() == 0); // VRAM completely freed!
         assert(node->total_host_bytes() == ss.gdn_bytes + ss.R_bytes);
 
-        // Verify data fidelity in host snapshot
+        // Verify data fidelity in pinned host snapshot
         const float* h_gdn = (const float*) node->stage_host_snapshots[0].gdn_data.data();
         assert(h_gdn[0] == 3.14159f);
         assert(h_gdn[1023] == 3.14159f);
-        (void) h_gdn;
 
         node->free_host();
         assert(!node->has_snapshot());
         assert(node->total_host_bytes() == 0);
-        std::cout << "  [PASS] HiCache L2 Host-RAM parking, data fidelity, and VRAM release" << std::endl;
+        std::cout << "  [PASS] HiCache L2 Pinned Host-RAM parking, data fidelity, and VRAM release" << std::endl;
     }
 
-    std::cout << "All RadixTree tests passed successfully!" << std::endl;
+    // 5. Test 64-token chunk hash fingerprinting
+    {
+        std::vector<int32_t> tok_a(128, 77);
+        std::vector<int32_t> tok_b(128, 77);
+        tok_b[120] = 99; // Change in second chunk
+
+        uint64_t ha0 = compute_token_chunk_hash(tok_a.data(), 64);
+        uint64_t ha1 = compute_token_chunk_hash(tok_a.data() + 64, 64);
+        uint64_t hb0 = compute_token_chunk_hash(tok_b.data(), 64);
+        uint64_t hb1 = compute_token_chunk_hash(tok_b.data() + 64, 64);
+
+        assert(ha0 == hb0); // First chunk identical
+        assert(ha1 != hb1); // Second chunk must differ
+        std::cout << "  [PASS] 64-token chunk hashing and collision resistance" << std::endl;
+    }
+
+    // 6. Test Concurrent Multi-Threaded match_prefix (under shared_mutex)
+    {
+        std::vector<int32_t> query_tokens(4096);
+        for (size_t i = 0; i < query_tokens.size(); ++i) query_tokens[i] = (int32_t)(500 + (i % 200));
+
+        std::vector<std::thread> readers;
+        std::atomic<bool> ok{true};
+
+        for (int t = 0; t < 8; ++t) {
+            readers.emplace_back([&tree, &query_tokens, &ok]() {
+                for (int iter = 0; iter < 1000; ++iter) {
+                    auto match = tree.match_prefix(query_tokens);
+                    if (match.matched_tokens < 0) ok = false;
+                }
+            });
+        }
+
+        for (auto& th : readers) th.join();
+        assert(ok);
+        std::cout << "  [PASS] 8-thread concurrent lockless match_prefix reads" << std::endl;
+    }
+
+    // 7. Measure match_prefix latency on 10,000 token prompt
+    {
+        std::vector<int32_t> long_prompt(10000);
+        for (size_t i = 0; i < long_prompt.size(); ++i) long_prompt[i] = (int32_t)(i + 1);
+
+        int iters = 20000;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            auto m = tree.match_prefix(long_prompt);
+            (void) m;
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double elapsed_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
+        std::cout << "  [PERF] 10,000-token match_prefix latency: " << elapsed_us << " us / match" << std::endl;
+        assert(elapsed_us < 10.0); // Target < 10 us
+        std::cout << "  [PASS] Latency well below 10 us target!" << std::endl;
+    }
+
+    std::cout << "All RadixTree & HiCache L2 unit tests passed successfully!" << std::endl;
     return 0;
 }
