@@ -12,6 +12,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/core/radix_tree.hpp"
+#include "strata/core/shm_ipc.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -435,6 +436,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         err = "concurrency: no profile-filled expert cache fits; reduce context/concurrency or increase available VRAM";
         return 1;
     }
+    if (const char* shm_env = std::getenv("STRATA_IPC_SHM")) {
+        if (ipc::ShmProducer::instance()->init(shm_env)) {
+            std::fprintf(stderr, "strata concurrent: zero-copy shared memory IPC enabled (%s)\n", shm_env);
+        }
+    }
     struct ProgressGuard { ~ProgressGuard() { core::progress().busy.store(false); } } progress_guard;
     std::jthread watchdog; // outlives the batch graph, including teardown after a failed GPU execution
     // C4: one batch coordinator per stage (at N=1 this is today's single `batch`).  Each carries its
@@ -701,7 +707,25 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // runs it (the pump, or this loop when the pump is off).
         auto& s = *m.slots[i];
         const int64_t read0 = s.read.load(std::memory_order_acquire);
-        const int64_t n = std::min<int64_t>(c.prefill_chunk, s.position.load(std::memory_order_relaxed) - read0);
+        // Task 1.2: Fine-grained dynamic chunk sizing & Aux micro-prefill
+        int active_decodes = 0;
+        for (const auto& ptr : m.slots) {
+            const auto& sl = *ptr;
+            if (sl.active.load(std::memory_order_relaxed) &&
+                sl.read.load(std::memory_order_relaxed) >= sl.position.load(std::memory_order_relaxed)) {
+                ++active_decodes;
+            }
+        }
+        int64_t dynamic_chunk = c.prefill_chunk;
+        if (active_decodes >= 2) dynamic_chunk = std::min<int64_t>(dynamic_chunk, 512);
+        else if (active_decodes == 1) dynamic_chunk = std::min<int64_t>(dynamic_chunk, 1024);
+
+        const int64_t rem = s.position.load(std::memory_order_relaxed) - read0;
+        // Subtask 1.2.3: Dedicated Aux micro-prefill
+        if (rem <= c.prefill_chunk && (s.is_aux || rem <= 1024)) {
+            dynamic_chunk = std::min<int64_t>(c.prefill_chunk, rem);
+        }
+        const int64_t n = std::min<int64_t>(dynamic_chunk, rem);
         const auto start = Clock::now();
         if (!s.stages[0].prompt.run(s.request.tokens.data() + read0, n, read0, chunk_err)) return false;
         // Lane pipeline-prefill: the chunk that completes this slot's prompt must drain the deferred
@@ -717,6 +741,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // Release: the consumed rows, prompt_ms and the session state are visible to this loop the moment
         // its ready check (acquire) sees read == position; the fences order it for the other readers.
         s.read.store(read0 + n, std::memory_order_release);
+        if (ipc::ShmProducer::instance()->is_active()) {
+            ipc::ShmProducer::instance()->write_progress(s.request.id, read0 + n, (int64_t) s.request.tokens.size());
+        }
         std::printf("R %llu PP %lld %zu\n", (unsigned long long) s.request.id, (long long) (read0 + n),
                     s.request.tokens.size());
         std::fflush(stdout);
@@ -1119,6 +1146,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             for (int t = 1; t < keep; ++t) ++pos_accepted[std::min(t, 8)];
             for (int t = 0; t < keep; ++t) {
                 s.consumed.push_back(s.window[t]); s.suffix.append(s.output[t]); ++s.generated;
+                if (ipc::ShmProducer::instance()->is_active()) {
+                    ipc::ShmProducer::instance()->write_token(s.request.id, s.output[t]);
+                }
                 std::printf("R %llu T %d\n", (unsigned long long) s.request.id, s.output[t]);
             }
             std::fflush(stdout);
@@ -1609,10 +1639,16 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
             }
             if (pick == nullptr) {
-                for (auto& ptr : m.slots) {
-                    if (!ptr->active.load() && req_len < ptr->max_context) {
-                        pick = ptr.get();
-                        break;
+                // Task 1.4: Idle-Slot Lending - only lend primary slots to aux tasks if no primary requests are queued!
+                const bool primary_waiting = (c.aux_context > 0 && req_len < c.aux_context) &&
+                    std::any_of(pending.begin(), pending.end(),
+                        [&](const Request& r) { return (int64_t) r.tokens.size() >= c.aux_context; });
+                if (!primary_waiting) {
+                    for (auto& ptr : m.slots) {
+                        if (!ptr->active.load() && req_len < ptr->max_context) {
+                            pick = ptr.get();
+                            break;
+                        }
                     }
                 }
             }

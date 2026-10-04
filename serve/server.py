@@ -28,6 +28,7 @@ import hmac
 import codecs
 import ctypes
 import json
+import mmap
 import os
 import queue
 import re
@@ -300,6 +301,72 @@ def session_hint(ids) -> int:
     h.update(",".join(str(int(t)) for t in ids[:256]).encode())
     return int.from_bytes(h.digest(), "big")
 
+class ShmConsumer:
+    """Zero-copy binary IPC reader for Strata concurrent engine shared-memory ring buffer."""
+    HEADER_FMT = "<IIII"
+    HEADER_SIZE = 16
+    ENTRY_FMT = "<BBHIQqq"
+    ENTRY_SIZE = 32
+
+    def __init__(self, name: str):
+        if not name.startswith("/"):
+            name = "/" + name
+        self.path = f"/dev/shm{name}"
+        self.fd = -1
+        self.m = None
+        self.capacity = 0
+        self.tail = 0
+
+    def open(self, timeout_s: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if os.path.exists(self.path):
+                try:
+                    self.fd = os.open(self.path, os.O_RDWR)
+                    self.m = mmap.mmap(self.fd, 0, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+                    head, tail, cap, magic = struct.unpack_from(self.HEADER_FMT, self.m, 0)
+                    if magic == 0x53545241 and cap > 0:
+                        self.capacity = cap
+                        self.tail = tail
+                        return True
+                except OSError:
+                    pass
+            time.sleep(0.02)
+        return False
+
+    def poll(self):
+        if not self.m:
+            return
+        head, = struct.unpack_from("<I", self.m, 0)
+        while self.tail < head:
+            idx = self.tail & (self.capacity - 1)
+            off = self.HEADER_SIZE + idx * self.ENTRY_SIZE
+            msg_type, flags, reserved, token, req_id, p_read, p_total = struct.unpack_from(self.ENTRY_FMT, self.m, off)
+            if msg_type != 0:
+                yield (req_id, msg_type, token, p_read, p_total)
+            self.tail += 1
+            struct.pack_into("<I", self.m, 4, self.tail)
+
+    def close(self):
+        if self.m:
+            try:
+                self.m.close()
+            except Exception:
+                pass
+            self.m = None
+        if self.fd >= 0:
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            self.fd = -1
+        if os.path.exists(self.path):
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -387,6 +454,39 @@ class StrataEngine:
         self.lines: queue.Queue = queue.Queue()
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+        self._shm_active = False
+        self.shm_consumer = None
+        shm_name = (env or {}).get("STRATA_IPC_SHM") or os.environ.get("STRATA_IPC_SHM")
+        if self.multiplex and shm_name:
+            self.shm_consumer = ShmConsumer(shm_name)
+            self.shm_pump = threading.Thread(target=self._shm_pump, daemon=True)
+            self.shm_pump.start()
+
+    def _shm_pump(self):
+        consumer = getattr(self, "shm_consumer", None)
+        if not consumer or not consumer.open(timeout_s=5.0):
+            return
+        self._shm_active = True
+        proc = self.proc
+        while self.proc is proc and not getattr(self, "ended", False):
+            had_any = False
+            for req_id, m_type, token, p_read, p_total in consumer.poll():
+                had_any = True
+                payload = None
+                if m_type == 1:    # MSG_TOKEN
+                    payload = f"T {token}\n"
+                elif m_type == 2:  # MSG_PROGRESS
+                    payload = f"PP {p_read} {p_total}\n"
+                if payload is not None:
+                    with self._channels_lock:
+                        channel = self._channels.get(req_id)
+                        if channel is not None:
+                            try:
+                                channel.put_nowait(payload)
+                            except queue.Full:
+                                pass
+            if not had_any:
+                time.sleep(0.0002)
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
@@ -398,6 +498,8 @@ class StrataEngine:
             if len(fields) != 3 or fields[0] != "R" or not fields[1].isdigit():
                 continue
             number, payload = int(fields[1]), fields[2]
+            if getattr(self, "_shm_active", False) and (payload.startswith("T ") or payload.startswith("PP ")):
+                continue
             overflow = False
             with self._channels_lock:
                 channel = self._channels.get(number)
@@ -458,6 +560,13 @@ class StrataEngine:
         return self.proc is not None and not getattr(self, "ended", False) and self.proc.poll() is None
 
     def exit_code(self):
+        if getattr(self, "shm_consumer", None):
+            try:
+                self.shm_consumer.close()
+            except Exception:
+                pass
+            self.shm_consumer = None
+        self._shm_active = False
         if self.proc is None:
             return None
         try:
@@ -784,6 +893,13 @@ class StrataEngine:
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
         a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        if getattr(self, "shm_consumer", None):
+            try:
+                self.shm_consumer.close()
+            except Exception:
+                pass
+            self.shm_consumer = None
+        self._shm_active = False
         if self.proc is None:
             return
         try:
