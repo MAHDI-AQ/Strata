@@ -31,6 +31,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -92,7 +93,6 @@ public:
     // identical offsets in every stage by construction. Attention, recurrence and commit stay per member.
     bool run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user, std::string& err);
 
-    // ============================ STAGE-PIPELINE OVERLAP (lane overlap) ============================
     // A PASS is one stage's graph execution for one round unit: begin_pass_* stages the inputs,
     // captures/replays this stage's graph for (shape, parity), launches it on cs_ and records `done`
     // after the launch (it fires when the graph, hand-off copies included, has completed).  NO host
@@ -118,6 +118,10 @@ public:
     // Configure before init; CLI validation supplies a positive bounded cache limit.
     void set_batch_cache(int limit, int reserve_mib) { batch_cache_limit_ = limit; batch_reserve_mib_ = reserve_mib; }
     void set_batch_parallel(bool enabled) { batch_parallel_ = enabled; }
+=======
+    /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
+    bool copy_logits(int t, float* host) const;
+    int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
@@ -186,6 +190,10 @@ public:
     bool commit(int n_keep, std::string& err);          ///< launch the chain and wait its tail (the pair below)
     bool commit_launch(int n_keep, std::string& err);   ///< fill + launch this stage's commit and chain on (no wait)
     bool commit_wait(std::string& err);                 ///< wait the CHAIN TAIL's stream (commit_launch's pair)
+    static void set_commit_async(bool on);
+    bool wait_commit(std::string& err);
+    bool window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
+                         std::string& err);
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
@@ -265,7 +273,7 @@ private:
     bool batch_parallel_ = false;
     cudaEvent_t batch_fork_ = nullptr, batch_join_[16] = {};   ///< batch-parallel member events, one per request (16 = the M2 request lattice)
     cudaGraphExec_t batch_replay_ = nullptr;
-    static constexpr int kProfPer = 32;              // stamps per layer
+    static constexpr int kProfPer = 33;              // stamps per layer (33 avoids collision)
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
     std::vector<unsigned long long> prof_h_;
@@ -323,6 +331,8 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+    cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
+    bool commit_pending_ = false;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
@@ -355,6 +365,7 @@ private:
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
     static constexpr int64_t kStagingBlobs = 16;
+    static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
     float* hit_xs_ = nullptr;

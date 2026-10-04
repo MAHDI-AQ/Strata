@@ -22,6 +22,11 @@ namespace strata::core {
 
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 
+/// #243: STRATA_ARENA_PIN_GIB, the cap on the expert arena's CUDA registration in GiB.  -1 when unset (the engine
+/// decides, as in 0.1.30), 0 = no cap (the whole arena, or as many slices as the driver takes), N > 0 = at most N GiB,
+/// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
+int arena_pin_cap_gib();
+
 struct PinnedArena {
     void* base = nullptr;
     uint64_t capacity = 0;
@@ -98,6 +103,22 @@ LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_byte
 /// Plan v0.3 P6: the same with one byte range per layer (`layer_off[L]`, `layer_bytes[L]`).
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk);
+
+/// The same ranges read UNBUFFERED straight into `dst` (Windows): no staging buffer and no file-cache copy - the
+/// drive's DMA lands where the experts live. Every range, `dst` and `chunk` must be 4 KiB aligned; returns ok =
+/// false with an empty `error` when they are not (or off Windows), and the caller falls back to load_experts_ranges.
+LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
+                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk);
+
+/// Whether the expert files are better read unbuffered (Windows; false elsewhere): a timed probe of random 64 KiB
+/// reads says they are not in the OS file cache (a cached read takes ~10 us, the drive ~80), and the RAM left
+/// beside the arena (`arena_bytes`) could not keep them cached for the next start either - so a warm restart after
+/// an idle unload never gets slower, and only a start that reads the drive anyway skips the cache's copy.
+/// STRATA_UNBUFFERED_LOAD=1 / 0 forces it. `why` says what decided.
+/// `cache_counts` false (the file tier with a RAM budget): only whether the files could be kept decides - their mapped
+/// pages land in the process's working set, so a partly cached file would still take the RAM the budget was sized for.
+bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_bytes, std::string& why,
+                        bool cache_counts = true);
 
 // FNV-1a 64.  Per layer, so a corrupt or short read names WHICH layer rather than just failing a whole-file
 // comparison - the same reason the Phase 1 tools report the first differing element.
