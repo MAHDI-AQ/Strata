@@ -1560,6 +1560,8 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "batch verify: sampling failed"; return false; }
     for (const auto& b : batch)
         for (int t = 0; t < b.count; ++t) b.output[t] = b.verifier->h_out_[t];
+    progress_at("decode");
+    progress_beat();
     return true;
 }
 void Verifier::set_plan_slot(int grp) {
@@ -1781,6 +1783,7 @@ bool Verifier::begin_pass_window(int T, const int32_t* tokens, int64_t pos0, Poo
 bool Verifier::begin_pass_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user,
                                 cudaEvent_t done, std::string& err) {
     const OnDevice on_device(device_);
+    g_diag_verifier.store(this);
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     int total = 0;
     std::vector<std::pair<Verifier*, int>> shape;
@@ -1982,6 +1985,8 @@ bool Verifier::end_pass_batch(const std::vector<BatchWindow>& batch, std::string
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "batch verify: sampling failed"; return false; }
     for (const auto& b : batch)
         for (int t = 0; t < b.count; ++t) b.output[t] = b.verifier->h_out_[t];
+    progress_at("decode");
+    progress_beat();
     return true;
 }
 }  // namespace strata::core
