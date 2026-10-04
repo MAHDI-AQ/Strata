@@ -26,7 +26,7 @@ While upstream Strata proved that a 125B MoE model could execute on consumer gam
    - Vectorized 128-bit `float4` transactions (`native_moe_combine`, `f32_to_bf16_bulk`).
    - Persistent 72MB L2 cache window pinning verify arena and scratchpads.
 4. **Chunk-Pipelined Prefill (`STRATA_PREFILL_CHAIN=1`):**
-   - Simultaneous cross-GPU chunk pipelining across dual GPUs, achieving **3,450.2 tok/s cold prefill**.
+   - Simultaneous cross-GPU chunk pipelining across dual GPUs, achieving **3,450.2 tok/s cold prefill** on IQ3_XXS and **5,355.4 tok/s** on Q1 Coder.
 5. **262K Massive Context Window:**
    - Single-agent master posture scaled to **262,144 tokens** context with **131,072 tokens (128K)** output window on dual 24GB GPUs.
 6. **Mathematical Bitwise Parity Suite:**
@@ -47,13 +47,29 @@ All benchmarks below were measured directly on the **Mahdi AI Lab** hardware rig
 - **RAM:** 96 GB DDR4-3200
 - **Storage:** WD_BLACK SN850X 4TB NVMe SSD
 - **OS:** Ubuntu 24.04 LTS
-- **Model:** `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (IQ3_XXS, 125B MoE, 512 experts, 3.06 bpw)
+
+### 1. Single-Agent Master Posture — Qwen3.8-Flash-Next IQ3_XXS (262K Context Window)
+
+Evaluated on `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (IQ3_XXS, 125B MoE, 512 experts, 3.06 bpw) using `--max-context 262144` and `--kv q4_0`:
 
 | Configuration | Model / Quant | Context Window | Concurrency ($C$) | Decode Speed | Cold Prefill | VRAM Expert Residency |
 |---|---|---:|:---:|---:|---:|---:|
 | **Single-Agent Master** | Qwen3.8-Flash-Next IQ3_XXS | **262,144** | $C=1$ | **105.2 tok/s** | **3,450.2 tok/s** | **89.2%** (21,931 / 24,576 slots) |
-| **Multi-Agent Concurrency** | Qwen3.8-Flash-Next IQ3_XXS | 32,768 | $C=3$ | **172.5 tok/s aggregate** | **3,450.2 tok/s** | **89.2%** |
-| **Peak Multi-Agent Concurrency** | Qwen3.8-Flash-Next IQ3_XXS | 32,768 | $C=5$ | **217.06 tok/s aggregate** | **3,450.2 tok/s** | **89.2%** |
+
+*Single-agent master posture supports full 262,144 context with 128K max output window on dual 24GB GPUs with 95.0%–99.9% expert cache hit rate.*
+
+### 2. Multi-Agent Concurrency & Throughput Scaling — Qwen3.8-Flash-Next Coder Q1 (IQ1_M)
+
+Evaluated on `Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M` (125B MoE Coder, 1.75 bpw) under concurrent multi-agent load across 128K context:
+
+| Concurrency ($C$) | Serving Mode | Aggregate Decode Throughput | Per-Agent Decode Speed | Cold Prefill | VRAM Residency |
+|---|---|---:|---:|---:|---:|
+| **$C=1$** | Single Stream | **100.5 – 108.6 tok/s** | 100.5 – 108.6 tok/s | 2,380.2 tok/s (short) / 5,124.2 tok/s (bulk) | 100.0% (pinned) |
+| **$C=2$** | Dual Agent | **152.40 tok/s** | 100.20 tok/s | — | 100.0% |
+| **$C=3$** | Multi-Agent Swarm | **187.50 tok/s** | 82.10 tok/s | — | 100.0% |
+| **$C=4$** | Swarm Fan-Out | **205.10 tok/s** | 68.40 tok/s | — | 100.0% |
+| **$C=5$** | Full Concurrency (Burst) | **220.04 tok/s** | 59.4 – 68.7 tok/s | 5,355.4 tok/s | 100.0% |
+| **$C=5$** | Sustained Sweet Spot (11.5 GHz) | **253.92 tok/s** | 59.2 – 63.2 tok/s | 5,124.2 tok/s | 100.0% |
 
 *All kernel modifications verified with bitwise parity passing 100% against reference ggml implementations.*
 
@@ -101,7 +117,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8096/v1", api_key="not-needed")
 
 response = client.chat.completions.create(
-    model="strata-iq3xxs",
+    model="strata-coder",
     messages=[
         {"role": "system", "content": "You are a helpful coding assistant."},
         {"role": "user", "content": "Explain RadixTree KV cache prefix sharing in 3 concise bullet points."},
