@@ -2,7 +2,7 @@
 
 Strata was created by **Niko1221** and advanced by an extraordinary community of open-source engineers, systems researchers, and hardware performance specialists.
 
-This repository is a downstream innovation fork maintained by the **M&F AI Lab** (`MAHDI-AQ`). While this fork introduces deep architectural extensions (Ada Lovelace tensor core kernels, GSQ-RCO 512-expert streaming, Dynamic RadixTree KV caching, chunk-pipelined prefill, and multi-agent concurrency), **none of this would be possible without the foundational breakthroughs, architectural elegance, and sustained contributions of the original Strata community.**
+This repository is a downstream innovation fork maintained by the **Mahdi AI Lab** (`MAHDI-AQ`). While this fork introduces deep architectural extensions (Ada Lovelace tensor core kernels, GSQ-RCO 512-expert streaming, Dynamic RadixTree KV caching, chunk-pipelined prefill, and multi-agent concurrency), **none of this would be possible without the foundational breakthroughs, architectural elegance, and sustained contributions of the original Strata community.**
 
 ---
 
@@ -26,7 +26,7 @@ We formally and respectfully credit the following authors and contributors whose
 | **Oluwabori Olaleye** | [`borexola`](https://github.com/borexola) | Model packaging tooling and multi-shard GGUF parsing. |
 | **GioStrives** | [`giostrives@gmail.com`](mailto:giostrives@gmail.com) | Community usability testing and CLI parameter ergonomics. |
 | **Pravesh Khatana** | [`pravesh.khatana@gmail.com`](mailto:pravesh.khatana@gmail.com) | Evaluation tooling, tokenizer compliance, and prompt format validation. |
-| **M&F AI Lab** | [`MAHDI-AQ`](https://github.com/MAHDI-AQ) | SM89 Ada Lovelace kernel tiling, GSQ-RCO IQ3_XXS 512-expert streaming, Dynamic RadixTree KV, 262K context scaling, and agentic benchmark receipts. |
+| **Mahdi AI Lab** | [`MAHDI-AQ`](https://github.com/MAHDI-AQ) | SM89 Ada Lovelace kernel tiling, GSQ-RCO IQ3_XXS 512-expert streaming, Dynamic RadixTree KV, 262K context scaling, and agentic benchmark receipts. |
 
 ---
 
@@ -34,4 +34,4 @@ We formally and respectfully credit the following authors and contributors whose
 
 1. **Standalone Downstream Lab:** This fork operates as an independent downstream research lab.
 2. **Upstream PR Boundary:** Because this fork introduces radical architectural alterations tailored for multi-GPU agentic labs, **we do not submit unsolicited upstream PRs or file issues against `Niko1221/Strata`**. Upstream maintainers are welcome to cherry-pick any modular features, kernels, or bug fixes from our clean commits at their discretion.
-3. **Open Access:** All proprietary M&F AI Lab innovations (13,633+ LoC) are provided openly under the repository's open-source license for the benefit of the local LLM and agentic engineering community.
+3. **Open Access:** All proprietary Mahdi AI Lab innovations (13,633+ LoC) are provided openly under the repository's open-source license for the benefit of the local LLM and agentic engineering community.

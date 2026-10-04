@@ -1,4 +1,3 @@
-import os
 #!/usr/bin/env python3
 """calibrate_recorded.py - recorded-receipt calibration for the acceptance harness (M0 evidence).
 
@@ -28,6 +27,7 @@ import argparse
 import glob
 import json
 import sys
+import os
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent

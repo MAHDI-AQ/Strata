@@ -1,9 +1,9 @@
 {
  "schema": "strata-acceptance-envelope/1",
- "program": "M&F AI Lab Strata serving lane - N-scaling acceptance (M0 instruments)",
+ "program": "Mahdi AI Lab Strata serving lane - N-scaling acceptance (M0 instruments)",
  "authority": [
-  "master plan 2026-10-02-strata-agentic-engine-acceleration-master-plan.md section 11.5 (finish line + channel conventions)",
-  "scratch/lane-sglang-target/report.md sections 3 (envelope) and 4 (harness extensions)"
+  "High-throughput multi-agent serving specification (finish line + channel conventions)",
+  "Throughput envelope and harness benchmark specifications"
  ],
  "reading": {
   "convention": "WALL",

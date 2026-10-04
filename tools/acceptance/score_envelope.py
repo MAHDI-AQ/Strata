@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """score_envelope.py - the N-scaling acceptance scorer (harness extension E3).
 
-Scores ONE arm's receipts against envelope.json (the machine form of the master-plan 11.5
-signature + lane-sglang-target section 3).  Nothing is modelled: every number is recomputed
+Scores ONE arm's receipts against envelope.json (the machine form of the serving acceptance signature).  Nothing is modelled: every number is recomputed
 from the raw receipts (requests.jsonl / turns.jsonl / metrics-series.jsonl / gates.json);
 summary.md is never trusted.
 
@@ -20,7 +19,7 @@ Classes (each names its instrument + channel):
   integrity        G1 spots + fault scan from gates.json (NOT EVALUATED when absent)
 
 Verdicts: CONFIRM (every class PASS) | NOT_CONFIRM (blockers listed) | FALSIFY (pre-registered
-master-plan 11.5 falsifier: aggregate prefill <= 5400 at N=8) | REFUSED (zero data).
+pre-registered falsifier: aggregate prefill <= 5400 at N=8) | REFUSED (zero data).
 
 Usage:
   score_envelope.py --cell 5x87.5K --streak-dir D [--sustained-dir D] [--gates G.json]
@@ -414,7 +413,7 @@ def score_cell(cell_name: str, env: dict, streak_dir: str | None, sustained_dir:
         "shape_declared_engine_tokens": cell["ctx_engine"],
         "verdict": verdict, "falsify": falsify, "blockers": blockers, "gaps": gaps,
         "classes": classes, "checks": checks,
-        "authority": "master-plan 11.5 + lane-sglang-target section 3 (envelope.json)",
+        "authority": "serving acceptance specification (envelope.json)",
     }
 
 

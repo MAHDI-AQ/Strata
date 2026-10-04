@@ -15,7 +15,8 @@ PY="${PY:-python3}"
 RECORDED_ROOT=""
 R0_DIR=""
 REQUIRE_RECORDED=0
-MIN_TOTAL=90      # hard floor: updated consciously when the battery grows (never silently lowered)
+MIN_TOTAL=90      # hard floor with recorded calibration
+MIN_STANDALONE=70 # floor for standalone open-source clone without internal lab receipts
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -256,8 +257,10 @@ fi
 
 # ---------------------------------------------------------------- final
 step "final"
-echo "total checks executed: $TOTAL (floor $MIN_TOTAL), FAILS=$FAILS"
-[ "$TOTAL" -ge "$MIN_TOTAL" ]; want "suite check count >= $MIN_TOTAL" $?
+TARGET_FLOOR="$MIN_TOTAL"
+if [ -z "$RECORDED_ROOT" ]; then TARGET_FLOOR="$MIN_STANDALONE"; fi
+echo "total checks executed: $TOTAL (floor $TARGET_FLOOR), FAILS=$FAILS"
+[ "$TOTAL" -ge "$TARGET_FLOOR" ]; want "suite check count >= $TARGET_FLOOR" $?
 if [ "$FAILS" -gt 0 ]; then
   echo "SELFTEST FAILED ($FAILS failures)"
   exit 1

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """long_horizon_harness_test.py - Realistic multi-agent long-horizon harness benchmark.
 
-Models a realistic Hermes agent workload:
+Models a realistic multi-agent coding workload:
   1. Base harness: ~35k tokens (system prompt + tool definitions + instructions).
   2. Long-horizon context accumulation: Main agent works, appends tool outputs, growing from 35k -> 50k -> 70k.
   3. Concurrent subagent fan-out: Main agent spins up 4 subagents sharing the accumulated harness prefix concurrently (c5 @ 128k context envelope).
@@ -127,7 +127,7 @@ def main():
     tool_output_2 = generate_text_tokens(args.step2_tokens, seed=103)
 
     messages = [
-        {"role": "system", "content": f"You are Hermes Agent with tool capabilities. HARNESS_DATA: {base_harness}"},
+        {"role": "system", "content": f"You are an autonomous coding agent with tool capabilities. HARNESS_DATA: {base_harness}"},
         {"role": "user", "content": "Begin primary task analysis."}
     ]
 

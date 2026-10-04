@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """retention_gate.py - multi-agent sustained retention gate (harness extension E7).
 
-Scores the master-plan 11.5 retention clause on a sustained multi-turn receipt (turns.jsonl
+Scores the multi-agent sustained retention clause on a sustained multi-turn receipt (turns.jsonl
 written by the sustained instrument / agent_sim): on re-sent conversation turns,
   coverage: >= 90 percent of re-sent turns resume (reused >= 0.95 x the agent's previous prompt)
   retained TTFT: <= 1.0 s p50 and <= 2.0 s p95 over the resumed turns.

@@ -1,4 +1,4 @@
-<h1 align="center">Strata (M&F AI Lab Edition)</h1>
+<h1 align="center">Strata (Mahdi AI Lab Edition)</h1>
 
 <p align="center"><b>Industrial High-Throughput Inference Engine for 125B MoE Models</b><br>
 NVIDIA Dual RTX 4090 / Ada Lovelace / Ampere · 262K Context Window · Multi-Agent Dynamic RadixTree KV · Free and Open Source</p>
@@ -13,7 +13,7 @@ NVIDIA Dual RTX 4090 / Ada Lovelace / Ampere · 262K Context Window · Multi-Age
 
 ## 🌟 Overview & Lineage
 
-**Strata (M&F AI Lab Edition)** is an accelerated downstream fork of [Niko1221/Strata](https://github.com/Niko1221/Strata), engineered specifically for autonomous agent swarms, massive context windows (262K), and high-throughput speculative decoding on consumer GPUs (NVIDIA RTX 4090 / 3090).
+**Strata (Mahdi AI Lab Edition)** is an accelerated downstream fork of [Niko1221/Strata](https://github.com/Niko1221/Strata), engineered specifically for autonomous agent swarms, massive context windows (262K), and high-throughput speculative decoding on consumer GPUs (NVIDIA RTX 4090 / 3090).
 
 While upstream Strata proved that a 125B MoE model could run on a single gaming card, this fork scales the architecture into an **industrial-grade agentic engine**:
 - **World-Record Decode Throughput:** **217.06 tok/s** aggregate decode across 5 concurrent agent slots ($C=5$), and **105.2 tok/s** single-stream ($C=1$).
@@ -54,7 +54,7 @@ Native multi-GPU execution for 512-expert routed models (`ISTA-DASLab/Qwen3.8-Fl
 
 ## 📊 Benchmark Verification
 
-### Benchmark Matrix (Dual NVIDIA RTX 4090 24GB, PCIe 4.0 x16, Ubuntu 24.04)
+### Benchmark Matrix (Dual NVIDIA GeForce RTX 4090 24GB, AMD Ryzen 9 5950X, 96 GB DDR4-3200 RAM, WD_BLACK SN850X 4TB NVMe, Ubuntu 24.04)
 
 | Configuration | Model / Quant | Context | Concurrency ($C$) | Decode Speed | Cold Prefill | VRAM Residency |
 |---|---|---:|:---:|---:|---:|---:|
@@ -63,7 +63,7 @@ Native multi-GPU execution for 512-expert routed models (`ISTA-DASLab/Qwen3.8-Fl
 | **Multi-Agent Swarm** | Qwen3.8-Flash-Next IQ3_XXS | 32,768 | $C=3$ | **172.5 tok/s aggregate** | **3,450.2 tok/s** | **89.2%** |
 | **Max Concurrency Record** | Qwen3.8-Flash-Next IQ3_XXS | 32,768 | $C=5$ | **217.06 tok/s aggregate** | **3,450.2 tok/s** | **89.2%** |
 
-*Verified live on M&F AI Lab hardware with bitwise parity test passing 100% against reference ggml implementations.*
+*Verified live on Mahdi AI Lab hardware with bitwise parity test passing 100% against reference ggml implementations.*
 
 ---
 

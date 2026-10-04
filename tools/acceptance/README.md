@@ -1,7 +1,7 @@
 # acceptance — the N-scaling acceptance harness (M0)
 
 The program's finish-line instrument: it boots arms, runs the calibrated load legs, scores every
-class of the master-plan §11.5 signature against `envelope.json`, and names the decode channel of
+class of the serving acceptance signature against `envelope.json`, and names the decode channel of
 every claim. It gates the Strata serving lane program, so it lives in the repo (`tools/acceptance/`,
 a sibling of `tools/hip/` and `tools/vision/`) — not in scratch.
 
@@ -9,7 +9,7 @@ a sibling of `tools/hip/` and `tools/vision/`) — not in scratch.
 
 | file | role |
 |---|---|
-| `envelope.json` | machine form of §11.5 + lane-sglang-target §3: cells, bars, channels, calibration factor, falsifier |
+| `envelope.json` | machine form of serving acceptance target: cells, bars, channels, calibration factor, falsifier |
 | `token_calib.py` | engine-token calibration: sizes prompts at `engine_target / 0.729`; asserts landed shapes ±2% (E5) |
 | `run_envelope.sh` | runner: boots one arm via `tools/restart-campaign.sh`, runs the streak + sustained legs with the existing load kits, scores, restores the fleet on every exit path (E2/E4) |
 | `score_envelope.py` | scorer: all classes vs envelope.json; CONFIRM / NOT_CONFIRM / FALSIFY / REFUSED (E3) |
@@ -75,7 +75,7 @@ Exit codes: runner `0 CONFIRM / 1 NOT_CONFIRM / 2 FALSIFY / 3 refused-or-failed`
 
 ## Falsifiers built in
 
-- Pre-registered: aggregate prefill ≤ 5,400 at N=8 → `FALSIFY` (master plan §11.5).
+- Pre-registered: aggregate prefill ≤ 5,400 at N=8 → `FALSIFY` (acceptance envelope falsifier).
 - Zero-data refusal: any run with no scoreable rows → exit 3, never a green.
 - Fixture battery (`selftest_acceptance.sh`): positive CONFIRM, negative streak, dead-reuse
   mutation, slow-retained-TTFT, falsify, zero-data — and the recorded calibration (§ below).
