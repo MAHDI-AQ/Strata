@@ -1895,6 +1895,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 if (ret.valid && !retire_unit(ret)) return 1;
                 unit_parity ^= 1;
                 ++rounds;
+                core::progress_beat();
                 if (adaptive && rounds % c.adapt_every == 0) {
                     // Fence: a swap rewrites the residency table and the cache slots the pump reads for chunks.
                     if (!pump_fence()) return 1;
@@ -1915,6 +1916,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             if (!input_done) { if (service_input(quit)) return 1; input_done = true; }
             ++rounds;
+            core::progress_beat();
             if (adaptive && rounds % c.adapt_every == 0) {
                 // Fence: a swap rewrites the residency table and the cache slots the pump reads for chunks.
                 if (!pump_fence()) return 1;
