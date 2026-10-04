@@ -1312,12 +1312,29 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
             else { err = "batch verify: requires native experts"; ok = false; break; }
             if (!(ok = record_window(total, cs_, err, 2, l))) break;
             if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + 29), cs_);
+            if (batch_parallel_ && cudaEventRecord(batch_fork_, cs_) != cudaSuccess) {
+                err = "batch verify: fork (phase 3) failed"; ok = false; break;
+            }
             row = 0;
+            int member3 = 0;
             for (const auto& b : batch) {
-                copy(b.verifier->parts_, parts_ + row * K * N, (size_t) b.count * K * N * sizeof(float), cs_);
-                if (!ok || !(ok = b.verifier->record_window(b.count, cs_, err, 3, l))) break;
+                Verifier& v = *b.verifier;
+                cudaStream_t branch = batch_parallel_ ? v.cs_ : cs_;
+                if (batch_parallel_ && cudaStreamWaitEvent(branch, batch_fork_, 0) != cudaSuccess) {
+                    err = "batch verify: branch wait (phase 3) failed"; ok = false; break;
+                }
+                copy(v.parts_, parts_ + row * K * N, (size_t) b.count * K * N * sizeof(float), branch);
+                if (!ok || !(ok = v.record_window(b.count, branch, err, 3, l))) break;
+                if (batch_parallel_ && cudaEventRecord(batch_join_[member3], branch) != cudaSuccess) {
+                    err = "batch verify: branch join (phase 3) failed"; ok = false; break;
+                }
+                ++member3;
                 row += b.count;
             }
+            if (batch_parallel_) for (int i = 0; i < member3; ++i)
+                if (cudaStreamWaitEvent(cs_, batch_join_[i], 0) != cudaSuccess) {
+                    err = "batch verify: join wait (phase 3) failed"; ok = false;
+                }
             if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + 30), cs_);
         }
         if (prof_on_) gpu_stamp(prof_, (int) (g_->n_layers * kProfPer + 2), cs_);
