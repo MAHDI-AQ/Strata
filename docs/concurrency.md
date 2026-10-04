@@ -1,5 +1,8 @@
 # Experimental concurrent serving
 
+> [!NOTE]
+> **Environment Context:** This document records early exploratory single-GPU testing on Windows (RTX 5090). For our production Dual NVIDIA GeForce RTX 4090 (Ubuntu 24.04) multi-agent benchmarks, context scaling (262K), and RadixTree performance, see the root [`README.md`](../README.md).
+
 This branch adds configurable shared-model serving for **1–4 requests**, raised to **1–8 requests** in the pair-combine build (the qualification tables below were established at c=1–4). It is based on upstream 0.1.27, commit `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`. Native Windows qualification on an RTX 5090 established exact token parity at c=1, 2, 3 and 4 under the matched numerical settings below. This remains a single-GPU experimental implementation; the qualification is specific to Swift IQ2_XS and the tested configuration, not a guarantee across all models and settings.
 
 The subsequent throughput work adds up to sixteen shared expert rows, optional padded verification and parallel request projections. See [the throughput study](concurrency-throughput.md) for matched measurements, current qualification and recommended settings. The qualification tables later in this document describe the original implementation.

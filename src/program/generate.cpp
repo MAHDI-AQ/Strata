@@ -197,6 +197,8 @@ struct Options {
     /// combination recorded in bench/results/2026-09-23-attention-ple plus the native indexer, and never the
     /// <=256-token attention adapter. It becomes the default once P0 shows it is not slower.
     std::string native_preset;
+    std::string embd_gguf;
+    std::vector<std::string> native_shards, native_head_shards;
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
     std::string ple_io = "direct";
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
@@ -1057,6 +1059,7 @@ int main(int argc, char** argv) {
         else if (a == "--native-router") o.native_router = true;
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
         else if (a == "--native") o.native_preset = next("--native");
+        else if (a == "--embd-gguf") o.embd_gguf = next("--embd-gguf");
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
         else if (a == "--no-capture") o.no_capture = true;
@@ -1419,8 +1422,20 @@ int main(int argc, char** argv) {
     }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
+        try {
+            o.native_shards = strata::gguf_split_paths(o.native_preset);
+            if (o.ple_gguf.empty() && !o.no_ple) {
+                const strata::GgufModel model(o.native_shards);
+                size_t at = 0;
+                if (model.find("per_layer_token_embd.weight", &at) != nullptr) o.ple_gguf = o.native_shards[at];
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), e.what());
+            return 2;
+        }
         if (o.no_ple || o.ple_gguf.empty()) {
-            std::fprintf(stderr, "strata generate: --native requires --ple-gguf (the PLE key is native too)\n");
+            std::fprintf(stderr, "strata generate: --native requires --ple-gguf (the PLE key is native too), and no "
+                                 "shard of the model holds per_layer_token_embd.weight\n");
             return 2;
         }
         o.stream_token = true;
@@ -1430,14 +1445,25 @@ int main(int argc, char** argv) {
         o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
         if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
         if (o.native_dense_gguf.empty()) {
-            // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
-            // may put any layer in any shard (Swift's GGUFs: layers 13-47 in shard 2, the PLE table in shard 1)
-            o.native_dense_gguf = model_shards(o.native_preset);
-            if (std::find(o.native_dense_gguf.begin(), o.native_dense_gguf.end(), o.ple_gguf) == o.native_dense_gguf.end())
+            o.native_dense_gguf = o.native_shards;
+            bool ple_only = false;
+            try {
+                strata::GgufFile pg(o.ple_gguf);
+                if (const strata::MetaValue* v = pg.get("general.architecture")) ple_only = v->s == "strata-ple";
+            } catch (const std::exception&) {}
+            if (!ple_only &&
+                std::find(o.native_dense_gguf.begin(), o.native_dense_gguf.end(), o.ple_gguf) == o.native_dense_gguf.end())
                 o.native_dense_gguf.push_back(o.ple_gguf);
         }
-        // Plan v0.3 (24 Sep): the CPU experts stay on the VNNI kernel.  The llama.cpp-CPU-exact q8_0 contract
-        // cost 27.0 vs 17.2 ms/token of pool time and G-C does not need it; `--cpu-oracle-q8-0` still selects it.
+    }
+    if (!o.native_head_gguf.empty()) {
+        try {
+            o.native_head_shards = o.native_head_gguf == o.native_preset ? o.native_shards
+                                                                         : strata::gguf_split_paths(o.native_head_gguf);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata generate: --native-head-gguf %s: %s\n", o.native_head_gguf.c_str(), e.what());
+            return 2;
+        }
     }
     if (o.logits_stride > 1 && (o.max_new != 1 || o.dump_logits.empty())) {
         std::fprintf(stderr, "strata generate: --logits-stride > 1 requires --max-new 1 and --dump-logits\n");
@@ -1625,7 +1651,7 @@ int main(int argc, char** argv) {
             // a pruned variant (GSQ-RCO Coder) ships fewer experts than the canonical 512x10; the model file
             // is the authority on its own MoE shape - everything else in the geometry is unchanged
             try {
-                strata::GgufFile model_gguf(o.native_preset);
+                strata::GgufFile model_gguf(o.native_shards.front());
                 if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
                 if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
                 if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.freq_base")) gguf_rope_base = v->num();
@@ -1720,7 +1746,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         const strata::core::ModelGeometry g0;
-        if (!native_embed.load(std::vector<std::string>{o.native_preset}, g0.n_embd, 248320, err)) {
+        if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd, 248320, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -2316,7 +2342,7 @@ int main(int argc, char** argv) {
         const bool last = i + 1 == stages.size();
         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
-            (last && !o.native_head_gguf.empty() && !st.head.load(std::vector<std::string>{o.native_head_gguf}, g.n_embd, wo_s->ne1, err))) {
+            (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_shards, g.n_embd, wo_s->ne1, err))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d head: %s\n", st.dev,
                          wo_s == nullptr ? "output.weight is missing" : err.c_str());
             return 1;
@@ -2504,7 +2530,7 @@ int main(int argc, char** argv) {
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
-        if (!native_head.load(std::vector<std::string>{o.native_head_gguf}, g.n_embd, n_vocab, err)) {
+        if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }

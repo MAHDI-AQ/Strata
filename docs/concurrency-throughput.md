@@ -1,5 +1,8 @@
 # Concurrency throughput on native Windows
 
+> [!NOTE]
+> **Environment Context:** This document records early exploratory single-GPU throughput testing on Windows (RTX 5090). For our production Dual NVIDIA GeForce RTX 4090 (Ubuntu 24.04) multi-agent benchmarks, context scaling (262K), and RadixTree performance, see the root [`README.md`](../README.md).
+
 The optimized c=4 path combines shared expert dispatch with overlapping request projections and reusable verification graphs. On the tested RTX 5090, the selected preset reached **230–233 aggregate decode tokens/s**, compared with **109–110** on the previous fork. These are totals across four requests, not per-request rates. A smaller prefill workspace measured 233–237 TPS but had substantially worse long-prompt TTFT.
 
 ## Configuration

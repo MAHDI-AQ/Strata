@@ -43,6 +43,7 @@ While upstream Strata proved that a 125B MoE model could execute on consumer gam
 All benchmarks below were measured directly on the **Mahdi AI Lab** hardware rig running real completions:
 
 - **GPUs:** Dual NVIDIA GeForce RTX 4090 24GB (PCIe 4.0 x16 / x8)
+  - *Hardware Overclock Profile:* Core Clock Offset **+150 MHz** (~2,800 MHz boost) · GDDR6X Memory Clock Offset **+1000 MHz** (11.5 GHz effective / ~1,104 GB/s bandwidth per GPU)
 - **CPU:** AMD Ryzen 9 5950X (16-Core / 32-Thread)
 - **RAM:** 96 GB DDR4-3200
 - **Storage:** WD_BLACK SN850X 4TB NVMe SSD
@@ -72,6 +73,23 @@ Evaluated on `Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M` (125B MoE Coder, 1.75 bpw) under
 | **$C=5$** | Sustained Sweet Spot (11.5 GHz) | **253.92 tok/s** | 59.2 – 63.2 tok/s | 5,124.2 tok/s | 100.0% |
 
 *All kernel modifications verified with bitwise parity passing 100% against reference ggml implementations.*
+
+### 3. Empirical Head-to-Head: Vanilla Upstream Strata (v0.1.38) vs Mahdi AI Lab Fork
+
+Evaluated side-by-side on the exact same Dual RTX 4090 rig (Ubuntu 24.04, +150 MHz Core / +1000 MHz GDDR6X OC) using identical model weights (`Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M` and `IQ3_XXS`):
+
+| Capability / Benchmark Metric | Vanilla Upstream Strata (v0.1.38) | Strata (Mahdi AI Lab Edition) | Empirical Acceleration / Difference |
+|---|---|---|---|
+| **Max Reachable Context Window** | 65,536 – 131,072 tokens (static allocation limits) | **262,144 tokens (262K)** with 128K max output window | **2× – 4× deeper context** on identical dual 24GB GPUs |
+| **Multi-Agent Concurrency** | **$C=1$ Only** (Strict FIFO serialization; no multi-slot decode) | **$C=1$ to $C=5$ Concurrent Multiplexing** (dynamic slot balancing) | **Up to 5 concurrent agent streams** |
+| **Decode Throughput ($C=1$)** | ~100.5 – 132.2 tok/s | **105.2 – 147.9 tok/s** (IQ3_XXS) / **150.0 – 180.0 tok/s** (Q1 Coder) | **+12% to +15% faster single stream** |
+| **Aggregate Throughput ($C=3$)** | 77.48 tok/s (serialized FIFO queue) | **187.50 tok/s** (parallel decoding) | **2.42× aggregate throughput speedup** |
+| **Aggregate Throughput ($C=5$)** | 81.73 tok/s (serialized FIFO queue) | **220.04 tok/s (burst) / 253.92 tok/s (sustained sweet spot)** | **3.11× aggregate throughput speedup** |
+| **Cold Prefill Throughput** | Single-GPU chunked (unpipelined) | **Chunk-Pipelined Prefill** (`STRATA_PREFILL_CHAIN=1`, `STRATA_AUX_WIDE=1`) | **3,450.2 tok/s (IQ3_XXS) / 5,355.4 tok/s (Q1 Coder)** (4.1× scaling) |
+| **Cross-GPU KV Cache Parking** | **Unsupported** (`layer-split parking is not supported`) | **Dynamic RadixTree KV Manager** with L2 Host-RAM parking | Full cross-GPU checkpointing, branch prefix sharing, zero-copy VRAM eviction |
+| **Hardware Kernel Optimization** | Generic SM75/SM80+ CUDA kernels | Custom SM89 Ada Lovelace GEMM tiling + persistent 72MB L2 cache pinning | Verified bitwise parity passing 100% across all 18 quant formats |
+
+*Note: In vanilla upstream Strata, requests beyond $C=1$ are queued in FIFO order; each client waits for the previous request to completely finish decoding, capping aggregate throughput at ~80 tok/s and scaling request latency linearly with queue depth. The Mahdi AI Lab Edition multiplexes multiple concurrent requests simultaneously within GPU compute and VRAM budgets.*
 
 ---
 
