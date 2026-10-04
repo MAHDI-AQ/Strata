@@ -6,11 +6,11 @@
 #
 #   bash selftest_acceptance.sh [--recorded-root DIR] [--require-recorded] [--r0-dir DIR]
 #
-# Env: PY (python3), WS (lab root; default /home/mhd67/strata-serving-lab).
+# Env: PY (python3), WS (lab root; default .).
 # Exit: 0 all executed checks PASS and total >= MIN_TOTAL / 1 any FAIL / 3 refusal (require-recorded).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WS="${WS:-/home/mhd67/strata-serving-lab}"
+WS="${WS:-.}"
 PY="${PY:-python3}"
 RECORDED_ROOT=""
 R0_DIR=""

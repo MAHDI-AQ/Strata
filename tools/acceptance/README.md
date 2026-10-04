@@ -33,7 +33,7 @@ with the recorded <20-row fallback). Judged statistic = cross-agent median (the 
 ```bash
 # one arm
 bash tools/acceptance/run_envelope.sh --cell 5x87.5K --label a1 \
-    --config /home/mhd67/strata-serving-lab/scratch/pump-boot/c5-pump.json \
+    --config ./scratch/pump-boot/c5-pump.json \
     --gates-in /path/to/gates.json
 
 # battery (plan: label|cell|config|legs per line; '#' comments)

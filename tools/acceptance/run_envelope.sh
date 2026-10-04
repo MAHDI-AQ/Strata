@@ -11,13 +11,13 @@
 # Engine-token calibration: leg sizes are derived from the cell's ENGINE-token target via
 # token_calib.py (est = engine / 0.729); a run never trusts legacy est-space shapes.
 #
-# Env: WS (lab root, default /home/mhd67/strata-serving-lab), URL, SERVE_LOG, ENGINE_LOG, PY.
+# Env: WS (lab root, default .), URL, SERVE_LOG, ENGINE_LOG, PY.
 # Refuses: marker scratch/.primary-measuring present; missing config/envelope/kits; relative config.
 # Exit: 0 all arms CONFIRM / 1 any arm NOT_CONFIRM / 2 any arm FALSIFY / 3 REFUSED, harness input
 #       or boot/restore failure / 4 usage.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WS="${WS:-/home/mhd67/strata-serving-lab}"
+WS="${WS:-.}"
 URL="${URL:-http://127.0.0.1:8096}"
 SERVE_LOG="${SERVE_LOG:-$WS/serve-8096.log}"
 ENGINE_LOG="${ENGINE_LOG:-$WS/serve-combined-8-engine.log}"

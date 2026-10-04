@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """calibrate_recorded.py - recorded-receipt calibration for the acceptance harness (M0 evidence).
 
@@ -54,7 +55,7 @@ def first(pattern: str):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--root", default="/home/mhd67/strata-serving-lab/scratch")
+    ap.add_argument("--root", default=os.getenv("STRATA_SCRATCH", "./scratch"))
     ap.add_argument("--r0-dir", default=None, help="ship-confirm prelim receipt override")
     ap.add_argument("--require", action="store_true", help="fail (exit 3) when a receipt root is missing")
     ap.add_argument("--json", action="store_true")
