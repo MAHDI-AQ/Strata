@@ -487,13 +487,90 @@ __global__ void copy_or_zero_kernel(float4* __restrict__ dst, const volatile flo
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (long long) gridDim.x * blockDim.x)
         dst[i] = zero ? make_float4(0.f, 0.f, 0.f, 0.f) : const_cast<const float4*>(src)[i];
 }
+__global__ void resident_plan_warp_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
+                                          int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+                                          long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
+                                          uint32_t ring) {
+    const int tid = threadIdx.x;
+    __shared__ int32_t s_ids[512];
+
+    int invalid = 0;
+    for (int i = tid; i < n; i += 32) {
+        const int32_t e = ids[i];
+        if (i < 512) s_ids[i] = e;
+        if (e < 0 || e >= n_expert || res[e] < 0) invalid = 1;
+    }
+    if (__any_sync(0xffffffff, invalid)) {
+        if (tid == 0) *skip = 0;
+        return;
+    }
+    __syncwarp();
+
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+
+    int groups = 0, entries = 0;
+
+    for (int i0 = 0; i0 < n; ++i0) {
+        const int32_t target_e = (i0 < 512) ? s_ids[i0] : ids[i0];
+        bool first = true;
+        for (int j = 0; j < i0; ++j) {
+            const int32_t prev_e = (j < 512) ? s_ids[j] : ids[j];
+            if (prev_e == target_e) { first = false; break; }
+        }
+        if (!first) continue;
+
+        if (tid == 0) {
+            const int32_t slot = res[target_e];
+            ptr[groups] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+            start[groups] = entries;
+        }
+
+        for (int base = i0; base < n; base += 32) {
+            const int idx = base + tid;
+            const bool match = (idx < n) && (((idx < 512) ? s_ids[idx] : ids[idx]) == target_e);
+            const uint32_t mask = __ballot_sync(0xffffffff, match);
+            if (match) {
+                const int rank = __popc(mask & ((1u << tid) - 1));
+                dst[entries + rank] = idx;
+                tok[entries + rank] = idx / k;
+            }
+            entries += __popc(mask);
+        }
+        ++groups;
+    }
+
+    if (tid == 0) {
+        start[groups] = entries;
+        start2[0] = entries;
+        counts[0] = groups;
+        counts[1] = entries;
+        counts[2] = 0;
+        __threadfence();
+        *skip = ring;
+    }
+}
 }  // namespace
 
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream) {
-    resident_plan_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
-                                                             blob, plan, capx, skip, ring);
+    static const bool use_warp = [] {
+        const char* e = std::getenv("STRATA_WARP_PLAN");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    if (use_warp) {
+        resident_plan_warp_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base,
+                                                                       slot_off, blob, plan, capx, skip, ring);
+    } else {
+        resident_plan_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
+                                                                 blob, plan, capx, skip, ring);
+    }
     check("resident_plan");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
