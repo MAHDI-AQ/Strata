@@ -913,7 +913,6 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
-<<<<<<< HEAD
   if(STRATA_BUILD_CONCURRENCY_TESTS)
     add_executable(strata-expert-width-test tests/concurrency/test_expert_width.cpp)
     target_link_libraries(strata-expert-width-test PRIVATE strata_kernels_cpu strata_artifact)
@@ -922,12 +921,11 @@ if(STRATA_NATIVE_EXPERTS)
       target_include_directories(strata-gpu-expert-width-test PRIVATE ${_strata_gpu_include_directories})
       target_link_libraries(strata-gpu-expert-width-test PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
     endif()
-=======
+  endif()
   set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
   # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
   if(STRATA_ORCA_Q4KS_MMQ)
     list(APPEND _strata_mmq_types q5_0)
->>>>>>> origin/main
   endif()
   if(STRATA_ENABLE_CUDA)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
