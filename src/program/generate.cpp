@@ -1213,8 +1213,8 @@ int main(int argc, char** argv) {
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
-    if (o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0 && !o.layer_split.empty()) {
-        std::fprintf(stderr, "strata serve: conversation parking does not yet support --layer-split; disable parking with --conversation-cache-mib 0\n");
+    if (o.concurrency <= 1 && o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0 && !o.layer_split.empty()) {
+        std::fprintf(stderr, "strata serve: legacy single-stream conversation parking does not support --layer-split; use --concurrency >= 2 for multi-device RadixTree HiCache L2\n");
         return 2;
     }
     if (o.concurrency < 1 || o.concurrency > 16 || o.batch_rows < 1 ||
@@ -2398,8 +2398,7 @@ int main(int argc, char** argv) {
         // Refuse early with the kill-switch named; the env override lets a fleet force off.
         if (const char* cc_env = std::getenv("STRATA_CONCURRENT_CACHE_MIB")) config.conversation_cache_mib = std::atoll(cc_env);
         if (config.conversation_cache_mib > 0) {
-            std::fprintf(stderr, "strata concurrent: conversation prefix-cache parking is not yet supported on the concurrent path; disable with --conversation-cache-mib 0 (fleet kill-switch STRATA_CONCURRENT_CACHE_MIB=0)\n");
-            return 2;
+            std::fprintf(stderr, "strata concurrent: HiCache L2 host-RAM conversation cache enabled (budget: %lld MiB)\n", (long long) config.conversation_cache_mib);
         }
         concurrent = std::make_unique<strata::program::ConcurrentServe>(config);
         if (!concurrent->prepare(g, ss, mtp, serve_stages, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }

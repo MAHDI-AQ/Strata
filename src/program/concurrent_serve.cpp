@@ -414,11 +414,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     if (stages.empty() || !stages[0].wt || !stages[0].cache || !stages[0].dispatch) {
         err = "concurrency: no stage"; return 1;
     }
-    // P1-cache-revive defense-in-depth: the CLI refuses enabled parking before prepare(); a
-    // programmatic caller bypassing it must not silently run uncached.
+    // HiCache L2: RadixTree dynamic prefix-cache parking is native to the concurrent multi-device path.
     if (c.conversation_cache_mib > 0) {
-        err = "concurrency: conversation prefix-cache parking is not supported on the concurrent path (kill-switch: conversation_cache_mib=0)";
-        return 1;
+        std::fprintf(stderr, "strata concurrent: HiCache L2 host-RAM conversation cache enabled (budget: %lld MiB, slots: %d)\n", (long long) c.conversation_cache_mib, c.conversation_cache_slots);
     }
     // C1 boundary: at N=1 every binding below is the very object the old run() took as a separate
     // argument - same call sequence, same objects, same order (re-root, not a rewrite).
@@ -843,7 +841,15 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         const char* e = std::getenv("STRATA_RADIX_VRAM_SLOTS");
         return (e && std::atoi(e) > 0) ? (size_t) std::atoi(e) : (size_t) 4;
     }();
-    core::RadixTree radix_tree(radix_slots);
+    const size_t radix_host_slots = [&] {
+        const char* e = std::getenv("STRATA_RADIX_HOST_SLOTS");
+        if (e && std::atoi(e) > 0) return (size_t) std::atoi(e);
+        if (c.conversation_cache_slots > 0) return (size_t) c.conversation_cache_slots;
+        return (size_t) 64;
+    }();
+    core::RadixTree radix_tree(radix_slots, radix_host_slots);
+    std::fprintf(stderr, "strata concurrent: RadixTree HiCache L2 host-RAM parking enabled (VRAM slots: %zu, Host-RAM slots: %zu)\n",
+                 radix_slots, radix_host_slots);
     auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens) {
         if (prefix_len < 256 || tokens.size() < (size_t) prefix_len) return;
         s.saved_prefix = prefix_len;
@@ -1344,7 +1350,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (s.radix_node && s.radix_node != radix_parent) radix_tree.release(s.radix_node);
             s.radix_node = radix_parent;
             radix_tree.acquire(s.radix_node);
-            std::fprintf(stderr, "strata concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld\n", (long long) reused, (long long) radix_parent->id);
+            std::fprintf(stderr, "strata concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld (%s)\n", (long long) reused, (long long) radix_parent->id, radix_parent->has_device_snapshot() ? "VRAM" : "Host-RAM HiCache L2");
         } else if (parent != nullptr && parent != &s) {
             // SPRINT 1: Cross-slot prefix fork from parent slot snapshot
             s.consumed.assign(parent->saved_consumed.begin(), parent->saved_consumed.begin() + reused);
