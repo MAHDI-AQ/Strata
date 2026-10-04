@@ -1011,8 +1011,7 @@ bool MtpDrafter::draft_begin(int T, const int32_t* tokens, int64_t p, int a, std
     const bool fused = fuse_chain_env();
     int L = 1;
     if (fused) {
-        // S1c-FIXED (the first build's L was a downward ratchet; boot receipts scratch/lane-spec-boots/
-        // report section 4): the cap reads the round's fair per-slot row allocation (alloc_share_, set by
+        // S1c-FIXED: the cap reads the round's fair per-slot row allocation (alloc_share_, set by
         // the serve loop from the row budget and the served-slot count) - a quantity this chain can never
         // influence.  The old `T - 1` term read the row count of the window just verified, which the cap
         // itself sized (that window's count <= L + 1), so L could only fall and L = 1 was absorbing.

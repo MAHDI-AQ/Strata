@@ -33,7 +33,7 @@ with the recorded <20-row fallback). Judged statistic = cross-agent median (the 
 ```bash
 # one arm
 bash tools/acceptance/run_envelope.sh --cell 5x87.5K --label a1 \
-    --config ./scratch/pump-boot/c5-pump.json \
+    --config /path/to/c5-pump.json \
     --gates-in /path/to/gates.json
 
 # battery (plan: label|cell|config|legs per line; '#' comments)
@@ -46,7 +46,7 @@ bash tools/acceptance/run_envelope.sh --dry-run --plan plan.txt
 python3 tools/acceptance/score_envelope.py --cell 5x87.5K \
     --streak-dir <prelim-decode-streak RESULTS_DIR> --sustained-dir <agent-sim RESULTS_DIR>
 
-# the suite gate (recorded calibration auto-detects at $WS/scratch)
+# the suite gate (recorded calibration uses lab receipts when available)
 bash tools/acceptance/selftest_acceptance.sh
 ```
 
@@ -57,11 +57,11 @@ Exit codes: runner `0 CONFIRM / 1 NOT_CONFIRM / 2 FALSIFY / 3 refused-or-failed`
 
 - Boots are owned by `tools/restart-campaign.sh` (lab root, single owner); this runner never boots
   directly and never edits fleet configs.
-- Legs are driven by the existing kits (`scratch/lane-acceptance-kits/fixed/`): `run_decode_streak.sh`
+- Legs are driven by the existing kits (configured via STREAK_KIT / SUSTAINED_KIT): `run_decode_streak.sh`
   (streak leg) and `agent_sim.py` (sustained leg). Override with `STREAK_KIT` / `SUSTAINED_KIT`.
 - G1 spots + fault scan arrive as a `--gates-in` receipt (produced by the window's spot leg with the
   existing md-pair comparator); absent gates = `integrity: NOT_EVALUATED` and the cell cannot CONFIRM.
-- Refuses while `scratch/.primary-measuring` exists (reported, not enforced, in `--dry-run`).
+- Refuses while active measurement marker exists (reported, not enforced, in `--dry-run`).
 
 ## Known instrument gaps (named, never silently passed)
 
