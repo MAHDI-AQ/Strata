@@ -6,7 +6,10 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <vector>
 
 namespace strata::core {
 
@@ -46,6 +49,19 @@ size_t RadixNode::total_vram_bytes() const {
     return total;
 }
 
+size_t RadixNode::total_host_bytes() const {
+    size_t total = 0;
+    for (const auto& hss : stage_host_snapshots) {
+        total += hss.gdn_data.size() + hss.ple_data.size() + hss.R_data.size();
+        for (const auto& qs : hss.qsa_slices) {
+            total += qs.k_q.size() + qs.v_q4.size() + qs.k_scale.size() + qs.v_scale.size();
+            total += qs.idx_tail.size() + qs.idx_dead.size() + qs.idx_pooled.size();
+            if (qs.has_idx_block_pos) total += sizeof(int32_t);
+        }
+    }
+    return total;
+}
+
 void RadixNode::free_device() {
     for (auto& ss : stage_snapshots) {
         ss.free_device();
@@ -53,12 +69,93 @@ void RadixNode::free_device() {
     stage_snapshots.clear();
 }
 
-RadixNode::~RadixNode() {
-    free_device();
+void RadixNode::free_host() {
+    stage_host_snapshots.clear();
+    is_host_parked = false;
 }
 
-RadixTree::RadixTree(size_t max_cached_snapshots)
-    : max_cached_snapshots_(max_cached_snapshots) {
+void RadixNode::park_to_host() {
+    if (stage_snapshots.empty()) return;
+    stage_host_snapshots.resize(stage_snapshots.size());
+    for (size_t st = 0; st < stage_snapshots.size(); ++st) {
+        auto& ss = stage_snapshots[st];
+        auto& hss = stage_host_snapshots[st];
+        hss.device = ss.device;
+        hss.ple_prev_saved[0] = ss.ple_prev_saved[0];
+        hss.ple_prev_saved[1] = ss.ple_prev_saved[1];
+        hss.ple_token_saved = ss.ple_token_saved;
+        hss.qsa_ord0 = ss.qsa_ord0;
+        hss.qsa_alloc = ss.qsa_alloc;
+
+        if (ss.device >= 0) {
+            const core::OnDevice on(ss.device);
+            if (ss.gdn_saved && ss.gdn_bytes > 0) {
+                hss.gdn_data.resize(ss.gdn_bytes);
+                cudaMemcpy(hss.gdn_data.data(), ss.gdn_saved, ss.gdn_bytes, cudaMemcpyDeviceToHost);
+            }
+            if (ss.ple_saved && ss.ple_bytes > 0) {
+                hss.ple_data.resize(ss.ple_bytes);
+                cudaMemcpy(hss.ple_data.data(), ss.ple_saved, ss.ple_bytes, cudaMemcpyDeviceToHost);
+            }
+            if (ss.R_saved && ss.R_bytes > 0) {
+                hss.R_data.resize(ss.R_bytes);
+                cudaMemcpy(hss.R_data.data(), ss.R_saved, ss.R_bytes, cudaMemcpyDeviceToHost);
+            }
+            hss.qsa_slices.resize(ss.qsa_slices.size());
+            for (size_t j = 0; j < ss.qsa_slices.size(); ++j) {
+                const auto& src = ss.qsa_slices[j];
+                auto& dst = hss.qsa_slices[j];
+                if (src.k_q && src.k_bytes > 0) {
+                    dst.k_q.resize(src.k_bytes);
+                    cudaMemcpy(dst.k_q.data(), src.k_q, src.k_bytes, cudaMemcpyDeviceToHost);
+                }
+                if (src.v_q4 && src.v_bytes > 0) {
+                    dst.v_q4.resize(src.v_bytes);
+                    cudaMemcpy(dst.v_q4.data(), src.v_q4, src.v_bytes, cudaMemcpyDeviceToHost);
+                }
+                if (src.k_scale && src.k_scale_bytes > 0) {
+                    dst.k_scale.resize(src.k_scale_bytes);
+                    cudaMemcpy(dst.k_scale.data(), src.k_scale, src.k_scale_bytes, cudaMemcpyDeviceToHost);
+                }
+                if (src.v_scale && src.v_scale_bytes > 0) {
+                    dst.v_scale.resize(src.v_scale_bytes);
+                    cudaMemcpy(dst.v_scale.data(), src.v_scale, src.v_scale_bytes, cudaMemcpyDeviceToHost);
+                }
+                if (src.idx_tail && src.idx_tail_bytes > 0) {
+                    dst.idx_tail.resize(src.idx_tail_bytes);
+                    cudaMemcpy(dst.idx_tail.data(), src.idx_tail, src.idx_tail_bytes, cudaMemcpyDeviceToHost);
+                }
+                if (src.idx_dead && src.idx_dead_bytes > 0) {
+                    dst.idx_dead.resize(src.idx_dead_bytes);
+                    cudaMemcpy(dst.idx_dead.data(), src.idx_dead, src.idx_dead_bytes, cudaMemcpyDeviceToHost);
+                }
+                if (src.idx_pooled && src.idx_pooled_bytes > 0) {
+                    dst.idx_pooled.resize(src.idx_pooled_bytes);
+                    cudaMemcpy(dst.idx_pooled.data(), src.idx_pooled, src.idx_pooled_bytes, cudaMemcpyDeviceToHost);
+                }
+                if (src.idx_block_pos) {
+                    dst.has_idx_block_pos = true;
+                    cudaMemcpy(&dst.idx_block_pos_val, src.idx_block_pos, sizeof(int32_t), cudaMemcpyDeviceToHost);
+                }
+            }
+        }
+        ss.free_device();
+    }
+    stage_snapshots.clear();
+    is_host_parked = true;
+}
+
+RadixNode::~RadixNode() {
+    free_device();
+    free_host();
+}
+
+RadixTree::RadixTree(size_t max_cached_snapshots, size_t max_host_snapshots)
+    : max_cached_snapshots_(max_cached_snapshots), max_host_snapshots_(max_host_snapshots) {
+    const char* env_l2 = std::getenv("STRATA_HICACHE_L2_SLOTS");
+    if (env_l2) {
+        max_host_snapshots_ = (size_t) std::strtoul(env_l2, nullptr, 10);
+    }
     root_ = std::make_shared<RadixNode>();
     root_->id = 0;
     root_->prefix_len = 0;
@@ -365,7 +462,7 @@ bool RadixTree::fork_to_session(
     std::string& err) {
 
     if (!node || !node->has_snapshot()) {
-        err = "radix_fork: node has no device snapshot";
+        err = "radix_fork: node has no snapshot";
         return false;
     }
 
@@ -380,63 +477,126 @@ bool RadixTree::fork_to_session(
     const int64_t pages = (prefix_len + qs.page_size - 1) / qs.page_size;
     const size_t qsa_rows = (size_t) pages * qs.n_head_kv * qs.page_size;
 
-    for (size_t st = 0; st < n_stages; ++st) {
-        const auto& ss = node->stage_snapshots[st];
-        auto* child = child_states[st];
-        const core::OnDevice on(ss.device);
-        cudaStream_t cs = (cudaStream_t) streams[st];
+    if (node->has_device_snapshot()) {
+        for (size_t st = 0; st < n_stages && st < node->stage_snapshots.size(); ++st) {
+            const auto& ss = node->stage_snapshots[st];
+            auto* child = child_states[st];
+            const core::OnDevice on(ss.device);
+            cudaStream_t cs = (cudaStream_t) streams[st];
 
-        if (ss.R_saved && child->block.R) {
-            cudaMemcpyAsync(child->block.R, ss.R_saved, ss.R_bytes, cudaMemcpyDeviceToDevice, cs);
+            if (ss.R_saved && child->block.R) {
+                cudaMemcpyAsync(child->block.R, ss.R_saved, ss.R_bytes, cudaMemcpyDeviceToDevice, cs);
+            }
+
+            if (ss.gdn_saved && child->gdn_state) {
+                cudaMemcpyAsync(child->gdn_state, ss.gdn_saved, ss.gdn_bytes, cudaMemcpyDeviceToDevice, cs);
+            }
+
+            if (ss.ple_saved && child->ple_hist) {
+                cudaMemcpyAsync(child->ple_hist, ss.ple_saved, ss.ple_bytes, cudaMemcpyDeviceToDevice, cs);
+                child->ple_prev[0] = ss.ple_prev_saved[0];
+                child->ple_prev[1] = ss.ple_prev_saved[1];
+                child->ple_token = ss.ple_token_saved;
+            }
+
+            for (int64_t j = 0; j < child->qsa_alloc && j < (int64_t) ss.qsa_slices.size(); ++j) {
+                const auto& slice = ss.qsa_slices[j];
+                QsaState& cst = child->qsa_states[child->qsa_ord0 + j];
+
+                if (cst.kv_q4) {
+                    const size_t bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                    if (slice.k_q && cst.k_q4) cudaMemcpyAsync(cst.k_q4, slice.k_q, bytes, cudaMemcpyDeviceToDevice, cs);
+                    if (slice.v_q4 && cst.v_q4) cudaMemcpyAsync(cst.v_q4, slice.v_q4, bytes, cudaMemcpyDeviceToDevice, cs);
+                } else if (cst.kv_hybrid) {
+                    const size_t k_bytes = qsa_rows * qs.head_dim;
+                    const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                    const size_t v_bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                    if (slice.k_q && cst.k_q) cudaMemcpyAsync(cst.k_q, slice.k_q, k_bytes, cudaMemcpyDeviceToDevice, cs);
+                    if (slice.k_scale && cst.k_scale) cudaMemcpyAsync(cst.k_scale, slice.k_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
+                    if (slice.v_q4 && cst.v_q4) cudaMemcpyAsync(cst.v_q4, slice.v_q4, v_bytes, cudaMemcpyDeviceToDevice, cs);
+                } else if (cst.kv_int8) {
+                    const size_t bytes = qsa_rows * qs.head_dim;
+                    const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                    if (slice.k_q && cst.k_q) cudaMemcpyAsync(cst.k_q, slice.k_q, bytes, cudaMemcpyDeviceToDevice, cs);
+                    if (slice.v_q4 && cst.v_q) cudaMemcpyAsync(cst.v_q, slice.v_q4, bytes, cudaMemcpyDeviceToDevice, cs);
+                    if (slice.k_scale && cst.k_scale) cudaMemcpyAsync(cst.k_scale, slice.k_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
+                    if (slice.v_scale && cst.v_scale) cudaMemcpyAsync(cst.v_scale, slice.v_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
+                }
+
+                if (slice.idx_tail && cst.idx_tail) {
+                    cudaMemcpyAsync(cst.idx_tail, slice.idx_tail, slice.idx_tail_bytes, cudaMemcpyDeviceToDevice, cs);
+                }
+                if (slice.idx_dead && cst.idx_dead) {
+                    cudaMemcpyAsync(cst.idx_dead, slice.idx_dead, slice.idx_dead_bytes, cudaMemcpyDeviceToDevice, cs);
+                }
+                if (slice.idx_block_pos && cst.idx_block_pos) {
+                    cudaMemcpyAsync(cst.idx_block_pos, slice.idx_block_pos, sizeof(int32_t), cudaMemcpyDeviceToDevice, cs);
+                }
+                const int64_t pooled_rows = prefix_len / qs.idx_block;
+                if (pooled_rows > 0 && slice.idx_pooled && cst.idx_pooled) {
+                    cudaMemcpyAsync(cst.idx_pooled, slice.idx_pooled, slice.idx_pooled_bytes, cudaMemcpyDeviceToDevice, cs);
+                }
+            }
         }
+    } else if (node->has_host_snapshot()) {
+        for (size_t st = 0; st < n_stages && st < node->stage_host_snapshots.size(); ++st) {
+            const auto& hss = node->stage_host_snapshots[st];
+            auto* child = child_states[st];
+            const core::OnDevice on(hss.device);
+            cudaStream_t cs = (cudaStream_t) streams[st];
 
-        if (ss.gdn_saved && child->gdn_state) {
-            cudaMemcpyAsync(child->gdn_state, ss.gdn_saved, ss.gdn_bytes, cudaMemcpyDeviceToDevice, cs);
-        }
-
-        if (ss.ple_saved && child->ple_hist) {
-            cudaMemcpyAsync(child->ple_hist, ss.ple_saved, ss.ple_bytes, cudaMemcpyDeviceToDevice, cs);
-            child->ple_prev[0] = ss.ple_prev_saved[0];
-            child->ple_prev[1] = ss.ple_prev_saved[1];
-            child->ple_token = ss.ple_token_saved;
-        }
-
-        for (int64_t j = 0; j < child->qsa_alloc && j < (int64_t) ss.qsa_slices.size(); ++j) {
-            const auto& slice = ss.qsa_slices[j];
-            QsaState& cst = child->qsa_states[child->qsa_ord0 + j];
-
-            if (cst.kv_q4) {
-                const size_t bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
-                if (slice.k_q && cst.k_q4) cudaMemcpyAsync(cst.k_q4, slice.k_q, bytes, cudaMemcpyDeviceToDevice, cs);
-                if (slice.v_q4 && cst.v_q4) cudaMemcpyAsync(cst.v_q4, slice.v_q4, bytes, cudaMemcpyDeviceToDevice, cs);
-            } else if (cst.kv_hybrid) {
-                const size_t k_bytes = qsa_rows * qs.head_dim;
-                const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
-                const size_t v_bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
-                if (slice.k_q && cst.k_q) cudaMemcpyAsync(cst.k_q, slice.k_q, k_bytes, cudaMemcpyDeviceToDevice, cs);
-                if (slice.k_scale && cst.k_scale) cudaMemcpyAsync(cst.k_scale, slice.k_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
-                if (slice.v_q4 && cst.v_q4) cudaMemcpyAsync(cst.v_q4, slice.v_q4, v_bytes, cudaMemcpyDeviceToDevice, cs);
-            } else if (cst.kv_int8) {
-                const size_t bytes = qsa_rows * qs.head_dim;
-                const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
-                if (slice.k_q && cst.k_q) cudaMemcpyAsync(cst.k_q, slice.k_q, bytes, cudaMemcpyDeviceToDevice, cs);
-                if (slice.v_q4 && cst.v_q) cudaMemcpyAsync(cst.v_q, slice.v_q4, bytes, cudaMemcpyDeviceToDevice, cs);
-                if (slice.k_scale && cst.k_scale) cudaMemcpyAsync(cst.k_scale, slice.k_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
-                if (slice.v_scale && cst.v_scale) cudaMemcpyAsync(cst.v_scale, slice.v_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
+            if (!hss.R_data.empty() && child->block.R) {
+                cudaMemcpyAsync(child->block.R, hss.R_data.data(), hss.R_data.size(), cudaMemcpyHostToDevice, cs);
             }
 
-            if (slice.idx_tail && cst.idx_tail) {
-                cudaMemcpyAsync(cst.idx_tail, slice.idx_tail, slice.idx_tail_bytes, cudaMemcpyDeviceToDevice, cs);
+            if (!hss.gdn_data.empty() && child->gdn_state) {
+                cudaMemcpyAsync(child->gdn_state, hss.gdn_data.data(), hss.gdn_data.size(), cudaMemcpyHostToDevice, cs);
             }
-            if (slice.idx_dead && cst.idx_dead) {
-                cudaMemcpyAsync(cst.idx_dead, slice.idx_dead, slice.idx_dead_bytes, cudaMemcpyDeviceToDevice, cs);
+
+            if (!hss.ple_data.empty() && child->ple_hist) {
+                cudaMemcpyAsync(child->ple_hist, hss.ple_data.data(), hss.ple_data.size(), cudaMemcpyHostToDevice, cs);
+                child->ple_prev[0] = hss.ple_prev_saved[0];
+                child->ple_prev[1] = hss.ple_prev_saved[1];
+                child->ple_token = hss.ple_token_saved;
             }
-            if (slice.idx_block_pos && cst.idx_block_pos) {
-                cudaMemcpyAsync(cst.idx_block_pos, slice.idx_block_pos, sizeof(int32_t), cudaMemcpyDeviceToDevice, cs);
-            }
-            const int64_t pooled_rows = prefix_len / qs.idx_block;
-            if (pooled_rows > 0 && slice.idx_pooled && cst.idx_pooled) {
-                cudaMemcpyAsync(cst.idx_pooled, slice.idx_pooled, slice.idx_pooled_bytes, cudaMemcpyDeviceToDevice, cs);
+
+            for (int64_t j = 0; j < child->qsa_alloc && j < (int64_t) hss.qsa_slices.size(); ++j) {
+                const auto& slice = hss.qsa_slices[j];
+                QsaState& cst = child->qsa_states[child->qsa_ord0 + j];
+
+                if (cst.kv_q4) {
+                    const size_t bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                    if (!slice.k_q.empty() && cst.k_q4) cudaMemcpyAsync(cst.k_q4, slice.k_q.data(), bytes, cudaMemcpyHostToDevice, cs);
+                    if (!slice.v_q4.empty() && cst.v_q4) cudaMemcpyAsync(cst.v_q4, slice.v_q4.data(), bytes, cudaMemcpyHostToDevice, cs);
+                } else if (cst.kv_hybrid) {
+                    const size_t k_bytes = qsa_rows * qs.head_dim;
+                    const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                    const size_t v_bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                    if (!slice.k_q.empty() && cst.k_q) cudaMemcpyAsync(cst.k_q, slice.k_q.data(), k_bytes, cudaMemcpyHostToDevice, cs);
+                    if (!slice.k_scale.empty() && cst.k_scale) cudaMemcpyAsync(cst.k_scale, slice.k_scale.data(), sc_bytes, cudaMemcpyHostToDevice, cs);
+                    if (!slice.v_q4.empty() && cst.v_q4) cudaMemcpyAsync(cst.v_q4, slice.v_q4.data(), v_bytes, cudaMemcpyHostToDevice, cs);
+                } else if (cst.kv_int8) {
+                    const size_t bytes = qsa_rows * qs.head_dim;
+                    const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                    if (!slice.k_q.empty() && cst.k_q) cudaMemcpyAsync(cst.k_q, slice.k_q.data(), bytes, cudaMemcpyHostToDevice, cs);
+                    if (!slice.v_q4.empty() && cst.v_q) cudaMemcpyAsync(cst.v_q, slice.v_q4.data(), bytes, cudaMemcpyHostToDevice, cs);
+                    if (!slice.k_scale.empty() && cst.k_scale) cudaMemcpyAsync(cst.k_scale, slice.k_scale.data(), sc_bytes, cudaMemcpyHostToDevice, cs);
+                    if (!slice.v_scale.empty() && cst.v_scale) cudaMemcpyAsync(cst.v_scale, slice.v_scale.data(), sc_bytes, cudaMemcpyHostToDevice, cs);
+                }
+
+                if (!slice.idx_tail.empty() && cst.idx_tail) {
+                    cudaMemcpyAsync(cst.idx_tail, slice.idx_tail.data(), slice.idx_tail.size(), cudaMemcpyHostToDevice, cs);
+                }
+                if (!slice.idx_dead.empty() && cst.idx_dead) {
+                    cudaMemcpyAsync(cst.idx_dead, slice.idx_dead.data(), slice.idx_dead.size(), cudaMemcpyHostToDevice, cs);
+                }
+                if (slice.has_idx_block_pos && cst.idx_block_pos) {
+                    cudaMemcpyAsync(cst.idx_block_pos, &slice.idx_block_pos_val, sizeof(int32_t), cudaMemcpyHostToDevice, cs);
+                }
+                const int64_t pooled_rows = prefix_len / qs.idx_block;
+                if (pooled_rows > 0 && !slice.idx_pooled.empty() && cst.idx_pooled) {
+                    cudaMemcpyAsync(cst.idx_pooled, slice.idx_pooled.data(), slice.idx_pooled.size(), cudaMemcpyHostToDevice, cs);
+                }
             }
         }
     }
@@ -478,6 +638,7 @@ size_t RadixTree::evict_lru(size_t max_snapshots, size_t min_free_vram_mib) {
         return false;
     };
 
+    // Tier 1: Park excess VRAM snapshots to HiCache L2 Host-RAM
     while (cached_snapshots_ > 0 && should_evict()) {
         std::vector<std::shared_ptr<RadixNode>> leaves;
         collect_unreferenced_leaves(root_, leaves);
@@ -487,17 +648,49 @@ size_t RadixTree::evict_lru(size_t max_snapshots, size_t min_free_vram_mib) {
             return a->last_accessed < b->last_accessed;
         });
 
-        auto victim = leaves.front();
-        if (victim->has_snapshot()) {
-            victim->free_device();
-            if (cached_snapshots_ > 0) --cached_snapshots_;
-            ++evicted;
+        std::shared_ptr<RadixNode> victim = nullptr;
+        for (const auto& leaf : leaves) {
+            if (leaf->has_device_snapshot()) {
+                victim = leaf;
+                break;
+            }
         }
+        if (!victim) break;
 
-        if (auto p = victim->parent.lock()) {
-            if (!victim->edge_tokens.empty()) {
-                p->children.erase(victim->edge_tokens[0]);
-                --node_count_;
+        victim->park_to_host();
+        if (cached_snapshots_ > 0) --cached_snapshots_;
+        ++cached_host_snapshots_;
+        ++evicted;
+    }
+
+    // Tier 2: Prune host snapshots when exceeding max_host_snapshots_
+    while (cached_host_snapshots_ > max_host_snapshots_) {
+        std::vector<std::shared_ptr<RadixNode>> leaves;
+        collect_unreferenced_leaves(root_, leaves);
+        if (leaves.empty()) break;
+
+        std::sort(leaves.begin(), leaves.end(), [](const auto& a, const auto& b) {
+            return a->last_accessed < b->last_accessed;
+        });
+
+        std::shared_ptr<RadixNode> host_victim = nullptr;
+        for (const auto& leaf : leaves) {
+            if (leaf->has_host_snapshot()) {
+                host_victim = leaf;
+                break;
+            }
+        }
+        if (!host_victim) break;
+
+        host_victim->free_host();
+        if (cached_host_snapshots_ > 0) --cached_host_snapshots_;
+
+        if (host_victim->children.empty() && host_victim->ref_count == 0) {
+            if (auto p = host_victim->parent.lock()) {
+                if (!host_victim->edge_tokens.empty()) {
+                    p->children.erase(host_victim->edge_tokens[0]);
+                    --node_count_;
+                }
             }
         }
     }

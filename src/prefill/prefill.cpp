@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include <unordered_map>
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
@@ -358,6 +359,8 @@ struct Prefill::Impl {
     int64_t ple_pf_n = 0;
     int ple_pf_buf = 0;
     int ple_up = 0;              // the ple_emb_host buffer the last uploaded chunk used (R2's alternation)
+    // Fused GDN Alpha+Beta weights per layer
+    std::unordered_map<int64_t, uint16_t*> wab_fused;
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -407,6 +410,10 @@ Prefill::~Prefill() {
     if (impl_->ple_pf.valid()) impl_->ple_pf.wait();
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
+    for (auto& kv : impl_->wab_fused) {
+        if (kv.second) cudaFree(kv.second);
+    }
+    impl_->wab_fused.clear();
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -1424,8 +1431,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
-                    if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV)) return false;
-                    if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV)) return false;
+                    // Fused GDN Alpha+Beta Multi-Projection GEMM:
+                    // Fuses wa [HV, K] and wb [HV, K] into single contiguous GEMM [2*HV, K] writing m.ab [T, 2*HV].
+                    uint16_t*& wab = m.wab_fused[l];
+                    if (!wab && wa->data && wb->data && wa->kind == core::WeightKind::Bf16InF32 && wb->kind == core::WeightKind::Bf16InF32) {
+                        const size_t sz = (size_t) HV * (size_t) g.n_embd * sizeof(uint16_t);
+                        if (cudaMalloc((void**) &wab, sz * 2) == cudaSuccess) {
+                            cudaMemcpyAsync(wab, wa->data, sz, cudaMemcpyDeviceToDevice, cs);
+                            cudaMemcpyAsync(wab + (size_t) HV * (size_t) g.n_embd, wb->data, sz, cudaMemcpyDeviceToDevice, cs);
+                        } else {
+                            cudaGetLastError();
+                            wab = nullptr;
+                        }
+                    }
+                    if (wab) {
+                        m.gemm.bf16(m.mixed_bf, wab, m.ab, T, 2 * HV, g.n_embd, 2 * HV);
+                    } else {
+                        if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV)) return false;
+                        if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV)) return false;
+                    }
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
