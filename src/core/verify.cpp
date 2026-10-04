@@ -3,7 +3,6 @@
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
-
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -34,7 +33,6 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
-
 #include <algorithm>
 #include <atomic>
 #include <map>
@@ -49,16 +47,13 @@
 #include <cstring>
 #include <exception>
 #include <immintrin.h>
-
 namespace strata::core {
 namespace {
-
 constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
-
 struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
@@ -68,13 +63,11 @@ struct Bump {
         return p;
     }
 };
-
 bool mapped(size_t bytes, void** h, void** d) {
     if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) return false;
     std::memset(*h, 0, bytes);
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
-
 strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head;
@@ -84,13 +77,11 @@ strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
     s.idx_dim = g.idx_key_dim;
     return s;
 }
-
 const WeightRef* need(const LayerView& v, const char* suffix, std::string& err) {
     const WeightRef* r = v.get(suffix);
     if (r == nullptr && err.empty()) err = v.name(suffix) + " is missing";
     return r;
 }
-
 bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
     if (w == nullptr) return false;
     if (w->native_data == nullptr) {
@@ -99,9 +90,7 @@ bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
     }
     return true;
 }
-
 }  // namespace
-
 namespace {
 std::atomic<const Verifier*> g_diag_verifier{nullptr};
 void diag_active_verifier(std::FILE* f) {
@@ -133,7 +122,6 @@ const int64_t g_test_stall = [] {
     return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
 }();
 }  // namespace
-
 bool Verifier::release_gpu_waits(int timeout_ms) {
     released_.store(true);
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
@@ -154,14 +142,12 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     }
     return true;
 }
-
 void Verifier::diag(std::FILE* f) const {
     auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
     std::fprintf(f, "  verify window: %d tokens at position %lld, host at layer step %u; the GPU rang %u; flags: "
                     "served %u, plan (A) %u, copies (B) %u\n", last_t_, (long long) last_pos0_, cur_layer_ + 1,
                  rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_));
 }
-
 Verifier::~Verifier() {
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
@@ -187,7 +173,6 @@ Verifier::~Verifier() {
     if (skip_) cudaFree(skip_);
     if (slot_off_d_) cudaFree(slot_off_d_);
 }
-
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err, bool batch_workspace) {
     g_diag_verifier.store(this);
@@ -236,12 +221,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
-
     const strata::kernels::QsaShapes s = shapes_of(g);
     cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     max_blocks_ = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
-
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
@@ -250,7 +233,6 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
-
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
@@ -289,7 +271,6 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sink_.fetch = &Verifier::fetch_dma;
         sink_.ctx = this;
     }
-
     // ---- the device arena: the same sequence counted, then carved
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
@@ -352,6 +333,34 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: stream create failed";
         return false;
     }
+    // SM89 Ada Lovelace 72MB Persistent L2 Cache Window:
+    // Pin verify device arena into persistent L2 cache to eliminate GDDR6X trips during token verification.
+    {
+        size_t max_persisting_l2 = 0;
+        cudaDeviceGetLimit(&max_persisting_l2, cudaLimitPersistingL2CacheSize);
+        if (max_persisting_l2 == 0) {
+            const size_t target_window = 40ULL * 1024 * 1024; // 40 MiB (out of 49.5 MiB max on SM89 RTX 4090)
+            if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, target_window) == cudaSuccess) {
+                max_persisting_l2 = target_window;
+            } else {
+                cudaGetLastError();
+            }
+        }
+        if (max_persisting_l2 > 0 && arena_ && count.used > 0) {
+            cudaStreamAttrValue attr;
+            std::memset(&attr, 0, sizeof(attr));
+            attr.accessPolicyWindow.base_ptr = arena_;
+            attr.accessPolicyWindow.num_bytes = std::min<size_t>(count.used, max_persisting_l2);
+            attr.accessPolicyWindow.hitRatio = 1.0f;
+            attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+            attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+            if (cudaStreamSetAttribute(cs_, cudaStreamAttributeAccessPolicyWindow, &attr) == cudaSuccess) {
+                std::fprintf(stderr, "strata verify: SM89 persistent L2 cache window enabled (%.1f MiB on cs)\n", (double) attr.accessPolicyWindow.num_bytes / 1048576.0);
+            } else {
+                cudaGetLastError();
+            }
+        }
+    }
     if (batch_workspace && batch_parallel_) {
         if (cudaEventCreateWithFlags(&batch_fork_, cudaEventDisableTiming) != cudaSuccess) {
             err = "batch verify: fork event failed"; return false;
@@ -379,9 +388,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                  (double) count.used / 1048576.0);
     return true;
 }
-
 const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
-
 // ================================ THE WINDOW, AS CAPTURED ================================
 //
 // Plan v0.3 P6 (split window): with `groups_ == 2` the window's tokens are cut into two groups A = [0, T/2 up) and
@@ -414,7 +421,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     groups_[T] = G;
-
     // ---- the window's inputs, from mapped staging
     const int64_t HB = Verifier::handoff_floats(g);
     const int32_t* pos_k = pos_ + MT * NH;
@@ -425,7 +431,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     if (ple_on) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
-
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
     if (lb_ > 0) {
@@ -455,7 +460,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                              row_codes, row_groups, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     }
-
     }
     if (phase == 0) return true;
     // per-layer state indices (GDN and QSA layers are numbered separately)
@@ -467,7 +471,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
             else gdn_idx[(size_t) l] = gi++;
         }
     }
-
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
@@ -756,7 +759,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
         stamp(l, 18, grp);
         return true;
     };
-
     // ---------------------------------------------------------------- post(l, group): experts, combine
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
@@ -843,7 +845,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
         }
         return true;
     };
-
     if (phase == 1) return pre(layer, 0);
     if (phase == 2 || phase == 3) return post(layer, 0);
     if (phase == 5) {   // C2-A3: a split's earlier stage hands this window's packed rows on
@@ -872,7 +873,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
         }
         return true;
     }
-
     }
     // ---- the head, T columns, and the argmax of each
     stamp(g.n_layers, 0, 0);
@@ -911,7 +911,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
     stamp(g.n_layers, 1, 0);
     return true;
 }
-
 std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
@@ -937,7 +936,6 @@ std::string Verifier::profile_report() {
     prof_windows_ = 0;
     return out;
 }
-
 bool Verifier::capture(int T, std::string& err) {
     if (exec_[parity_][T] != nullptr) return true;
     const OnDevice on_device(device_);
@@ -1001,7 +999,6 @@ bool Verifier::capture(int T, std::string& err) {
                  cudaGetErrorString(ue), cudaGetErrorString(us));
     return true;
 }
-
 bool Verifier::capture_commit(std::string& err) {
     if (commit_exec_ != nullptr) return true;
     const OnDevice on_device(device_);
@@ -1068,7 +1065,6 @@ bool Verifier::capture_commit(std::string& err) {
     cudaGraphDestroy(graph);
     return true;
 }
-
 bool Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
@@ -1103,7 +1099,6 @@ bool Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0, std::str
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     return true;
 }
-
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     using namespace strata::kernels;
@@ -1178,7 +1173,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     return true;
 }
-
 // C2: the shared batch-round preparation - validation, per-member staging and the graph
 // lookup/capture.  run_batch (serial) and begin_pass_batch (stage-pipeline overlap) both call
 // it; they differ only in what they do with the captured graph (run it here, or launch it as a
@@ -1482,7 +1476,6 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
     }
     return true;
 }
-
 bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user, std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
@@ -1538,7 +1531,6 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
         for (int t = 0; t < b.count; ++t) b.output[t] = b.verifier->h_out_[t];
     return true;
 }
-
 void Verifier::set_plan_slot(int grp) {
     const int64_t cap = sink_.cap;
     int32_t* base = h_plan_ + (size_t) grp * (size_t) plan_i32_;
@@ -1556,7 +1548,6 @@ void Verifier::set_plan_slot(int grp) {
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
 }
-
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
 void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
     volatile long* f = (volatile long*) flag;
@@ -1572,7 +1563,6 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
     while (cur < value && !__atomic_compare_exchange_n((uint32_t*) flag, &cur, value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
 #endif
 }
-
 // Plan v0.3 P6: the PCIe share by DMA.  The copy engine moves the blobs while the CPU computes its own share and the
 // GPU its VRAM experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe
 // groups).  Staging is split between the two token groups of a split window.
@@ -1588,13 +1578,11 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     fs.value = want;
     cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
 }
-
 void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
     _mm_sfence();
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
-
 // LANE hostloop: commit() is split so callers can LAUNCH every slot's commit chain first and wait
 // afterwards (the per-slot chains then run concurrently instead of one-slot-at-a-time).  The
 // contract is unchanged for the historical wrapper: commit() == commit_launch() + commit_wait().
@@ -1617,7 +1605,6 @@ bool Verifier::commit_launch(int n_keep, std::string& err) {
     if (next_ != nullptr) return next_->commit_launch(n_keep, err);
     return true;
 }
-
 // Only the CHAIN TAIL waits.  The tail's wait is the caller's dependency: the drafter's own stream
 // reads the last stage's committed state next (ms_commit now measures the tail WAIT only).
 bool Verifier::commit_wait(std::string& err) {
@@ -1628,12 +1615,9 @@ bool Verifier::commit_wait(std::string& err) {
     ms_commit += ms_since(t0);
     return true;
 }
-
 bool Verifier::commit(int n_keep, std::string& err) {
     return commit_launch(n_keep, err) && commit_wait(err);
 }
-
-
 // ============================ STAGE-PIPELINE OVERLAP (lane overlap) ============================
 //
 // The serial round runs stage0's pass to completion (host loop, cs_ sync), then stage1's, and the
@@ -1678,7 +1662,6 @@ bool Verifier::launch_pass(int T, cudaEvent_t done, std::string& err) {
     VDBG("launched\n");
     return true;
 }
-
 bool Verifier::service_one(int64_t k, PoolMultiFn pool, void* user, std::string& err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
@@ -1719,7 +1702,6 @@ bool Verifier::service_one(int64_t k, PoolMultiFn pool, void* user, std::string&
     (void) err;
     return true;
 }
-
 bool Verifier::pass_stall(uint32_t want, int64_t l, Clock::time_point wait_start, Clock::time_point& last_flush,
                           std::string& err) {
     const auto now = Clock::now();
@@ -1739,7 +1721,6 @@ bool Verifier::pass_stall(uint32_t want, int64_t l, Clock::time_point wait_start
     }
     return true;
 }
-
 bool Verifier::begin_pass_window(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user,
                                  cudaEvent_t done, std::string& err) {
     const OnDevice on_device(device_);
@@ -1766,7 +1747,6 @@ bool Verifier::begin_pass_window(int T, const int32_t* tokens, int64_t pos0, Poo
     pass_wait_reported_ = false;
     return true;
 }
-
 bool Verifier::begin_pass_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user,
                                 cudaEvent_t done, std::string& err) {
     const OnDevice on_device(device_);
@@ -1792,7 +1772,6 @@ bool Verifier::begin_pass_batch(const std::vector<BatchWindow>& batch, PoolMulti
     pass_wait_reported_ = false;
     return true;
 }
-
 int Verifier::pass_step(std::string& err) {
     if (!pass_live_ || pass_k_ >= pass_total_) return 0;
     const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
@@ -1815,7 +1794,6 @@ int Verifier::pass_step(std::string& err) {
     pass_wait_reported_ = false;
     return 1;
 }
-
 bool Verifier::drive_passes(Verifier* a, Verifier* b, std::string& err) {
     // LANE sched-impl P3 (host-loop O3 counter-only): count consecutive no-progress iterations per
     // call. Default off (STRATA_DRIVE_HISTO unset = old path, one getenv per call); when on, two ALU
@@ -1846,7 +1824,6 @@ bool Verifier::drive_passes(Verifier* a, Verifier* b, std::string& err) {
         } else if (counting) burst = 0;
     }
 }
-
 void Verifier::pass_prof_dump() {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
@@ -1873,7 +1850,6 @@ void Verifier::pass_prof_dump() {
     prof_sum_[0][26] += (double) (at(L, 1) - at(L, 0));
     ++prof_windows_;
 }
-
 bool Verifier::pass_finish_outputs(int T, int32_t* out, std::string& err) {
     using namespace strata::kernels;
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
@@ -1896,7 +1872,6 @@ bool Verifier::pass_finish_outputs(int T, int32_t* out, std::string& err) {
     progress_beat();
     return true;
 }
-
 bool Verifier::end_pass_window(int T, int32_t* out, std::string& err) {
     const OnDevice on_device(device_);
     pass_live_ = false;
@@ -1932,7 +1907,6 @@ bool Verifier::end_pass_window(int T, int32_t* out, std::string& err) {
     }
     return pass_finish_outputs(T, out, err);
 }
-
 bool Verifier::end_pass_batch(const std::vector<BatchWindow>& batch, std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
@@ -1979,7 +1953,4 @@ bool Verifier::end_pass_batch(const std::vector<BatchWindow>& batch, std::string
         for (int t = 0; t < b.count; ++t) b.output[t] = b.verifier->h_out_[t];
     return true;
 }
-
-
-
 }  // namespace strata::core
