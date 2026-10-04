@@ -841,7 +841,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     });
     const size_t radix_slots = [] {
         const char* e = std::getenv("STRATA_RADIX_VRAM_SLOTS");
-        return (e && std::atoi(e) > 0) ? (size_t) std::atoi(e) : (size_t) 8;
+        return (e && std::atoi(e) > 0) ? (size_t) std::atoi(e) : (size_t) 4;
     }();
     core::RadixTree radix_tree(radix_slots);
     auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens) {
