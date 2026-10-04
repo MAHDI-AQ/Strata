@@ -1816,12 +1816,21 @@ bool Verifier::drive_passes(Verifier* a, Verifier* b, std::string& err) {
         if (!done_a) { const int r = a->pass_step(err); if (r < 0) return false; progressed += r; }
         if (!done_b) { const int r = b->pass_step(err); if (r < 0) return false; progressed += r; }
         if (!progressed) {
+            ++burst;
             if (counting) {
                 ++acct->drive_idle_iters;
-                if (++burst > acct->drive_idle_maxburst) acct->drive_idle_maxburst = burst;
+                if (burst > acct->drive_idle_maxburst) acct->drive_idle_maxburst = burst;
             }
-            _mm_pause();
-        } else if (counting) burst = 0;
+            if (burst < 64) {
+                _mm_pause();
+            } else if (burst < 256) {
+                for (int p = 0; p < 8; ++p) _mm_pause();
+            } else {
+                for (int p = 0; p < 32; ++p) _mm_pause();
+            }
+        } else {
+            burst = 0;
+        }
     }
 }
 void Verifier::pass_prof_dump() {
