@@ -293,6 +293,13 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
+
+def session_hint(ids) -> int:
+    h = hashlib.blake2b(digest_size=8)
+    h.update(b"strata-sess:")
+    h.update(",".join(str(int(t)) for t in ids[:256]).encode())
+    return int.from_bytes(h.digest(), "big")
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.

@@ -159,6 +159,8 @@ struct ConcurrentServe::Impl {
         spec::SuffixDrafter suffix;
         spec::DraftPolicy policy{8};
         Request request;
+        int64_t max_context = 0;
+        bool is_aux = false;
         // Lane prefill: `active`/`read`/`position`/`prompt_ms` are touched by the pump thread as well as by
         // the loop.  The gate that keeps them disjoint is `read < position`: only the pump advances `read`
         // during prompt processing, and the loop only decodes (and re-sets `read = position`) once the slot
@@ -306,11 +308,15 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
     m.shared_draft = &draft;
     m.session_k = primary.k;
     static const core::ModelGeometry draft_geometry{};
+    const int primary_slots = (c.aux_slots > 0 && c.aux_slots < c.requests) ? (c.requests - c.aux_slots) : c.requests;
     for (int i = 0; i < c.requests; ++i) {
+        const int64_t slot_context = (i >= primary_slots && c.aux_context > 0) ? c.aux_context : c.context;
         // Register ownership before any allocation that can fail partway through initialization.
         m.slots.push_back(std::make_unique<Impl::Slot>(stages.size()));
         auto& s = m.slots.back();
-        s->suffix = spec::SuffixDrafter(std::max(1, c.suffix), 64, (size_t) c.context + 4096);
+        s->max_context = slot_context;
+        s->is_aux = (i >= primary_slots);
+        s->suffix = spec::SuffixDrafter(std::max(1, c.suffix), 64, (size_t) slot_context + 4096);
         for (size_t st = 0; st < stages.size(); ++st) {
             auto& gs = s->stages[st];
             const core::OnDevice on(stages[st].device);
@@ -318,24 +324,15 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
                 // Slot 0 borrows the CLI's chain: the primary on stage 0, the CLI stage sessions beyond it.
                 gs.state = st == 0 ? &primary : stages[st].session;
             } else if (m.lazy_slots) {
-                // STRATA_SLOT_LAZY: the arena is carved from this stage's expert-cache tail at the slot's
-                // first admission (run()'s bringup_slot).  Record the byte count here, where `primary` is
-                // in scope; `gs.state` is the same owned state the eager branch points at.
                 gs.state = &gs.owned;
-                m.deferred_bytes[st] = (int64_t) core::session_bytes(g, c.context, primary.k, stages[st].lb, stages[st].le);
-                // lane lazy-enabler: under --batch-parallel each slot's member stream needs its own PLE
-                // scratch - the exact allocation the eager branch below makes; bringup_slot wires it.  It
-                // is tiny (~0.25 MiB) and spent here BEFORE every cache sizing, so it is already netted
-                // out of the free figures the sizers read - never add it to a reserve or to deferred_bytes.
+                m.deferred_bytes[st] = (int64_t) core::session_bytes(g, slot_context, primary.k, stages[st].lb, stages[st].le);
                 if (st == 0 && c.parallel_batch && primary.ple.ready()) {
                     if (!gpu_alloc(&gs.ple_scratch, (size_t) core::ple_run_scratch_bytes(), c.reserve_mib, err)) return false;
                 }
             } else {
-                // C4 follow-up (C5 reconciliation): an owned stage session carves ONLY its stage's layers -
-                // same range convention as the CLI's per-stage carve (le == -1 resolves to the end).
-                if (!gpu_alloc(&gs.arena, core::session_bytes(g, c.context, primary.k, stages[st].lb, stages[st].le), c.reserve_mib, err)) return false;
+                if (!gpu_alloc(&gs.arena, core::session_bytes(g, slot_context, primary.k, stages[st].lb, stages[st].le), c.reserve_mib, err)) return false;
                 gs.state = &gs.owned;
-                if (!core::session_init(g, c.context, primary.k, gs.arena, gs.owned, stages[st].lb, stages[st].le)) { err = "concurrency: session initialization failed"; return false; }
+                if (!core::session_init(g, slot_context, primary.k, gs.arena, gs.owned, stages[st].lb, stages[st].le)) { err = "concurrency: session initialization failed"; return false; }
                 if (st == 0) {
                     // The PLE is a layer-1 module: only the stage that holds layer 1 (stage 0 for any legal
                     // split) wires it.  Stages >= 1 leave it unwired there (ready() == false).
@@ -653,6 +650,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s%s\n",
                 c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.kv.c_str(), c.suffix, adaptive ? "adaptive" : "static",
                 retain ? " admission=d1" : "");
+    const int primary_slots = (c.aux_slots > 0 && c.aux_slots < c.requests) ? (c.requests - c.aux_slots) : c.requests;
+    if (c.aux_slots > 0) std::fprintf(stderr, "strata concurrent: tiered slots: %d primary @ %lld tokens, %d aux @ %lld tokens\n", primary_slots, (long long) c.context, c.aux_slots, (long long) c.aux_context);
     std::printf("READY %lld stop multiplex\n", (long long) c.context);
     // LANE sched-impl P2 (host-loop O1/O2 surface): echo the effective spin posture so the primary's
     // A/B reads off this log line. Zero wait-posture change: the knobs are honored where they already
@@ -1124,11 +1123,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             std::fflush(stdout);
             s.first = false;
-            if (p.eos || s.generated >= s.request.max_new || s.position.load() + keep >= c.context) {
+            if (p.eos || s.generated >= s.request.max_new || s.position.load() + keep >= s.max_context) {
                 finish(s, p.eos ? "stop" : "length"); continue;
             }
             // Catch-up consumes the verified window; limit the extra speculative chain near the context boundary.
-            s.draft->set_max_drafts((int) std::min<int64_t>(c.mtp_window_rows - 1, c.context - (s.position.load() + keep)));
+            s.draft->set_max_drafts((int) std::min<int64_t>(c.mtp_window_rows - 1, s.max_context - (s.position.load() + keep)));
             s.draft->set_alloc_share(alloc_share);   // S1c-fix: the fused cap's budget term for this round
             if (wavefront) {
                 // STRATA_DRAFT_WAVEFRONT: this slot's chain is launched below, after EVERY slot's commit,
@@ -1198,7 +1197,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         if (!s.active.load() || s.read.load(std::memory_order_acquire) < s.position.load()) return false;
         if (overlap && prev.valid &&
             std::find(prev.ready.begin(), prev.ready.end(), &s) != prev.ready.end()) return false;
-        if (s.position.load() >= c.context) return false;
+        if (s.position.load() >= s.max_context) return false;
         if (s.generated >= s.request.max_new) return false;
         return true;
     };
@@ -1217,7 +1216,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             const core::OnDevice on(sg.device);
             auto& gs = s.stages[st];
             uint8_t* base = nullptr;
-            const int64_t first = sg.cache->release_tail_bytes(m.deferred_bytes[st], kLazySlotFloorSlots, &base);
+            const int64_t slot_context = s.max_context > 0 ? s.max_context : c.context;
+            const int64_t def_bytes = (int64_t) core::session_bytes(g, slot_context, m.session_k, sg.lb, sg.le);
+            const int64_t first = sg.cache->release_tail_bytes(def_bytes, kLazySlotFloorSlots, &base);
             if (first < 0) {
                 err = "concurrency: STRATA_SLOT_LAZY: the expert cache's tail cannot hold this slot's session (stage " +
                       std::to_string(st) + ")";
@@ -1233,7 +1234,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     return false;
                 }
             }
-            if (!core::session_init(g, c.context, m.session_k, base, gs.owned, sg.lb, sg.le)) {
+            if (!core::session_init(g, slot_context, m.session_k, base, gs.owned, sg.lb, sg.le)) {
                 err = "concurrency: STRATA_SLOT_LAZY: session initialization failed";
                 return false;
             }
@@ -1307,6 +1308,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // request the slot's sessions already hold (0 = fresh: zero every stage, today's path). The caller
     // has moved the request in and holds the pump fence; the pump only sees the slot after pump_resume.
     auto admit_slot = [&](Impl::Slot& s, int64_t reused, Impl::Slot* parent = nullptr, std::shared_ptr<core::RadixNode> radix_parent = nullptr) -> bool {
+        if ((int64_t) s.request.tokens.size() > s.max_context) { err = "concurrency: request prompt (" + std::to_string(s.request.tokens.size()) + ") exceeds slot context (" + std::to_string(s.max_context) + ")"; return false; }
         if (m.lazy_slots && !s.brought_up && !bringup_slot(s, err)) return false;
         s.read.store(reused); s.generated = s.offered = s.accepted = 0;
         s.prompt_ms.store(0); s.first = true; s.active.store(true);
@@ -1470,7 +1472,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 if (pending[q].session != 0) {
                     for (auto& ptr : m.slots) {
                         const auto& held = *ptr;
-                        if (held.active.load() || held.session != pending[q].session) continue;
+                        if (held.active.load() || held.session != pending[q].session || (int64_t) tokens.size() >= held.max_context) continue;
                         const int64_t L = (int64_t) held.consumed.size();
                         if (L < 1 || L > nmax) break;
                         bool same = true;
@@ -1482,7 +1484,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 if (cand == nullptr) {
                     for (auto& ptr : m.slots) {
                         const auto& held = *ptr;
-                        if (held.active.load()) continue;
+                        if (held.active.load() || (int64_t) tokens.size() >= held.max_context) continue;
                         const int64_t L = (int64_t) held.consumed.size();
                         if (L < 1 || L > nmax || L <= candL) continue;
                         bool same = true;
@@ -1501,15 +1503,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
 
         // SPRINT 4: Dynamic RadixTree prefix fork pass
         while (retain && !pending.empty()) {
-            Impl::Slot* pick_child = nullptr;
-            for (auto& ptr : m.slots) {
-                if (!ptr->active.load()) {
-                    pick_child = ptr.get();
-                    break;
-                }
-            }
-            if (pick_child == nullptr) break;
-
             size_t pick_q = 0;
             int64_t best = 0;
             std::shared_ptr<core::RadixNode> best_node = nullptr;
@@ -1527,6 +1520,20 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             if (best_node == nullptr || best == 0) break;
 
+            const int64_t req_len = (int64_t) pending[pick_q].tokens.size();
+            Impl::Slot* pick_child = nullptr;
+            if (c.aux_context > 0 && req_len < c.aux_context) {
+                for (auto& ptr : m.slots) {
+                    if (!ptr->active.load() && ptr->is_aux && req_len < ptr->max_context) { pick_child = ptr.get(); break; }
+                }
+            }
+            if (pick_child == nullptr) {
+                for (auto& ptr : m.slots) {
+                    if (!ptr->active.load() && req_len < ptr->max_context) { pick_child = ptr.get(); break; }
+                }
+            }
+            if (pick_child == nullptr) break;
+
             auto& s = *pick_child;
             s.request = std::move(pending[pick_q]);
             pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
@@ -1534,18 +1541,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
 
         // SPRINT 1: Cross-slot prefix fork pass.
-        // If there are still idle slots and pending requests, fork prefix state from any parent slot
-        // that holds a matching prefix snapshot (whether the parent is currently idle or active).
         while (retain && !pending.empty()) {
-            Impl::Slot* pick_child = nullptr;
-            for (auto& ptr : m.slots) {
-                if (!ptr->active.load()) {
-                    pick_child = ptr.get();
-                    break;
-                }
-            }
-            if (pick_child == nullptr) break;
-
             Impl::Slot* pick_parent = nullptr;
             size_t pick_q = 0;
             int64_t best = 0;
@@ -1558,7 +1554,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
 
                 for (auto& p_ptr : m.slots) {
                     auto* p = p_ptr.get();
-                    if (p == pick_child) continue;
                     const int64_t valid_len = p->saved_prefix;
                     if (valid_len < 256 || valid_len > nmax || valid_len <= best) continue;
                     bool same = true;
@@ -1574,6 +1569,20 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             if (pick_parent == nullptr || best == 0) break;
 
+            const int64_t req_len = (int64_t) pending[pick_q].tokens.size();
+            Impl::Slot* pick_child = nullptr;
+            if (c.aux_context > 0 && req_len < c.aux_context) {
+                for (auto& ptr : m.slots) {
+                    if (!ptr->active.load() && ptr->is_aux && req_len < ptr->max_context && ptr.get() != pick_parent) { pick_child = ptr.get(); break; }
+                }
+            }
+            if (pick_child == nullptr) {
+                for (auto& ptr : m.slots) {
+                    if (!ptr->active.load() && req_len < ptr->max_context && ptr.get() != pick_parent) { pick_child = ptr.get(); break; }
+                }
+            }
+            if (pick_child == nullptr) break;
+
             auto& s = *pick_child;
             s.request = std::move(pending[pick_q]);
             pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
@@ -1586,10 +1595,35 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (ms > admit_ms_max) admit_ms_max = ms;
             admit_ms_ring[(size_t) (admit_scans - 1) % kAdmissionStallSamples] = ms;
         }
-        for (auto& ptr : m.slots) if (!ptr->active.load() && !pending.empty()) {
-            auto& s = *ptr;
-            s.request = std::move(pending.front()); pending.pop_front();
-            if (!admit_slot(s, 0, nullptr)) return 1;
+        for (size_t q = 0; q < pending.size(); ) {
+            const auto& req = pending[q];
+            const int64_t req_len = (int64_t) req.tokens.size();
+            Impl::Slot* pick = nullptr;
+
+            if (c.aux_context > 0 && req_len < c.aux_context) {
+                for (auto& ptr : m.slots) {
+                    if (!ptr->active.load() && ptr->is_aux && req_len < ptr->max_context) {
+                        pick = ptr.get();
+                        break;
+                    }
+                }
+            }
+            if (pick == nullptr) {
+                for (auto& ptr : m.slots) {
+                    if (!ptr->active.load() && req_len < ptr->max_context) {
+                        pick = ptr.get();
+                        break;
+                    }
+                }
+            }
+            if (pick != nullptr) {
+                auto& s = *pick;
+                s.request = std::move(pending[q]);
+                pending.erase(pending.begin() + (std::ptrdiff_t) q);
+                if (!admit_slot(s, 0, nullptr)) return 1;
+            } else {
+                ++q;
+            }
         }
 
         pump_resume();   // new prefillable slots are announced here (a no-op when the pump is off)
@@ -1639,7 +1673,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             for (size_t j = 0; j < m.slots.size(); ++j) {
                 const auto& s = *m.slots[j];
                 if (s.active.load() && s.read.load(std::memory_order_acquire) >= s.position.load() &&
-                    s.position.load() < c.context && s.generated < s.request.max_new)
+                    s.position.load() < s.max_context && s.generated < s.request.max_new)
                     ++eligible;
             }
             if (eligible >= 2) {
@@ -1664,7 +1698,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             // the in-flight window (a double-generated token).
             if (overlap && prev.valid &&
                 std::find(prev.ready.begin(), prev.ready.end(), &s) != prev.ready.end()) continue;
-            if (s.position.load() >= c.context) { finish(s, "length"); continue; }
+            if (s.position.load() >= s.max_context) { finish(s, "length"); continue; }
             int n = s.first ? 1 : c.mtp_window_rows;
             if (!s.first && s.request.spec_min_p > 0) {
                 n = 1;
@@ -1679,7 +1713,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     if (pick.lookup) { n = pick.t; s.lookup = true; }
                 }
             }
-            n = (int) std::min<int64_t>(n, std::min(c.context - s.position.load(), s.request.max_new - s.generated));
+            n = (int) std::min<int64_t>(n, std::min(s.max_context - s.position.load(), s.request.max_new - s.generated));
             if (n < 1) { finish(s, "length"); continue; }
             ready.push_back(&s); wanted.push_back(n);
         }
@@ -1712,11 +1746,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             windows_served += (int64_t) windows.size();
             if (c.pad_batch && windows.size() > 1) {
                 int padded_rows = 0;
-                for (const auto& w : windows)
-                    padded_rows += (int) std::min<int64_t>(std::max(w.count, c.mtp_window_rows), c.context - w.position);
+                for (size_t wi = 0; wi < windows.size(); ++wi)
+                    padded_rows += (int) std::min<int64_t>(std::max(windows[wi].count, c.mtp_window_rows), win_slots[wi]->max_context - windows[wi].position);
                 if (padded_rows <= c.rows)
-                    for (auto& w : windows)
-                        w.count = (int) std::min<int64_t>(std::max(w.count, c.mtp_window_rows), c.context - w.position);
+                    for (size_t wi = 0; wi < windows.size(); ++wi)
+                        windows[wi].count = (int) std::min<int64_t>(std::max(windows[wi].count, c.mtp_window_rows), win_slots[wi]->max_context - windows[wi].position);
             }
             // Stable packing order avoids recapturing a graph merely because fairness rotated the request order.
             std::sort(windows.begin(), windows.end(), [](const auto& a, const auto& b) {
