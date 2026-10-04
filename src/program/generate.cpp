@@ -1720,7 +1720,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         const strata::core::ModelGeometry g0;
-        if (!native_embed.load(o.native_preset, g0.n_embd, 248320, err)) {
+        if (!native_embed.load(std::vector<std::string>{o.native_preset}, g0.n_embd, 248320, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -2316,7 +2316,7 @@ int main(int argc, char** argv) {
         const bool last = i + 1 == stages.size();
         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
-            (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_gguf, g.n_embd, wo_s->ne1, err))) {
+            (last && !o.native_head_gguf.empty() && !st.head.load(std::vector<std::string>{o.native_head_gguf}, g.n_embd, wo_s->ne1, err))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d head: %s\n", st.dev,
                          wo_s == nullptr ? "output.weight is missing" : err.c_str());
             return 1;
@@ -2504,7 +2504,7 @@ int main(int argc, char** argv) {
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
-        if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
+        if (!native_head.load(std::vector<std::string>{o.native_head_gguf}, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }

@@ -118,7 +118,6 @@ public:
     // Configure before init; CLI validation supplies a positive bounded cache limit.
     void set_batch_cache(int limit, int reserve_mib) { batch_cache_limit_ = limit; batch_reserve_mib_ = reserve_mib; }
     void set_batch_parallel(bool enabled) { batch_parallel_ = enabled; }
-=======
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }

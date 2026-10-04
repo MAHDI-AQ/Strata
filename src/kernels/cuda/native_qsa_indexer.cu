@@ -130,6 +130,12 @@ __device__ __forceinline__ float pooled_value(const float* values, int d, int ro
     }
     return y;
 }
+__device__ __forceinline__ float pooled_value(const float* values, int d, int rope_pos, float theta_scale,
+                                              float freq_scale, float corr_low, float corr_high,
+                                              float ext_factor, float mscale, const int32_t* mtab, bool zero_pos) {
+    return pooled_value<false>(values, d, rope_pos, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale,
+                               mtab, zero_pos, RopeTab{});
+}
 __device__ __forceinline__ float norm_scale(float mean, float* partials, int d) {
     float square_sum = d < D ? mean * mean : 0.0f;
     square_sum = warp_sum(square_sum);
