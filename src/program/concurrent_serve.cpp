@@ -1627,6 +1627,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // partition the eligible slots into two micro-batches so that Unit A and Unit B
         // can ping-pong across Stage 0 (GPU 1) and Stage 1 (GPU 0) concurrently.
         size_t max_unit_slots = m.slots.size();
+        static bool alt_unit = false;
         if (overlap && !prev.valid) {
             size_t eligible = 0;
             for (size_t j = 0; j < m.slots.size(); ++j) {
@@ -1635,7 +1636,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     s.position.load() < c.context && s.generated < s.request.max_new)
                     ++eligible;
             }
-            if (eligible >= 2) max_unit_slots = (eligible + 1) / 2;
+            if (eligible >= 2) {
+                if (eligible % 2 != 0) {
+                    max_unit_slots = alt_unit ? (eligible / 2) : ((eligible + 1) / 2);
+                    alt_unit = !alt_unit;
+                } else {
+                    max_unit_slots = eligible / 2;
+                }
+            }
         }
 
         std::vector<Impl::Slot*> ready;
