@@ -2473,8 +2473,11 @@ int main(int argc, char** argv) {
         config.window = o.spec; config.mtp_window_rows = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         config.prefill_chunk = o.concurrent_prefill; config.context = o.max_context; config.draft_context = o.mtp_window;
         config.reserve_mib = o.vram_reserve_mib; config.mtp_dir = o.mtp; config.spec_min_p = (float) o.spec_min_p;
+        if (const char* smp_env = std::getenv("STRATA_SPEC_MIN_P")) config.spec_min_p = (float) std::atof(smp_env);
         config.suffix = o.suffix_draft; config.eos = o.eos_ids; config.kv = o.kv;
         config.adapt_every = o.adapt_every; config.adapt_swaps = o.adapt_swaps;
+        if (const char* ae_env = std::getenv("STRATA_ADAPT_EVERY")) config.adapt_every = std::atoi(ae_env);
+        if (const char* asw_env = std::getenv("STRATA_ADAPT_SWAPS")) config.adapt_swaps = std::atoi(asw_env);
         config.conversation_cache_mib = o.conversation_cache_mib;
         config.conversation_cache_slots = o.conversation_cache_slots;
         config.conversation_cache_min_free_mib = o.conversation_cache_min_free_mib;

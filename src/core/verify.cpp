@@ -1743,7 +1743,13 @@ bool Verifier::service_one(int64_t k, PoolMultiFn pool, void* user, std::string&
 bool Verifier::pass_stall(uint32_t want, int64_t l, Clock::time_point wait_start, Clock::time_point& last_flush,
                           std::string& err) {
     const auto now = Clock::now();
-    if (now - last_flush > std::chrono::microseconds(2000)) {
+    // Latency optimization: avoid frequent cudaStreamQuery calls that acquire driver locks
+    // during fast graph execution. Check every 250ms (or STRATA_PASS_STALL_MS) instead of 2ms.
+    static const int64_t stall_interval_us = [] {
+        const char* v = std::getenv("STRATA_PASS_STALL_MS");
+        return (v ? std::max(10, std::atoi(v)) : 250) * 1000;
+    }();
+    if (now - last_flush > std::chrono::microseconds(stall_interval_us)) {
         last_flush = now;
         const cudaError_t q = cudaStreamQuery(cs_);
         if (q != cudaErrorNotReady && !pass_doorbell(want)) {

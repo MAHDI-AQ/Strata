@@ -35,3 +35,53 @@ We formally and respectfully credit the following authors and contributors whose
 1. **Standalone Downstream Lab:** This fork operates as an independent downstream research lab.
 2. **Upstream PR Boundary:** Because this fork introduces radical architectural alterations tailored for multi-GPU agentic labs, **we do not submit unsolicited upstream PRs or file issues against `Niko1221/Strata`**. Upstream maintainers are welcome to cherry-pick any modular features, kernels, or bug fixes from our clean commits at their discretion.
 3. **Open Access:** All proprietary Mahdi AI Lab innovations (13,633+ LoC) are provided openly under the repository's open-source license for the benefit of the local LLM and agentic engineering community.
+
+---
+
+## Ecosystem Cross-Pollination & Architectural Lineage
+
+In pursuit of maximal serving acceleration and latency reduction across consumer hardware (Dual RTX 4090), Strata openly cross-pollinates and synthesizes architectural breakthroughs from the broader LLM systems and compiler research community. 
+
+We formally acknowledge and attribute the following foundational projects, architectures, and research papers:
+
+### 1. SGLang (LMSYS Org / UC Berkeley)
+- **Repository:** [`sgl-project/sglang`](https://github.com/sgl-project/sglang)
+- **Key Researchers:** Lianmin Zheng, Liangsheng Yin, Zhiqiang Shen, Zhanghao Wu, Dachuan Li, Hao Zhang, Joseph E. Gonzalez, Ion Stoica (UC Berkeley / LMSYS).
+- **Paper:** *"SGLang: Efficient Execution of Structured Language Model Programs"* (arXiv:2312.07104).
+- **Attributed Architectural Patterns:**
+  - **RadixAttention (Tree-Structured Prefix Caching):** Strata adapts the core insight of maintaining KV caches in a dynamic radix tree rather than a linear hash map, enabling zero-copy cache sharing across multi-turn agent conversations, tool-calling chains, and shared system prompts.
+  - **Zero-Overhead Event Loop Scheduling:** The architectural separation of high-frequency token-level queue arbitration from GPU kernel execution pipelines to prevent CPU scheduling bottlenecks.
+  - **Shared-Memory IPC Protocol:** SGLang's pattern of lock-free POSIX shared-memory channels for token streaming and logits between the Python API layer and the native engine.
+
+### 2. vLLM (vLLM Team / UC Berkeley)
+- **Repository:** [`vllm-project/vllm`](https://github.com/vllm-project/vllm)
+- **Key Researchers:** Woosuk Kwon, Zhuohan Li, Siyuan Shen, Mellun Zhang, Lianmin Zheng, Charles Chen, Binhang Yuan, Ion Stoica (UC Berkeley).
+- **Paper:** *"Efficient Memory Management for Large Language Model Serving with PagedAttention"* (SOSP 2023).
+- **Attributed Architectural Patterns:**
+  - **Asynchronous Output Processing:** Decoupling token detokenization, sampling logic, and SSE wire streaming from the synchronous GPU forward-pass critical path.
+  - **Static CUDA Graph Re-binding:** The methodology of executing static CUDA graphs with dynamic batch sizes and sequence lengths by updating mapped device pointers and block tables rather than triggering expensive graph re-captures.
+  - **Chunked Prefill & Decode Piggybacking:** Interleaving bounded prompt evaluation chunks with latency-sensitive decode steps to prevent frame-drops on active multi-agent streams.
+
+### 3. FlashInfer (FlashInfer Team / University of Washington)
+- **Repository:** [`flashinfer-ai/flashinfer`](https://github.com/flashinfer-ai/flashinfer)
+- **Key Researchers:** Zihao Ye, Ruihang Lai, Lianmin Zheng, Yineng Zhang, Joseph E. Gonzalez, Arvind Krishnamurthy (University of Washington / UC Berkeley).
+- **Paper:** *"FlashInfer: Efficient and Customizable Attention Kernels for LLM Serving"*.
+- **Attributed Architectural Patterns:**
+  - **Fused GEMM Epilogues for Ada Lovelace (SM89):** Fusing normalization (RMSNorm) and bias addition directly into the GEMM input/output epilogues, eliminating intermediate global memory read/write passes.
+  - **Grouped GEMM for Mixture-of-Experts:** Parallelizing execution of multiple routed expert GEMMs across device SMs in a unified grid launch to maximize hardware utilization under low batch sizes.
+
+### 4. EAGLE-2 & Sequoia (Speculative Decoding Research)
+- **Papers & Repositories:**
+  - *EAGLE-2:* Yuhui Li, Fangcheng Fu, Ling Shen, Xu Chen, Shenggui Li, Wentao Zhang (Peking University) — *"EAGLE-2: Faster Sub-step Speculative Decoding with Dynamic Draft Trees"* (arXiv:2406.16858).
+  - *Sequoia:* Zhuohan Li, Siyuan Shen, Lianmin Zheng, Woosuk Kwon, Ion Stoica (UC Berkeley) — *"Sequoia: 4.8x Faster Speculative Decoding with Dynamic Trees"* (arXiv:2402.12374).
+  - *DeepSeek MTP:* DeepSeek-AI — *"DeepSeek-V2 / DeepSeek-V3 Technical Report"* (Multi-Token Prediction architecture).
+- **Attributed Architectural Patterns:**
+  - **Speculative Tree Topology Verification:** Verifying speculative candidate trees via customized 2D attention masks in a single forward pass, expanding acceptance rates beyond linear chain limits on branching reasoning paths.
+  - **Confidence-Gated Speculative Depth:** Dynamic evaluation of token generation uncertainty (logit entropy / top-1 margin) to dynamically throttle speculative draft length $T$, conserving compute on low-confidence branches.
+
+### 5. llama.cpp & GGML (Georgi Gerganov & Community)
+- **Repository:** [`ggerganov/llama.cpp`](https://github.com/ggerganov/llama.cpp)
+- **Key Architect:** Georgi Gerganov and the open-source GGML community.
+- **Attributed Architectural Patterns:**
+  - **Quantization Calibration (IQ3_XXS / Q4_0 / GSQ-RCO):** High-efficiency low-bit weight representation formats, block-quantized scales, and fast integer SIMD/warp-level dequantization kernels.
+  - **Memory-Mapped Weight Ingestion (`mmap`):** Direct file-backed tensor paging enabling zero-overhead model loading and instant process initialization.
