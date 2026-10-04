@@ -97,7 +97,6 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
     __shared__ __align__(16) float sq[G][HD];     // 12 KB: this KV head's query heads
     __shared__ float sp[G][CHUNK];                // scores, then probabilities
     __shared__ long long srow[CHUNK];             // pool row of each cell (page, kv head, slot)
-    __shared__ __align__(16) uint8_t sv[CHUNK][144]; // 9 KB: warp-staged V pool tile for Q4_0
     const int n_ids = __ldg(step + kStepWidth);
     const int chunk = blockIdx.x, kvh = blockIdx.y;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -152,24 +151,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
     }
     __syncthreads();
-    if constexpr (KV_MODE == 2 || KV_MODE == 3) {
-        for (int i = t; i < n_here * 9; i += THREADS) {
-            const int c = i / 9;
-            const int q4_idx = i % 9;
-            if (srow[c] >= 0) {
-                const uint4* src = reinterpret_cast<const uint4*>(p.v_q4 + srow[c] * 144);
-                *reinterpret_cast<uint4*>(&sv[c][q4_idx * 16]) = src[q4_idx];
-            }
-        }
-        __syncthreads();
-    }
     // values: thread t owns dimension t for all 12 heads.
-    const int b = t / QK4_0;
-    const int rem = t % QK4_0;
-    const int j = rem < 16 ? rem : (rem - 16);
-    const bool rem_low = rem < 16;
-    const int v_offset = b * sizeof(block_q4_0);
-
     float acc[G];
 #pragma unroll
     for (int h = 0; h < G; ++h) acc[h] = 0.0f;
@@ -181,11 +163,15 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         } else if constexpr (KV_MODE == 1) {
             const float sc = __half2float(__ushort_as_half(p.v_scale[srow[c] * (HD / KV_Q8_GROUP) + t / KV_Q8_GROUP]));
             v = (float) p.v_q[srow[c] * HD + t] * sc;
-        } else {   // modes 2 and 3: V is rotated Q4_0 from fast shared memory sv
-            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(&sv[c][v_offset]);
+        } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+            constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+            const int b = t / QK4_0;
+            const int rem = t % QK4_0;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + srow[c] * bytes_per_head) + b;
             const float d = __half2float(__ushort_as_half(blk->d));
+            const int j = rem < 16 ? rem : (rem - 16);
             const uint8_t byte = blk->qs[j];
-            const int nibble = rem_low ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+            const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
             v = (float) nibble * d;
         }
 #pragma unroll
@@ -206,34 +192,18 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
     const int h = blockIdx.x;                 // global query head
     const int kvh = h / G, hl = h % G;
     const int d = threadIdx.x;
-
-    __shared__ float s_w[128];
-    __shared__ float s_inv_L;
-
-    if (d < 32) {
-        float M = -FLT_MAX;
-        for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, part_m[(kvh * n_chunks + c) * G + hl]);
-        float L = 0.0f;
-        for (int c = d; c < n_chunks; c += 32) {
-            const float m = part_m[(kvh * n_chunks + c) * G + hl];
-            const float w = (m == -FLT_MAX) ? 0.0f : __expf(m - M);
-            s_w[c] = w;
-            L += part_l[(kvh * n_chunks + c) * G + hl] * w;
-        }
-        L = warp_sum(L);
-        if (d == 0) s_inv_L = L > 0.0f ? (1.0f / L) : 0.0f;
-    }
-    __syncthreads();
-
-    float acc = 0.0f;
+    float M = -FLT_MAX;
+    for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, part_m[(kvh * n_chunks + c) * G + hl]);
+    float L = 0.0f, acc = 0.0f;
     for (int c = 0; c < n_chunks; ++c) {
-        const float w = s_w[c];
-        if (w > 0.0f) {
-            const int slot = kvh * n_chunks + c;
-            acc = fmaf(part_acc[((size_t) slot * G + hl) * HD + d], w, acc);
-        }
+        const int slot = kvh * n_chunks + c;
+        const float m = part_m[slot * G + hl];
+        if (m == -FLT_MAX) continue;
+        const float w = __expf(m - M);
+        L = fmaf(part_l[slot * G + hl], w, L);
+        acc = fmaf(part_acc[((size_t) slot * G + hl) * HD + d], w, acc);
     }
-    attn[(size_t) h * HD + d] = acc * s_inv_L;
+    attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
 }  // namespace
