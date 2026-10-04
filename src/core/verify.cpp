@@ -782,39 +782,53 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
         const unsigned long long* p_ptr = (const unsigned long long*) (pl + ptr_off);
         const unsigned long long* p_ptr2 = p_ptr + capx;
         const int32_t* p_start2 = pl + ptr_off + 4 * capx;
-        float* hit_out = hit_out_ + (size_t) tb * K * N;
+        float* parts_out = parts_ + (size_t) tb * K * N;
         const auto& lay = strata::kernels::cpu::expert_layout();
-        // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging
-        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn) {
+        if (device_plan_) {
+            // E-6 / ZERO-COPY RESIDENT MOE PATH:
+            // All experts are 100% resident in GPU VRAM (verified by resident_plan on device).
+            // Write directly to parts_ (destination of down projection), bypassing:
+            // 1. hit_out scratchpad
+            // 2. wait_flag_ge_or(m_flagB_) kernel
+            // 3. grouped(p_ptr2) PCIe staging kernel (0 experts)
+            // 4. wait_flag_ge_or(m_flag_) kernel
+            // 5. copy_or_zero_from_mapped kernel (VRAM zeroing)
+            // 6. moe_hit_add kernel (parts += hit_out copy)
             if (lay.native) {
-                // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-                native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
+                native_expert_grouped(L, p_ptr, p_start, p_counts, p_dst, p_tok, cap, cap,
+                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, parts_out, cs);
             } else {
-                moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
-                               hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
+                moe_grouped_s2(p_ptr, p_start, p_counts, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
+                               hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, parts_out, cs);
             }
-        };
-        grouped(p_ptr, p_start, p_counts);
-        stamp(l, 20, grp);
-        if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-        else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-        if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-            const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-            uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
-        }
-        stamp(l, 21, grp);
-        grouped(p_ptr2, p_start2, p_counts + 2);
-        stamp(l, 22, grp);
-        if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
-            wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
-            copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
-                                     skip_ + grp, ring, cs);
+            stamp(l, 20, grp);
         } else {
+            float* hit_out = hit_out_ + (size_t) tb * K * N;
+            auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn) {
+                if (lay.native) {
+                    const auto& f = lay.fmt[(size_t) l];
+                    const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                    native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
+                                          nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
+                } else {
+                    moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
+                                   hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
+                }
+            };
+            grouped(p_ptr, p_start, p_counts);
+            stamp(l, 20, grp);
+            wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            }
+            stamp(l, 21, grp);
+            grouped(p_ptr2, p_start2, p_counts + 2);
+            stamp(l, 22, grp);
             wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
             stamp(l, 23, grp);
             if (dec_batch || p_counts != nullptr)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
@@ -822,8 +836,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                                       p_dst, p_counts + 1, cs);
             else
                 copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+            moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
-        moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
         if (phase == 2) return true;
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
