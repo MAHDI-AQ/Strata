@@ -27,6 +27,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
 
 #include <cuda_runtime.h>
 
@@ -278,7 +279,7 @@ struct Prefill::Impl {
     uint16_t *mixed_bf = nullptr, *mixed_h = nullptr;
     float* bo = nullptr;
     // GDN
-    float *qkv = nullptr, *z = nullptr, *ab = nullptr, *gate = nullptr, *beta = nullptr, *hbuf = nullptr, *y = nullptr;
+    float *qkv = nullptr, *z = nullptr, *qkv_g = nullptr, *ab = nullptr, *gate = nullptr, *beta = nullptr, *hbuf = nullptr, *y = nullptr;
     uint16_t* y_h = nullptr;
     // QSA
     float *Kc = nullptr, *Vc = nullptr, *Qf = nullptr, *q = nullptr, *idx_raw = nullptr, *q_idx = nullptr, *attn = nullptr;
@@ -431,7 +432,7 @@ Prefill::~Prefill() {
 }
 
 namespace {
-constexpr int64_t GEMM_SCRATCH = 32ll << 20;        // FP16 elements for the largest dequantized dense weight
+constexpr int64_t GEMM_SCRATCH = 48ll << 20;        // FP16 elements (fused QKV+Gate = 42M elems)        // FP16 elements for the largest dequantized dense weight
 constexpr size_t GEMM_WS = 32u << 20;               // cuBLAS workspace
 
 // THE ATTENTION HALF AND THE MoE HALF SHARE THEIR BUFFERS.  A layer runs its attention (GDN or QSA), writes it back
@@ -441,6 +442,7 @@ constexpr size_t GEMM_WS = 32u << 20;               // cuBLAS workspace
 // counted with the same `take` sequence `init` uses; a mismatch makes `init` fail with "do not fit", never overlap.
 uint64_t gdn_set_bytes(size_t T) {
     Alloc a; a.count_only = true; bool ok = true;
+    a.take<float>(T * (C + ZV), ok);
     a.take<float>(T * C, ok); a.take<float>(T * ZV, ok); a.take<float>(T * 2 * HV, ok); a.take<float>(T * HV, ok);
     a.take<float>(T * HV, ok); a.take<float>(T * C, ok); a.take<float>(T * ZV, ok); a.take<uint16_t>(T * ZV, ok);
     return a.used;
@@ -678,6 +680,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.region_bytes = region;
         Alloc a;
         a.base = base; a.cap = region; a.owned = &m.owned;
+        m.qkv_g = a.take<float>(T * (C + ZV), ok);
         m.qkv = a.take<float>(T * C, ok); m.z = a.take<float>(T * ZV, ok); m.ab = a.take<float>(T * 2 * HV, ok);
         m.gate = a.take<float>(T * HV, ok); m.beta = a.take<float>(T * HV, ok); m.hbuf = a.take<float>(T * C, ok);
         m.y = a.take<float>(T * ZV, ok); m.y_h = a.take<uint16_t>(T * ZV, ok);
@@ -1429,8 +1432,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    // Fused GDN QKV+Gate Multi-Projection GEMM (Lever B):
+                    // Fuses wqkv [C, K] and wg [ZV, K] into single cuBLAS launch [C+ZV, K], cutting 36 launches per chunk.
+                    if (m.qkv_g && m.gemm.scratch() && (size_t)(C + ZV) * (size_t)g.n_embd <= (size_t)m.gemm.scratch_elems() &&
+                        wqkv->native_data && wg->native_data) {
+                        strata::kernels::dequant_f16(wqkv->native_type, wqkv->native_data, 0, C, g.n_embd, m.gemm.scratch(), m.cs);
+                        strata::kernels::dequant_f16(wg->native_type, wg->native_data, 0, ZV, g.n_embd, m.gemm.scratch() + (size_t)C * (size_t)g.n_embd, m.cs);
+                        m.gemm.f16(m.mixed_h, m.gemm.scratch(), m.qkv_g, T, C + ZV, g.n_embd);
+                        split_qkv_z(m.qkv_g, m.qkv, m.z, T, C, ZV, m.cs);
+                    } else {
+                        if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    }
                     // Fused GDN Alpha+Beta Multi-Projection GEMM:
                     // Fuses wa [HV, K] and wb [HV, K] into single contiguous GEMM [2*HV, K] writing m.ab [T, 2*HV].
                     uint16_t*& wab = m.wab_fused[l];
