@@ -64,9 +64,35 @@ __global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict_
     if (i < n) y[i] = f16_from_f32(x[i]);
 }
 
+__global__ void to_f16_kernel_v4(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n_vec4) {
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_vec4) return;
+    const float4* x4 = reinterpret_cast<const float4*>(x + idx * 4);
+    float4 v = *x4;
+    uint16_t b0 = f16_from_f32(v.x);
+    uint16_t b1 = f16_from_f32(v.y);
+    uint16_t b2 = f16_from_f32(v.z);
+    uint16_t b3 = f16_from_f32(v.w);
+    uint64_t packed = (uint64_t) b0 | ((uint64_t) b1 << 16) | ((uint64_t) b2 << 32) | ((uint64_t) b3 << 48);
+    *reinterpret_cast<uint64_t*>(y + idx * 4) = packed;
+}
+
 __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = bf16_from_f32(x[i]);
+}
+
+__global__ void to_bf16_kernel_v4(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n_vec4) {
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_vec4) return;
+    const float4* x4 = reinterpret_cast<const float4*>(x + idx * 4);
+    float4 v = *x4;
+    uint16_t b0 = bf16_from_f32(v.x);
+    uint16_t b1 = bf16_from_f32(v.y);
+    uint16_t b2 = bf16_from_f32(v.z);
+    uint16_t b3 = bf16_from_f32(v.w);
+    uint64_t packed = (uint64_t) b0 | ((uint64_t) b1 << 16) | ((uint64_t) b2 << 32) | ((uint64_t) b3 << 48);
+    *reinterpret_cast<uint64_t*>(y + idx * 4) = packed;
 }
 
 __global__ void silu_kernel(float* __restrict__ x, int64_t n) {
@@ -164,14 +190,24 @@ void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
 
 void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
-    to_f16_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, y, n);
+    if (n % 4 == 0 && (reinterpret_cast<uintptr_t>(x) % 16 == 0) && (reinterpret_cast<uintptr_t>(y) % 8 == 0)) {
+        const int64_t n4 = n / 4;
+        to_f16_kernel_v4<<<grid_for(n4), THREADS, 0, (cudaStream_t) stream>>>(x, y, n4);
+    } else {
+        to_f16_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, y, n);
+    }
     check_launch("f32_to_f16_bulk");
     sync_if_needed(stream, "f32_to_f16_bulk");
 }
 
 void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
-    to_bf16_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, y, n);
+    if (n % 4 == 0 && (reinterpret_cast<uintptr_t>(x) % 16 == 0) && (reinterpret_cast<uintptr_t>(y) % 8 == 0)) {
+        const int64_t n4 = n / 4;
+        to_bf16_kernel_v4<<<grid_for(n4), THREADS, 0, (cudaStream_t) stream>>>(x, y, n4);
+    } else {
+        to_bf16_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, y, n);
+    }
     check_launch("f32_to_bf16_bulk");
     sync_if_needed(stream, "f32_to_bf16_bulk");
 }

@@ -19,6 +19,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/shared_expert.hpp"
+#include "strata/kernels/native_moe.hpp"
 
 #include <cuda_runtime.h>
 
@@ -449,6 +450,21 @@ int main(int argc, char** argv) {
         strata::kernels::moe_combine(d_p, d_w, d_s, d_y, n_embd2, k2, nullptr);
         std::vector<float> got((size_t) n_embd2);
         check(cudaMemcpy(got.data(), d_y, got.size() * 4, cudaMemcpyDeviceToHost), "mc cy");
+
+        // native_moe_combine check (v4 vectorized path)
+        std::vector<float> got_native((size_t) n_embd2);
+        strata::kernels::native_moe_combine(d_p, d_w, d_s, d_y, n_embd2, k2, nullptr);
+        check(cudaMemcpy(got_native.data(), d_y, got_native.size() * 4, cudaMemcpyDeviceToHost), "mc cy native");
+        const double rel_native = rel_l1(want, got_native);
+        std::printf("  %-42s rel %.3e\n", "native_moe_combine (v4) vs reference", rel_native);
+        if (!(rel_native <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++bad; }
+
+        // native_moe_combine_multi check (multi-token v4 path)
+        strata::kernels::native_moe_combine_multi(d_p, d_w, d_s, d_y, n_embd2, k2, 1, nullptr);
+        check(cudaMemcpy(got_native.data(), d_y, got_native.size() * 4, cudaMemcpyDeviceToHost), "mc cy native multi");
+        const double rel_native_multi = rel_l1(want, got_native);
+        std::printf("  %-42s rel %.3e\n", "native_moe_combine_multi (v4) vs reference", rel_native_multi);
+        if (!(rel_native_multi <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++bad; }
 
         for (const auto& trap : {std::make_pair(false, false), std::make_pair(true, true)}) {
             const std::vector<float> wrong = ref(trap.first, trap.second);
