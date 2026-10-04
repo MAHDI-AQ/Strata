@@ -72,6 +72,8 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
           const strata::kernels::RopeScaling& scaling, void* stream);
 /// q_full [T, 24, 512] (q | gate per head) -> q [T, 24, 256]
 void split_q(const float* q_full, float* q, int64_t T, void* stream);
+/// qkv_g [T, C + ZV] -> qkv [T, C] and z [T, ZV] (the fused QKV+Gate GEMM split)
+void split_qkv_z(const float* qkv_g, float* qkv, float* z, int64_t T, int64_t C, int64_t ZV, void* stream);
 /// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream);
 

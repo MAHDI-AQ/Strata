@@ -541,6 +541,19 @@ __global__ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, i
     p[pair] = a * c - b * s;
     p[pair + 32] = a * s + b * c;
 }
+__global__ void split_qkv_z_kernel(const float* __restrict__ qkv_g, float* __restrict__ qkv, float* __restrict__ z,
+                                   int64_t T, int64_t C, int64_t ZV) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * (C + ZV)) return;
+    const int64_t stride = C + ZV;
+    const int64_t t = i / stride;
+    const int64_t col = i % stride;
+    if (col < C) {
+        qkv[t * C + col] = qkv_g[i];
+    } else {
+        z[t * ZV + (col - C)] = qkv_g[i];
+    }
+}
 __global__ void split_q_kernel(const float* __restrict__ qf, float* __restrict__ q, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * 24 * 256) return;
@@ -775,6 +788,10 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
         x, heads, dim, ld, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
         strata::kernels::mrope_table());
     check("rope");
+}
+void split_qkv_z(const float* qkv_g, float* qkv, float* z, int64_t T, int64_t C, int64_t ZV, void* stream) {
+    split_qkv_z_kernel<<<blocks_for(T * (C + ZV)), 256, 0, (cudaStream_t) stream>>>(qkv_g, qkv, z, T, C, ZV);
+    check("split_qkv_z");
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
     split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);
