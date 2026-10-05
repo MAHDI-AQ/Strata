@@ -21,7 +21,7 @@ Instead, Strata AGX employs a **Selective Cherry-Pick & Ledger Architecture**:
 
 ---
 
-## 2. Versioning Standard
+## 2. Versioning Standard & Brakes-On Discipline (Mahdi Rule, 2026-10-05)
 
 Strata AGX follows the compound versioning scheme:
 ```text
@@ -29,11 +29,11 @@ v<upstream-version>-agx.<major>.<minor>.<patch>
 ```
 
 - `<upstream-version>`: Baseline upstream release tracked (e.g. `0.1.38`).
-- `<major>`: Milestone architectural delivery in Strata AGX (e.g. `1` for the complete 5-Phase Deep Acceleration Program).
-- `<minor>`: Non-breaking feature additions, new kernel targets, or major cherry-pick waves.
-- `<patch>`: Hotfixes, build fixes, or individual upstream cherry-picks.
+- `<major>`: Ground-up engine generation in Strata AGX (locked at `1`). Never bumped unless an irreversible breaking rewrite occurs.
+- `<minor>`: Monumental consolidated program deliveries (e.g. an entire multi-phase master plan sealed and verified). Minor versions are NEVER bumped for individual phases, tasks, or PRs.
+- `<patch>`: ALL active incremental work — research phases, kernel fusions, sync cherry-picks, PRs, and daily fixes (`v0.1.38-agx.1.0.1`, `1.0.2`, ..., `1.0.9999`). Patch numbers grow naturally without premature milestone inflation.
 
-*Milestone 1:* **`v0.1.38-agx.1.0.0`** (2026-10-05).
+*Baseline Milestone:* **`v0.1.38-agx.1.0.0`** (2026-10-05: Phases 1–5 complete).
 
 ---
 
