@@ -1060,13 +1060,13 @@ if(STRATA_NATIVE_EXPERTS)
   # #296's real-weight checks (OrcaRouter Q4_K_S files; docs/ORCA_Q4_K_S.md) - test programs, not part of a release
   if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS)
     add_executable(ple_q5_parity src/kernels/ple_q5_parity.cpp)
-    target_link_libraries(ple_q5_parity PRIVATE strata_kernels strata_artifact ggml-base ${_strata_gpu_runtime_target})
+    target_link_libraries(ple_q5_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact ggml-base ${_strata_gpu_runtime_target})
     add_executable(q5_projection_parity src/kernels/q5_projection_parity.cpp)
     target_include_directories(q5_projection_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(q5_projection_parity PRIVATE strata_kernels strata_artifact ggml-base ${_strata_gpu_runtime_target})
     # #291: the FP8 PLE table (tools/ple_fp8_pack.py) through PleTable vs the checkpoint's own values
     add_executable(ple_fp8_parity src/kernels/ple_fp8_parity.cpp)
-    target_link_libraries(ple_fp8_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    target_link_libraries(ple_fp8_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   endif()
 endif()
 
