@@ -1,3 +1,8 @@
+// src/core/radix_tree.cpp - Lockless RadixTree Prefix Matching, Mutation & Pinned DMA Implementation
+//
+// Cross-Engine Attribution and Research Lineage:
+//   - SGLang: RadixAttention tree prefix caching, hardware CRC32C chunking, and multi-tier memory management (arXiv:2312.07104)
+//
 #include "strata/core/radix_tree.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/qsa.hpp"

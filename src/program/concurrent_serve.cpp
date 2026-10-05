@@ -1,3 +1,11 @@
+// src/program/concurrent_serve.cpp - Multi-Stream Concurrent Engine & Wavefront Dispatch Loop
+//
+// Cross-Engine Attribution and Research Lineage:
+//   - SGLang: RadixAttention tree-structured prefix caching, zero-overhead event-loop scheduling, shared-memory IPC (Zheng et al., LMSYS / UC Berkeley, arXiv:2312.07104)
+//   - vLLM: Continuous batching, PagedAttention virtual block tables, chunked prefill interleaving (Kwon et al., UC Berkeley, SOSP 2023)
+//   - NanoFlow: Overlapped nanobatch execution, asynchronous device-level DMA scheduling (DeepSeek-AI / Tsinghua, arXiv:2408.12757)
+//   - EAGLE-2: Dynamic entropy-gated speculative depth calibration and decay (Li et al., Peking University, arXiv:2406.16858)
+//
 #include "strata/program/concurrent_serve.hpp"
 #include "strata/program/batch_schedule.hpp"
 #include "strata/prefill/prefill.hpp"

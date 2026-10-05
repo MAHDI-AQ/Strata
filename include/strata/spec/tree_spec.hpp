@@ -1,6 +1,11 @@
-// include/strata/spec/tree_spec.hpp - Phase 3: Speculative Tree Topology Verification & Confidence Gating
+// include/strata/spec/tree_spec.hpp - Speculative Tree Topology Verification & Confidence Gating
 //
-// Cross-Engine Reference: EAGLE-2 (Dynamic Draft Trees), Sequoia (Tree Mask Verification), Medusa.
+// Cross-Engine Attribution and Research Lineage:
+//   - EAGLE-2: "Faster Sub-step Speculative Decoding with Dynamic Draft Trees" (Li et al., Peking University, arXiv:2406.16858)
+//   - Sequoia: "4.8x Faster Speculative Decoding with Dynamic Trees" (Li, Shen, Zheng, Kwon, Stoica, UC Berkeley, arXiv:2402.12374)
+//   - DeepSeek MTP: Multi-Token Prediction Architecture (DeepSeek-V2 / DeepSeek-V3 Technical Reports)
+//   - Medusa: Simple Framework for Accelerating LLM Generation with Multiple Decoding Heads (Cai et al.)
+//
 //
 // In multi-agent serving with speculative decoding, linear draft chains (x1 -> x2 -> x3) suffer from
 // catastrophic early rejection when the target model diverges at x1, even if an alternate plausible

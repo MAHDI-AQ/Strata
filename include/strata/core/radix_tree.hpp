@@ -1,3 +1,12 @@
+// include/strata/core/radix_tree.hpp - Lockless Chunk-Hashed RadixTree Prefix Cache & HiCache L2 DMA
+//
+// Cross-Engine Attribution and Research Lineage:
+//   - SGLang: "Efficient Execution of Structured Language Model Programs" (Zheng et al., LMSYS / UC Berkeley, arXiv:2312.07104)
+//     * RadixAttention tree-structured prefix caching & automatic prefix cache reuse
+//     * Chunk-level 64-token hash fingerprinting via hardware SSE4.2 CRC32C (_mm_crc32_u64)
+//     * Hierarchical cache memory (L1 VRAM <-> L2 Pinned Host RAM DMA parking & wire-speed restoration)
+//   - vLLM: Automatic Prefix Caching (APC) and physical memory block table management (Kwon et al., SOSP 2023)
+//
 #pragma once
 
 #include <cuda_runtime.h>

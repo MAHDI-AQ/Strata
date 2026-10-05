@@ -1,3 +1,10 @@
+// src/kernels/cuda/router_top10.cu - Fused MoE Warp-Cooperative Top-10 Router & Activation Kernel
+//
+// Cross-Engine Attribution and Research Lineage:
+//   - FlashInfer: "Efficient and Customizable Attention Kernels for LLM Serving" (Ye et al., UW / UC Berkeley)
+//   - CUTLASS: Fast warp-cooperative reduction primitives (__shfl_xor_sync) and top-k selection algorithms (NVIDIA)
+//   - llama.cpp / GGML: Exact mathematical reference semantics (stable argsort and ggml_clamp renormalisation)
+//
 // src/kernels/cuda/router_top10.cu - P2.S2: the MoE router.
 //
 // P2.S2's spec: "BF16 GEMV, softmax / top-k / renormalize per docs/semantics.md; emits (expert_id, weight) x 10

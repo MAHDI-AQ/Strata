@@ -1,3 +1,10 @@
+// src/core/mtp.cpp - Multi-Token Prediction (MTP) Speculative Draft Head & Verification Engine
+//
+// Cross-Engine Attribution and Research Lineage:
+//   - DeepSeek-AI: Multi-Token Prediction (MTP) architecture (DeepSeek-V2 / DeepSeek-V3 Technical Reports)
+//   - EAGLE-1/2: Sub-step autoregressive draft proposal generation & feature fusion (Li et al., arXiv:2406.16858)
+//   - FlashInfer: Fused attention and kernel epilogues for low-latency speculative draft passes (Ye et al., UW)
+//
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
