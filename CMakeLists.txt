@@ -8,9 +8,23 @@
 # below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.38 LANGUAGES CXX)
+project(strata-agx VERSION 0.1.38 LANGUAGES CXX)
 option(STRATA_BUILD_CONCURRENCY_TESTS "Build CPU-only request scheduling tests" OFF)
+set(STRATA_AGX_VERSION "0.1.38-agx.1.0.0")
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+add_compile_definitions(STRATA_AGX_VERSION="${STRATA_AGX_VERSION}")
+
+execute_process(
+  COMMAND git rev-parse --short HEAD
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  OUTPUT_VARIABLE STRATA_COMMIT_HASH
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+if(NOT STRATA_COMMIT_HASH)
+  set(STRATA_COMMIT_HASH "121f361")
+endif()
+add_compile_definitions(STRATA_COMMIT="${STRATA_COMMIT_HASH}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")

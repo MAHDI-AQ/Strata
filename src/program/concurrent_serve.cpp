@@ -423,7 +423,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     }
     // HiCache L2: RadixTree dynamic prefix-cache parking is native to the concurrent multi-device path.
     if (c.conversation_cache_mib > 0) {
-        std::fprintf(stderr, "strata concurrent: HiCache L2 host-RAM conversation cache enabled (budget: %lld MiB, slots: %d)\n", (long long) c.conversation_cache_mib, c.conversation_cache_slots);
+        std::fprintf(stderr, "strata-agx concurrent: HiCache L2 host-RAM conversation cache enabled (budget: %lld MiB, slots: %d)\n", (long long) c.conversation_cache_mib, c.conversation_cache_slots);
     }
     // C1 boundary: at N=1 every binding below is the very object the old run() took as a separate
     // argument - same call sequence, same objects, same order (re-root, not a rewrite).
@@ -450,12 +450,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         const char* disable_env = std::getenv("STRATA_DISABLE_NATIVE_ROUTER");
         const bool use_native = (disable_env == nullptr || std::strcmp(disable_env, "1") != 0);
         strata::kernels::native_router_set_enabled(use_native);
-        std::fprintf(stderr, "strata concurrent: %s router enabled (SM89 Ada Lovelace warp-cooperative Top-10)\n",
+        std::fprintf(stderr, "strata-agx concurrent: %s router enabled (SM89 Ada Lovelace warp-cooperative Top-10)\n",
                      use_native ? "native fused" : "generic");
     }
     if (const char* shm_env = std::getenv("STRATA_IPC_SHM")) {
         if (ipc::ShmProducer::instance()->init(shm_env)) {
-            std::fprintf(stderr, "strata concurrent: zero-copy shared memory IPC enabled (%s)\n", shm_env);
+            std::fprintf(stderr, "strata-agx concurrent: zero-copy shared memory IPC enabled (%s)\n", shm_env);
         }
     }
     struct ProgressGuard { ~ProgressGuard() { core::progress().busy.store(false); } } progress_guard;
@@ -664,17 +664,17 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // P1-cache-revive: the concurrent path parks nothing yet (host-RAM snapshots); live retention is
     // separate from parking and the P1 refusal above stays in force for conversation_cache_mib > 0.
     // The DONE trailer field now carries the live-retention reuse count (was hardcoded 0).
-    std::fprintf(stderr, "strata concurrent: shared expert batching; independent MTP; adaptive cache %s; %s\n",
+    std::fprintf(stderr, "strata-agx concurrent: shared expert batching; independent MTP; adaptive cache %s; %s\n",
                  adaptive ? "on" : "off",
                  retain ? "prefix-cache live-retention on (parking not yet supported on this path)"
                         : "prefix-cache off (parking not yet supported on this path)");
     // D1: advertise the sess= wire hint only while retention is on - the off path stays byte-identical
     // (stdout and wire), and the server sends the hint only to an engine that advertises it.
-    std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s%s\n",
+    std::printf("INFO engine=" STRATA_AGX_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s%s\n",
                 c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.kv.c_str(), c.suffix, adaptive ? "adaptive" : "static",
                 retain ? " admission=d1" : "");
     const int primary_slots = (c.aux_slots > 0 && c.aux_slots < c.requests) ? (c.requests - c.aux_slots) : c.requests;
-    if (c.aux_slots > 0) std::fprintf(stderr, "strata concurrent: tiered slots: %d primary @ %lld tokens, %d aux @ %lld tokens\n", primary_slots, (long long) c.context, c.aux_slots, (long long) c.aux_context);
+    if (c.aux_slots > 0) std::fprintf(stderr, "strata-agx concurrent: tiered slots: %d primary @ %lld tokens, %d aux @ %lld tokens\n", primary_slots, (long long) c.context, c.aux_slots, (long long) c.aux_context);
     std::printf("READY %lld stop multiplex\n", (long long) c.context);
     // LANE sched-impl P2 (host-loop O1/O2 surface): echo the effective spin posture so the primary's
     // A/B reads off this log line. Zero wait-posture change: the knobs are honored where they already
@@ -682,7 +682,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     {
         const char* remote_spin = std::getenv("STRATA_REMOTE_SPIN");
         const char* pool_spin = std::getenv("STRATA_POOL_SPIN_US");
-        std::fprintf(stderr, "strata concurrent: spin posture remote_spin=%s pool_spin_us=%s (defaults: spin|maphost, 20000us)\n",
+        std::fprintf(stderr, "strata-agx concurrent: spin posture remote_spin=%s pool_spin_us=%s (defaults: spin|maphost, 20000us)\n",
                      (remote_spin && remote_spin[0]) ? remote_spin : "(unset:spin)",
                      (pool_spin && pool_spin[0]) ? pool_spin : "(unset:20ms)");
     }
@@ -870,7 +870,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             const auto beat = progress.beats.load();
             if (!progress.busy.load() || beat != last) { last = beat; since = now; continue; }
             if (watchdog_seconds > 0 && now - since >= std::chrono::seconds(watchdog_seconds)) {
-                std::fprintf(stderr, "strata concurrent: no progress for %d seconds (%s); stopping stalled engine\n",
+                std::fprintf(stderr, "strata-agx concurrent: no progress for %d seconds (%s); stopping stalled engine\n",
                              watchdog_seconds, progress.where.load());
                 if (auto diag = core::diag_verify_fn().load()) diag(stderr);
                 if (auto diag = core::diag_pool_fn().load()) diag(stderr);
@@ -891,7 +891,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         return (size_t) 64;
     }();
     core::RadixTree radix_tree(radix_slots, radix_host_slots);
-    std::fprintf(stderr, "strata concurrent: RadixTree HiCache L2 host-RAM parking enabled (VRAM slots: %zu, Host-RAM slots: %zu)\n",
+    std::fprintf(stderr, "strata-agx concurrent: RadixTree HiCache L2 host-RAM parking enabled (VRAM slots: %zu, Host-RAM slots: %zu)\n",
                  radix_slots, radix_host_slots);
     auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens) {
         if (prefix_len < 256 || tokens.size() < (size_t) prefix_len) return;
@@ -984,7 +984,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             rs.active.store(false);
             rs.count = 0;
         }
-        std::fprintf(stderr, "strata concurrent: batch round refused (%s); requests errored, engine up\n", why.c_str());
+        std::fprintf(stderr, "strata-agx concurrent: batch round refused (%s); requests errored, engine up\n", why.c_str());
     };
     // ============================ STAGE-PIPELINE OVERLAP (lane overlap) ============================
     // stage0[N+1] || stage1[N]: with the hand-off DOUBLE-BUFFERED by parity, stage0 of the next
@@ -1045,7 +1045,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 return 1;
             }
         }
-        std::fprintf(stderr, "strata concurrent: stage overlap on: stage0[N+1] runs with stage1[N] "
+        std::fprintf(stderr, "strata-agx concurrent: stage overlap on: stage0[N+1] runs with stage1[N] "
                              "(ping-pong hand-off, per-parity captures)\n");
     }
 
@@ -1347,7 +1347,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         size_t f0 = 0, t0 = 0, f1 = 0, t1 = 0;
         { const core::OnDevice on0(0); cudaMemGetInfo(&f0, &t0); }
         { const core::OnDevice on1(1); cudaMemGetInfo(&f1, &t1); }
-        std::fprintf(stderr, "strata concurrent: slot-lazy: slot sessions carved from the expert caches' tails (CUDA0 free %zu MiB, CUDA1 free %zu MiB)\n", f0 >> 20, f1 >> 20);
+        std::fprintf(stderr, "strata-agx concurrent: slot-lazy: slot sessions carved from the expert caches' tails (CUDA0 free %zu MiB, CUDA1 free %zu MiB)\n", f0 >> 20, f1 >> 20);
         return true;
     };
     // P4: one slot's admission - the exact sequence the loop always ran (bookkeeping, per-stage reset
@@ -1399,7 +1399,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (s.radix_node && s.radix_node != radix_parent) radix_tree.release(s.radix_node);
             s.radix_node = radix_parent;
             radix_tree.acquire(s.radix_node);
-            std::fprintf(stderr, "strata concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld (%s)\n", (long long) reused, (long long) radix_parent->id, radix_parent->has_device_snapshot() ? "VRAM" : "Host-RAM HiCache L2");
+            std::fprintf(stderr, "strata-agx concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld (%s)\n", (long long) reused, (long long) radix_parent->id, radix_parent->has_device_snapshot() ? "VRAM" : "Host-RAM HiCache L2");
         } else if (parent != nullptr && parent != &s) {
             // SPRINT 1: Cross-slot prefix fork from parent slot snapshot
             s.consumed.assign(parent->saved_consumed.begin(), parent->saved_consumed.begin() + reused);
@@ -1427,12 +1427,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
                 s.draft->kv_restore(reused);
             }
-            std::fprintf(stderr, "strata concurrent: cross-slot fork: slot forks %lld tokens from parent (saved=%lld)\n",
+            std::fprintf(stderr, "strata-agx concurrent: cross-slot fork: slot forks %lld tokens from parent (saved=%lld)\n",
                          (long long) reused, (long long) parent->saved_prefix);
         } else {
             // Intra-slot retention (slot continues itself)
             s.draft->kv_restore(reused);
-            std::fprintf(stderr, "strata concurrent: live retention: slot resumes %lld tokens\n", (long long) reused);
+            std::fprintf(stderr, "strata-agx concurrent: live retention: slot resumes %lld tokens\n", (long long) reused);
         }
         s.draft->set_prompt_len((int64_t) s.request.tokens.size());
         s.stages[0].verify.set_sampling(s.request.sampling);
@@ -2044,7 +2044,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     for (auto& s : m.slots) if (s->active.load()) finish(*s, "cancel");
     for (const auto& r : pending) error(r.id, "server shutting down");
     report_profile();
-    std::fprintf(stderr, "strata concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld 9=%lld 10=%lld 11=%lld 12=%lld 13=%lld 14=%lld 15=%lld 16=%lld\n",
+    std::fprintf(stderr, "strata-agx concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld 9=%lld 10=%lld 11=%lld 12=%lld 13=%lld 14=%lld 15=%lld 16=%lld\n",
                  (long long) batch_sizes[1], (long long) batch_sizes[2], (long long) batch_sizes[3], (long long) batch_sizes[4],
                  (long long) batch_sizes[5], (long long) batch_sizes[6], (long long) batch_sizes[7], (long long) batch_sizes[8],
                  (long long) batch_sizes[9], (long long) batch_sizes[10], (long long) batch_sizes[11], (long long) batch_sizes[12],
@@ -2052,21 +2052,21 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // lane-spec: the acceptance census at exit - windows served, drafts offered vs accepted (offered = the
     // sum over windows of count-1; accepted likewise of keep-1 - the same fields the DONE line carries per
     // request), split by the window's source and read off by draft position.
-    std::fprintf(stderr, "strata concurrent: spec census: windows=%lld offered=%lld accepted=%lld "
+    std::fprintf(stderr, "strata-agx concurrent: spec census: windows=%lld offered=%lld accepted=%lld "
                  "mtp[windows=%lld offered=%lld accepted=%lld] lookup[windows=%lld offered=%lld accepted=%lld]\n",
                  (long long) windows_served, (long long) offered_total, (long long) accepted_total,
                  (long long) source_windows[0], (long long) source_offered[0], (long long) source_accepted[0],
                  (long long) source_windows[1], (long long) source_offered[1], (long long) source_accepted[1]);
-    std::fprintf(stderr, "strata concurrent: spec windows by verified count: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
+    std::fprintf(stderr, "strata-agx concurrent: spec windows by verified count: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
                  (long long) count_hist[1], (long long) count_hist[2], (long long) count_hist[3], (long long) count_hist[4],
                  (long long) count_hist[5], (long long) count_hist[6], (long long) count_hist[7], (long long) count_hist[8]);
-    std::fprintf(stderr, "strata concurrent: spec windows by committed tokens: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
+    std::fprintf(stderr, "strata-agx concurrent: spec windows by committed tokens: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
                  (long long) keep_hist[1], (long long) keep_hist[2], (long long) keep_hist[3], (long long) keep_hist[4],
                  (long long) keep_hist[5], (long long) keep_hist[6], (long long) keep_hist[7], (long long) keep_hist[8]);
-    std::fprintf(stderr, "strata concurrent: spec offered by position: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
+    std::fprintf(stderr, "strata-agx concurrent: spec offered by position: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
                  (long long) pos_offered[1], (long long) pos_offered[2], (long long) pos_offered[3], (long long) pos_offered[4],
                  (long long) pos_offered[5], (long long) pos_offered[6], (long long) pos_offered[7], (long long) pos_offered[8]);
-    std::fprintf(stderr, "strata concurrent: spec accepted by position: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
+    std::fprintf(stderr, "strata-agx concurrent: spec accepted by position: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld\n",
                  (long long) pos_accepted[1], (long long) pos_accepted[2], (long long) pos_accepted[3], (long long) pos_accepted[4],
                  (long long) pos_accepted[5], (long long) pos_accepted[6], (long long) pos_accepted[7], (long long) pos_accepted[8]);
     return 0;

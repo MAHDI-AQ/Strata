@@ -1,4 +1,4 @@
-<h1 align="center">Strata (Mahdi AI Lab Edition)</h1>
+<h1 align="center">Strata AGX (Agentic Graph eXecution)</h1>
 
 <p align="center"><b>High-Throughput Downstream Inference Engine for 125B MoE Models</b><br>
 Dual NVIDIA GeForce RTX 4090 · 262K Context Scaling · Multi-Agent Dynamic RadixTree KV · Free and Open Source</p>
@@ -7,7 +7,7 @@ Dual NVIDIA GeForce RTX 4090 · 262K Context Scaling · Multi-Agent Dynamic Radi
 
 ## Overview
 
-**Strata (Mahdi AI Lab Edition)** is an independent downstream engineering fork of [Niko1221/Strata](https://github.com/Niko1221/Strata).
+**Strata AGX (Agentic Graph eXecution)** is an independent downstream engineering fork of [Niko1221/Strata](https://github.com/Niko1221/Strata).
 
 While upstream Strata proved that a 125B MoE model could execute on consumer gaming GPUs, this fork extends the architecture for **multi-agent workloads**, **massive context windows (262K)**, and **high-throughput dual-GPU execution**.
 
@@ -78,7 +78,7 @@ Evaluated on `Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M` (125B MoE Coder, 1.75 bpw) under
 
 Evaluated side-by-side on the exact same Dual RTX 4090 rig (Ubuntu 24.04, +150 MHz Core / +1000 MHz GDDR6X OC) using identical model weights (`Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M` and `IQ3_XXS`):
 
-| Capability / Benchmark Metric | Vanilla Upstream Strata (v0.1.38) | Strata (Mahdi AI Lab Edition) | Empirical Acceleration / Difference |
+| Capability / Benchmark Metric | Vanilla Upstream Strata (v0.1.38) | Strata AGX (v0.1.38-agx.1.0.0) | Empirical Acceleration / Difference |
 |---|---|---|---|
 | **Max Reachable Context Window** | 65,536 – 131,072 tokens (static allocation limits) | **262,144 tokens (262K)** with 128K max output window | **2× – 4× deeper context** on identical dual 24GB GPUs |
 | **Multi-Agent Concurrency** | **$C=1$ Only** (Strict FIFO serialization; no multi-slot decode) | **$C=1$ to $C=5$ Concurrent Multiplexing** (dynamic slot balancing) | **Up to 5 concurrent agent streams** |
@@ -89,7 +89,7 @@ Evaluated side-by-side on the exact same Dual RTX 4090 rig (Ubuntu 24.04, +150 M
 | **Cross-GPU KV Cache Parking** | **Unsupported** (`layer-split parking is not supported`) | **Dynamic RadixTree KV Manager** with L2 Host-RAM parking | Full cross-GPU checkpointing, branch prefix sharing, zero-copy VRAM eviction |
 | **Hardware Kernel Optimization** | Generic SM75/SM80+ CUDA kernels | Custom SM89 Ada Lovelace GEMM tiling + persistent 72MB L2 cache pinning | Verified bitwise parity passing 100% across all 18 quant formats |
 
-*Note: In vanilla upstream Strata, requests beyond $C=1$ are queued in FIFO order; each client waits for the previous request to completely finish decoding, capping aggregate throughput at ~80 tok/s and scaling request latency linearly with queue depth. The Mahdi AI Lab Edition multiplexes multiple concurrent requests simultaneously within GPU compute and VRAM budgets.*
+*Note: In vanilla upstream Strata, requests beyond $C=1$ are queued in FIFO order; each client waits for the previous request to completely finish decoding, capping aggregate throughput at ~80 tok/s and scaling request latency linearly with queue depth. Strata AGX multiplexes multiple concurrent requests simultaneously within GPU compute and VRAM budgets.*
 
 ---
 
