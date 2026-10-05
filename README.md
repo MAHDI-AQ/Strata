@@ -103,8 +103,8 @@ Evaluated side-by-side on the exact same Dual RTX 4090 rig (Ubuntu 24.04, +150 M
 
 ### Compile from Source
 ```bash
-git clone https://github.com/MAHDI-AQ/Strata.git
-cd Strata
+git clone https://github.com/MAHDI-AQ/Strata-AGX.git
+cd Strata-AGX
 cmake -B build -G Ninja -DSTRATA_ENABLE_CUDA=ON
 cmake --build build -j 16
 ```
