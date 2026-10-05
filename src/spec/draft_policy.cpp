@@ -10,7 +10,10 @@ namespace {
 // The shape of a round's cost by window size, relative to one token, used only for sizes not measured yet (the
 // measured round times replace it). Between the RTX 5070's measured curves: +10 ms per token with every missed expert
 // on the CPU (bench/results/2026-09-27-spec/window-cost), flatter with the default CPU/DMA split.
-constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6};
+constexpr double kShape[DraftPolicy::kMaxT + 1] = {
+    0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6,
+    3.95, 4.3, 4.65, 5.0, 5.35, 5.7, 6.05, 6.4
+};
 constexpr double kCostAlpha = 0.1;    // EMA weight of a new round time
 constexpr double kTokAlpha = 0.05;    // EMA weight of a new MTP window outcome
 constexpr double kDecay = 0.97;       // lookup counts: older windows fade
@@ -83,11 +86,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
         p.t = best_t;
         return p;
     }
-    // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would
-    // need a size not measured yet, it is tried (verification keeps the output; only the one round's speed is at stake)
     const int t_full = std::min(lookup_k, max_t_ - 1) + 1;
-    // Stratified probe gate: short matches (ordinary text) need stronger evidence;
-    // long matches (code-repeat/tool JSON) probe wider sooner. Output unchanged.
     const double probe_q = match < 6 ? 0.90 : 0.82;
     if (t_full > p.t && cost_n_[t_full] < kProbes && q >= probe_q) {
         p.lookup = true;

@@ -214,6 +214,14 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
     return best;
 }
 
+RadixMatch RadixTree::match_prefix_overlap(const int32_t* tokens, size_t n, float* out_overlap_ratio) const {
+    auto match = match_prefix(tokens, n);
+    if (out_overlap_ratio) {
+        *out_overlap_ratio = (n > 0) ? (static_cast<float>(match.matched_tokens) / static_cast<float>(n)) : 0.0f;
+    }
+    return match;
+}
+
 RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     RadixMatch best{nullptr, 0};

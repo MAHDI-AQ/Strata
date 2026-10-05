@@ -4,7 +4,7 @@
 **Maintained By:** Mahdi AI Lab (`Mahdi <MAHDI-AQ@users.noreply.github.com>`)  
 **Parent Upstream Repository:** [`Niko1221/Strata`](https://github.com/Niko1221/Strata) (`origin/main`)  
 **Fork Base Coordinate:** `99f3dbd0b21d1401b3769e0c0d963913607f380b` (`v0.1.38` baseline)  
-**Current AGX Release:** `v0.1.38-agx.1.0.1`  
+**Current AGX Release:** `v0.1.38-agx.1.0.2`  
 **Last Updated:** 2026-10-05
 
 ---
@@ -35,6 +35,7 @@ v<upstream-version>-agx.<major>.<minor>.<patch>
 
 *Baseline Milestone:* **`v0.1.38-agx.1.0.0`** (2026-10-05: Phases 1–5 complete).
 *Phase 6 Milestone:* **`v0.1.38-agx.1.0.1`** (2026-10-05: Fused GDN Recurrence, Direct Q8_0 Epilogue, and SM89 Split-K Flash-Decoding).
+*Phase 7 Milestone:* **`v0.1.38-agx.1.0.2`** (2026-10-05: Multi-Branch SpecTree DAG Expansion T <= 16, Device DP Verify Kernel, and Speculative Prefill).
 
 ---
 

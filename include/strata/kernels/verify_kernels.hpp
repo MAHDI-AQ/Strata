@@ -95,4 +95,17 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// last `window` cells: ids[q * ids_stride + j] = max(0, n_kv - window) + j and the record's width = the count.
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream);
 
+/// Task 7.2: Device-Side Speculative Tree Verification & Path Selection Kernel
+/// Evaluates candidate node validity against target predictions, computes longest valid
+/// branch using DP with cumulative log-prob tie-breaking, and writes best_path_indices
+/// and n_accepted directly into device memory in < 15 us without host round-trips.
+void spec_tree_verify_dp(const int32_t* tree_tokens,
+                         const int32_t* target_tokens,
+                         const int32_t* parents,
+                         const float* log_probs,
+                         int32_t* best_path_indices,
+                         int32_t* n_accepted,
+                         int T,
+                         void* stream);
+
 }  // namespace strata::kernels

@@ -227,6 +227,7 @@ public:
     ~RadixTree();
 
     RadixMatch match_prefix(const int32_t* tokens, size_t n) const;
+    RadixMatch match_prefix_overlap(const int32_t* tokens, size_t n, float* out_overlap_ratio = nullptr) const;
     RadixMatch match_prefix(const int64_t* tokens, size_t n) const;
     RadixMatch match_prefix(const std::vector<int32_t>& tokens) const { return match_prefix(tokens.data(), tokens.size()); }
     RadixMatch match_prefix(const std::vector<int64_t>& tokens) const { return match_prefix(tokens.data(), tokens.size()); }

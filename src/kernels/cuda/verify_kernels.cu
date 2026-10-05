@@ -633,4 +633,104 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
 }
 
+// Task 7.2: Device-Side Speculative Tree Verification & Path Selection Kernel
+// Cross-Engine Reference: Sequoia (SOSP 2024), EAGLE-2 (arXiv:2406.16858)
+namespace {
+__global__ void spec_tree_verify_dp_kernel(
+    const int32_t* __restrict__ tree_tokens,
+    const int32_t* __restrict__ target_tokens,
+    const int32_t* __restrict__ parents,
+    const float* __restrict__ log_probs,
+    int32_t* __restrict__ best_path_indices,
+    int32_t* __restrict__ n_accepted,
+    int T) {
+
+    __shared__ int32_t s_valid[16];
+    __shared__ int32_t s_len[16];
+    __shared__ float s_score[16];
+    __shared__ int32_t s_parent[16];
+
+    const int tid = threadIdx.x;
+    if (tid < 16) {
+        s_valid[tid] = 0;
+        s_len[tid] = 0;
+        s_score[tid] = -1e9f;
+        s_parent[tid] = (tid < T) ? parents[tid] : -1;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        if (T <= 0) {
+            *n_accepted = 0;
+            return;
+        }
+
+        // Root (node 0) is unconditionally valid as the prefix/anchor
+        s_valid[0] = 1;
+        s_len[0] = 1;
+        s_score[0] = (log_probs != nullptr) ? log_probs[0] : 0.0f;
+
+        // DP pass over nodes in topological order (parent[i] < i)
+        for (int i = 1; i < T; ++i) {
+            const int p = s_parent[i];
+            if (p >= 0 && p < i && s_valid[p]) {
+                const int32_t expected = target_tokens[p];
+                const int32_t actual = tree_tokens[i];
+                if (actual == expected) {
+                    s_valid[i] = 1;
+                    s_len[i] = s_len[p] + 1;
+                    const float score_inc = (log_probs != nullptr) ? log_probs[i] : 0.0f;
+                    s_score[i] = s_score[p] + score_inc;
+                }
+            }
+        }
+
+        // Find leaf node with maximum length, breaking ties with cumulative score
+        int best_node = 0;
+        int max_len = 1;
+        float max_score = s_score[0];
+
+        for (int i = 1; i < T; ++i) {
+            if (s_valid[i]) {
+                if (s_len[i] > max_len || (s_len[i] == max_len && s_score[i] > max_score)) {
+                    max_len = s_len[i];
+                    max_score = s_score[i];
+                    best_node = i;
+                }
+            }
+        }
+
+        // Backtrack path from best_node to root
+        int32_t path_rev[16];
+        int curr = best_node;
+        int count = 0;
+        while (curr >= 0 && count < 16) {
+            path_rev[count++] = curr;
+            curr = s_parent[curr];
+        }
+
+        // Emit best_path_indices in forward (root-to-leaf) order
+        for (int k = 0; k < count; ++k) {
+            best_path_indices[k] = path_rev[count - 1 - k];
+        }
+        *n_accepted = count;
+    }
+}
+}  // namespace
+
+void spec_tree_verify_dp(const int32_t* tree_tokens,
+                         const int32_t* target_tokens,
+                         const int32_t* parents,
+                         const float* log_probs,
+                         int32_t* best_path_indices,
+                         int32_t* n_accepted,
+                         int T,
+                         void* stream) {
+    if (T <= 0) return;
+    const int actual_t = (T > 16) ? 16 : T;
+    spec_tree_verify_dp_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(
+        tree_tokens, target_tokens, parents, log_probs, best_path_indices, n_accepted, actual_t);
+    check("spec_tree_verify_dp");
+}
+
 }  // namespace strata::kernels
