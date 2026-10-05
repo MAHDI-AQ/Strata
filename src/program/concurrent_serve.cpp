@@ -13,6 +13,7 @@
 #include "strata/spec/draft_policy.hpp"
 #include "strata/core/radix_tree.hpp"
 #include "strata/core/shm_ipc.hpp"
+#include "strata/kernels/native_router.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -435,6 +436,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     if (!source || !host_res || !hits.d_res || cache.slots() < 1) {
         err = "concurrency: no profile-filled expert cache fits; reduce context/concurrency or increase available VRAM";
         return 1;
+    }
+    // Phase 4: Compute Kernels & MoE Router Acceleration
+    {
+        const char* disable_env = std::getenv("STRATA_DISABLE_NATIVE_ROUTER");
+        const bool use_native = (disable_env == nullptr || std::strcmp(disable_env, "1") != 0);
+        strata::kernels::native_router_set_enabled(use_native);
+        std::fprintf(stderr, "strata concurrent: %s router enabled (SM89 Ada Lovelace warp-cooperative Top-10)\n",
+                     use_native ? "native fused" : "generic");
     }
     if (const char* shm_env = std::getenv("STRATA_IPC_SHM")) {
         if (ipc::ShmProducer::instance()->init(shm_env)) {

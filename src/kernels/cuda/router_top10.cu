@@ -186,7 +186,7 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
     }
 }
 
-#if defined(__HIPCC__)
+// ---- S6 & SM89 CUDA: the same router
 // ---- S6, AMD: the same router, BIT-IDENTICAL, without its serial parts. Measured on RDNA4 (gfx1201) the kernel
 // above took 39 us per call in decode (16% of the GPU's decode time): the ascending double sum is 512 dependent FP64
 // adds (~50 cycles each there), the ten selection passes are 20 block barriers, and the renormalisation re-reads its
@@ -324,29 +324,23 @@ void launch_generic(const float* logits, int n_tokens, int n_expert, int k, int*
     router_top10_kernel<<<(unsigned) n_tokens, threads, smem, (cudaStream_t) stream>>>(
         logits, n_tokens, n_expert, k, ids, weights);
 }
-#endif
+
 
 }  // namespace
 
 bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                           void* stream, int variant) {
-#if defined(__HIPCC__)
     if (n_tokens <= 0 || n_expert <= 64 || n_expert > 512 || k <= 0 || k > 32) return false;
     if (variant < 0 || variant > 2) return false;
     launch_generic(logits, n_tokens, n_expert, k, ids, weights, stream, variant);
     return cudaGetLastError() == cudaSuccess;
-#else
-    (void) logits; (void) n_tokens; (void) n_expert; (void) k; (void) ids; (void) weights; (void) stream;
-    (void) variant;
-    return false;
-#endif
 }
 
 void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                   void* stream) {
-#if defined(__HIPCC__)
+
     {
-        static const bool old = std::getenv("STRATA_HIP_ROUTER_OLD") != nullptr;
+        static const bool old = (std::getenv("STRATA_ROUTER_OLD") != nullptr || std::getenv("STRATA_HIP_ROUTER_OLD") != nullptr);
         if (!old && n_tokens > 0 && n_expert > 64 && n_expert <= 512 && k > 0 && k <= 32) {
             launch_generic(logits, n_tokens, n_expert, k, ids, weights, stream, 1);
             const cudaError_t e = cudaGetLastError();
@@ -364,7 +358,7 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
             return;
         }
     }
-#endif
+
     if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;
     if (k > 64) {
         std::fprintf(stderr, "router_top10: k %d exceeds the kernel's 64\n", k);

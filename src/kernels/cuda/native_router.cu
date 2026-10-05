@@ -26,11 +26,16 @@
 #include <cfloat>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 namespace strata::kernels {
 namespace {
-std::atomic<bool> enabled{false};
+bool default_native_router_enabled() {
+    const char* env = std::getenv("STRATA_DISABLE_NATIVE_ROUTER");
+    return env == nullptr || std::strcmp(env, "1") != 0;
+}
+std::atomic<bool> enabled{default_native_router_enabled()};
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int mask = 16; mask; mask >>= 1) value += __shfl_xor_sync(0xffffffffu, value, mask, 32);
