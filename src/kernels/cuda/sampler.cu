@@ -977,6 +977,11 @@ bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0) return;
+    (void) cudaGetLastError();
+    cudaPointerAttributes attr;
+    if (logits != nullptr && cudaPointerGetAttributes(&attr, logits) == cudaSuccess && attr.device >= 0) {
+        cudaSetDevice(attr.device);
+    }
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
         std::fprintf(stderr, "sample_tokens: penalty_last_n %d needs a history (got %p, len %d)\n",
                      p.penalty_last_n, (const void*) history, history_len);

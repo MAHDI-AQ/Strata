@@ -272,6 +272,7 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
 
 void iota(int32_t* dst, int64_t n, void* stream) {
     if (n <= 0) return;
+    (void) cudaGetLastError();
     iota_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(dst, n);
     ck(cudaGetLastError(), "iota");
 }

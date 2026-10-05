@@ -735,6 +735,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             }
         }
         for (size_t st = 0; st < n_stages; ++st) {
+            const core::OnDevice on(stage_devices[st]);
             cudaStreamSynchronize((cudaStream_t) streams[st]);
         }
         ++cached_snapshots_;

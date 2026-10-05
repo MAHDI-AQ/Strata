@@ -950,6 +950,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             ss.ple_token_saved = ss.state->ple_token;
         }
         for (size_t st = 0; st < m.stage_rt.size(); ++st) {
+            const core::OnDevice on(m.stages[st].device);
             cudaStreamSynchronize(m.stage_rt[st].prompt_stream);
         }
         // SPRINT 4: Dynamic RadixTree insert
@@ -1407,8 +1408,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             for (size_t st = 0; st < m.stages.size(); ++st) {   // C4: every stage's state resets on its device
                 const core::OnDevice on(m.stages[st].device);
                 core::session_zero(*s.stages[st].state, g, nullptr, m.stage_rt[st].prompt_stream);
-            }
-            for (size_t st = 0; st < m.stage_rt.size(); ++st) {
                 core::progress_at("concurrency: resetting a stage", (int64_t) st);
                 if (cudaStreamSynchronize(m.stage_rt[st].prompt_stream) != cudaSuccess) { err = "concurrency: reset failed"; return false; }
             }
