@@ -1749,7 +1749,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 const float p0 = s.probability[0];
                 const int dyn_depth = s.policy.decide_depth(p0, c.mtp_window_rows, s.request.spec_min_p);
                 n = 1;
-                while (n < dyn_depth && s.probability[n - 1] >= s.request.spec_min_p) ++n;
+                float thresh = s.request.spec_min_p;
+                while (n < dyn_depth && s.probability[n - 1] >= thresh) {
+                    ++n;
+                    thresh *= 0.85f; // Compound autoregressive entropy decay
+                }
             }
             s.lookup = false; s.match = 0;
             if (!s.first && c.suffix > 0) {
