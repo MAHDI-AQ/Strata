@@ -356,7 +356,7 @@ void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_
 /// memory the softmax works in.
 void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* v_scratch,
                      const int32_t* step, int64_t max_ids, const QsaShapes& s, float* attn, float* weights,
-                     void* stream);
+                     void* stream, float* scratch = nullptr);
 
 struct KvHostPools;   // kv_stream.hpp
 

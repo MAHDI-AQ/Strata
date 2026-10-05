@@ -320,7 +320,7 @@ if (!gemv_quantized(*w_gate, p_gate, f_gate, b.x_q8_0, b.x_q8k, b.z, g.n_embd, g
                     w_qkv->native_data != nullptr && w_gate->native_data != nullptr)) return false;
 try {
     if (fused_gdn) fused_gdn_step_norm(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.z, ssm_norm, RMS_EPS, b.y,
-                                       (int) g.ssm_k_heads, (int) g.ssm_v_heads, stream);
+                                       (int) g.ssm_k_heads, (int) g.ssm_v_heads, stream, b.y_q8_0);
     else if (native_gdn_enabled()) native_gdn_out_norm(b.o, b.z, ssm_norm, b.y, g.ssm_v_heads, g.ssm_state_size, RMS_EPS, stream);
     else gdn_out_norm(b.o, b.z, ssm_norm, b.y, g.ssm_v_heads, g.ssm_state_size, RMS_EPS, stream);
 } catch (const std::exception& error) { err = v.name("gdn_out_norm") + ": " + error.what(); return false; }
@@ -328,8 +328,11 @@ st_end(layer, 14, stream);
 // ---- 8. out = ssm_out @ y, whose activation is whatever THIS layer's `ssm_out` asks for
 st_begin(layer, 15, stream);
     if (!w_out->native_data) {
-        quantize_q8_K(b.y, b.y_q8k, g.ssm_value_dim, stream);
-        quantize_q8_0(b.y, b.y_q8_0, g.ssm_value_dim, stream);
+        if (w_out->wants_q8k()) {
+            quantize_q8_K(b.y, b.y_q8k, g.ssm_value_dim, stream);
+        } else if (!fused_gdn) {
+            quantize_q8_0(b.y, b.y_q8_0, g.ssm_value_dim, stream);
+        }
     }    if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,                        v.name("ssm_out.weight"), stream, err, b.y)) return false;    st_end(layer, 15, stream);    return true;}
 // ================================ the MoE block ================================
 uint64_t moe_buffers_bytes(const ModelGeometry& g, int64_t k) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2,
@@ -971,7 +974,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
                         cudaMemcpyDeviceToHost, (cudaStream_t) stream) != cudaSuccess) {
         err = v.name("native_flash_attn") + ": status readback failed"; return false;
     }
-} else qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
+} else qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream, b.attn_scratch);
     }
     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
     dump_slot(dump, g, layer, b.attn, (uint64_t) 2 * g.n_embd + 2 * g.hc,                            (uint64_t) g.n_head * g.head_dim, stream);    {        const uint64_t vs = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim +                            (uint64_t) 2 * g.n_head_kv * g.head_dim;        dump_slot(dump, g, layer, (const float*) b.v_scratch, vs,                            (uint64_t) g.n_head_kv * g.head_dim / 2, stream);        dump_slot(dump, g, layer, (const float*) b.ids, vs + (uint64_t) g.n_head_kv * g.head_dim / 2, 4, stream);        dump_slot(dump, g, layer, (const float*) st.step,                            vs + (uint64_t) g.n_head_kv * g.head_dim / 2 + 4, 4, stream);    }

@@ -10,7 +10,7 @@
 cmake_minimum_required(VERSION 3.24)
 project(strata-agx VERSION 0.1.38 LANGUAGES CXX)
 option(STRATA_BUILD_CONCURRENCY_TESTS "Build CPU-only request scheduling tests" OFF)
-set(STRATA_AGX_VERSION "0.1.38-agx.1.0.0")
+set(STRATA_AGX_VERSION "0.1.38-agx.1.0.1")
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 add_compile_definitions(STRATA_AGX_VERSION="${STRATA_AGX_VERSION}")
 

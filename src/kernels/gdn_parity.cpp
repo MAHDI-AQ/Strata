@@ -1,3 +1,5 @@
+#include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/quantize_act.hpp"
 // src/kernels/gdn_parity.cpp - P2.S2's test for the GDN recurrence, the conv and the two norms.
 //
 // `ref/gdn.py` carries eleven PROPERTY checks, several of which exist because a rival reading of the SOURCE
@@ -388,6 +390,71 @@ int main(int argc, char** argv) {
                     rel_silu > 0.05 ? "yes" : "*** NO ***", rel_silu * 100);
         if (!(rel_silu > 0.05)) ++bad;
         cudaFree(d_o); cudaFree(d_z); cudaFree(d_sn); cudaFree(d_y);
+    }
+
+    
+    // ================= 5. fused_gdn_step_norm & direct Q8_0 epilogue =================
+    {
+        const int S2 = 128, hk = 2, hv = 4;
+        const size_t state_elems = (size_t) S2 * hv * S2;
+        std::vector<float> st(state_elems), q((size_t) hk * S2), k((size_t) hk * S2), v((size_t) hv * S2);
+        std::vector<float> gate((size_t) hv), beta((size_t) hv), z((size_t) hv * S2), sn((size_t) S2);
+        for (auto& val : st) val = 0.05f * gauss(rng);
+        for (auto& val : q) val = gauss(rng);
+        for (auto& val : k) val = gauss(rng);
+        for (auto& val : v) val = gauss(rng);
+        for (auto& val : gate) val = -0.5f + 0.1f * gauss(rng);
+        for (auto& val : beta) val = 0.8f + 0.1f * gauss(rng);
+        for (auto& val : z) val = gauss(rng);
+        for (auto& val : sn) val = 1.0f + 0.1f * gauss(rng);
+
+        const float eps = 1e-6f;
+        float *d_st = nullptr, *d_q = nullptr, *d_k = nullptr, *d_v = nullptr;
+        float *d_g = nullptr, *d_b = nullptr, *d_z = nullptr, *d_sn = nullptr, *d_y = nullptr;
+        uint8_t *d_y_q8_0 = nullptr, *d_ref_q8_0 = nullptr;
+
+        check(cudaMalloc(&d_st, state_elems * 4), "fst");
+        check(cudaMalloc(&d_q, q.size() * 4), "fq");
+        check(cudaMalloc(&d_k, k.size() * 4), "fk");
+        check(cudaMalloc(&d_v, v.size() * 4), "fv");
+        check(cudaMalloc(&d_g, gate.size() * 4), "fg");
+        check(cudaMalloc(&d_b, beta.size() * 4), "fb");
+        check(cudaMalloc(&d_z, z.size() * 4), "fz");
+        check(cudaMalloc(&d_sn, sn.size() * 4), "fsn");
+        check(cudaMalloc(&d_y, hv * S2 * 4), "fy");
+        const size_t q8_bytes = (size_t) (hv * S2 / 32) * 34;
+        check(cudaMalloc(&d_y_q8_0, q8_bytes), "fq8");
+        check(cudaMalloc(&d_ref_q8_0, q8_bytes), "frefq8");
+
+        check(cudaMemcpy(d_st, st.data(), state_elems * 4, cudaMemcpyHostToDevice), "cst");
+        check(cudaMemcpy(d_q, q.data(), q.size() * 4, cudaMemcpyHostToDevice), "cq");
+        check(cudaMemcpy(d_k, k.data(), k.size() * 4, cudaMemcpyHostToDevice), "ck");
+        check(cudaMemcpy(d_v, v.data(), v.size() * 4, cudaMemcpyHostToDevice), "cv");
+        check(cudaMemcpy(d_g, gate.data(), gate.size() * 4, cudaMemcpyHostToDevice), "cg");
+        check(cudaMemcpy(d_b, beta.data(), beta.size() * 4, cudaMemcpyHostToDevice), "cb");
+        check(cudaMemcpy(d_z, z.data(), z.size() * 4, cudaMemcpyHostToDevice), "cz");
+        check(cudaMemcpy(d_sn, sn.data(), sn.size() * 4, cudaMemcpyHostToDevice), "csn");
+
+        strata::kernels::fused_gdn_step_norm(d_st, d_q, d_k, d_v, d_g, d_b, d_z, d_sn, eps, d_y,
+                                            hk, hv, nullptr, d_y_q8_0);
+        strata::kernels::quantize_q8_0(d_y, d_ref_q8_0, hv * S2, nullptr);
+
+        std::vector<uint8_t> got_q8(q8_bytes), ref_q8(q8_bytes);
+        check(cudaMemcpy(got_q8.data(), d_y_q8_0, q8_bytes, cudaMemcpyDeviceToHost), "cq8g");
+        check(cudaMemcpy(ref_q8.data(), d_ref_q8_0, q8_bytes, cudaMemcpyDeviceToHost), "cq8r");
+
+        int q8_diffs = 0;
+        for (size_t i = 0; i < q8_bytes; ++i) {
+            if (got_q8[i] != ref_q8[i]) ++q8_diffs;
+        }
+        std::printf("  %-42s %s (%d byte diffs / %zu)\n",
+                    "fused_gdn direct Q8_0 epilogue vs quantize_q8_0",
+                    q8_diffs == 0 ? "EXACT" : "*** MISMATCH ***", q8_diffs, q8_bytes);
+        if (q8_diffs != 0) ++bad;
+
+        cudaFree(d_st); cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+        cudaFree(d_g); cudaFree(d_b); cudaFree(d_z); cudaFree(d_sn);
+        cudaFree(d_y); cudaFree(d_y_q8_0); cudaFree(d_ref_q8_0);
     }
 
     std::printf("\ngdn: %d failures\n", bad);

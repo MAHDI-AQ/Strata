@@ -508,6 +508,154 @@ __global__ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* _
     }
 }
 
+
+// ================= 6b. qsa_attend Split-K Flash-Decoding =================
+constexpr int SPLIT_K_P = 8;
+
+__global__ void qsa_attend_splitk_kernel(const float* __restrict__ q, const uint16_t* __restrict__ k_scratch,
+                                         const uint16_t* __restrict__ v_scratch, const int32_t* __restrict__ step,
+                                         int n_head, int n_head_kv, int head_dim,
+                                         float* __restrict__ part_acc, float* __restrict__ part_m,
+                                         float* __restrict__ part_l) {
+    const long long n_ids = (long long) __ldg(step + kStepWidth);
+    const int p = blockIdx.x;      // 0..SPLIT_K_P - 1
+    const int h = blockIdx.y;      // 0..n_head - 1
+    const int d = threadIdx.x;     // 0..head_dim - 1
+    const size_t slot = (size_t) h * SPLIT_K_P + p;
+
+    if (n_ids <= 0) {
+        part_acc[slot * head_dim + d] = 0.0f;
+        if (d == 0) {
+            part_m[slot] = -FLT_MAX;
+            part_l[slot] = 0.0f;
+        }
+        return;
+    }
+
+    const long long j_start = (n_ids * p) / SPLIT_K_P;
+    const long long j_end = (n_ids * (p + 1)) / SPLIT_K_P;
+    const long long n_part = j_end - j_start;
+
+    if (n_part <= 0) {
+        part_acc[slot * head_dim + d] = 0.0f;
+        if (d == 0) {
+            part_m[slot] = -FLT_MAX;
+            part_l[slot] = 0.0f;
+        }
+        return;
+    }
+
+    extern __shared__ float s_w[];
+    float* red = s_w;
+    float* w = s_w + 32;
+
+    const int kv = h / (n_head / n_head_kv);
+    const float scale = 1.0f / sqrtf((float) head_dim);
+    const int lane = d & 31, wid = d >> 5, nwarp = (int) ((blockDim.x + 31) >> 5);
+
+    for (long long j = d; j < n_part; j += blockDim.x) {
+        const long long cell_idx = j_start + j;
+        const uint16_t* krow = k_scratch + (cell_idx * n_head_kv + kv) * head_dim;
+        float acc = 0.0f;
+        for (int i = 0; i < head_dim; ++i) acc += h2f(krow[i]) * q[(size_t) h * head_dim + i];
+        w[j] = acc * scale;
+    }
+    __syncthreads();
+
+    float mx = -FLT_MAX;
+    for (long long j = d; j < n_part; j += blockDim.x) mx = fmaxf(mx, w[j]);
+    mx = warp_max(mx);
+    if (lane == 0) red[wid] = mx;
+    __syncthreads();
+    if (wid == 0) {
+        mx = (lane < nwarp) ? red[lane] : -FLT_MAX;
+        mx = warp_max(mx);
+        if (lane == 0) red[0] = mx;
+    }
+    __syncthreads();
+    mx = red[0];
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (long long j = d; j < n_part; j += blockDim.x) {
+        const float e = expf(w[j] - mx);
+        w[j] = e;
+        sum += e;
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) red[wid] = sum;
+    __syncthreads();
+    if (wid == 0) {
+        sum = (lane < nwarp) ? red[lane] : 0.0f;
+        sum = warp_sum(sum);
+        if (lane == 0) red[0] = sum;
+    }
+    __syncthreads();
+    sum = red[0];
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (long long j = 0; j < n_part; ++j) {
+        acc += w[j] * h2f(v_scratch[((j_start + j) * n_head_kv + kv) * head_dim + d]);
+    }
+    part_acc[slot * head_dim + d] = acc;
+    if (d == 0) {
+        part_m[slot] = mx;
+        part_l[slot] = sum;
+    }
+}
+
+__global__ void qsa_attend_splitk_reduce_kernel(const float* __restrict__ part_acc,
+                                                const float* __restrict__ part_m,
+                                                const float* __restrict__ part_l,
+                                                int n_head, int head_dim,
+                                                float* __restrict__ attn) {
+    const int h = blockIdx.x;      // 0..n_head-1
+    const int d = threadIdx.x;     // 0..head_dim-1
+
+    float max_m = -FLT_MAX;
+    for (int p = 0; p < SPLIT_K_P; ++p) {
+        max_m = fmaxf(max_m, part_m[(size_t) h * SPLIT_K_P + p]);
+    }
+
+    if (max_m == -FLT_MAX) {
+        attn[(size_t) h * head_dim + d] = 0.0f;
+        return;
+    }
+
+    float total_l = 0.0f;
+    float acc = 0.0f;
+    for (int p = 0; p < SPLIT_K_P; ++p) {
+        const size_t slot = (size_t) h * SPLIT_K_P + p;
+        const float mp = part_m[slot];
+        if (mp == -FLT_MAX) continue;
+        const float alpha = expf(mp - max_m);
+        total_l += part_l[slot] * alpha;
+        acc += part_acc[slot * head_dim + d] * alpha;
+    }
+
+    attn[(size_t) h * head_dim + d] = total_l > 0.0f ? (acc / total_l) : 0.0f;
+}
+
+struct SplitKBuffers {
+    float* part_acc = nullptr;
+    float* part_m = nullptr;
+    float* part_l = nullptr;
+};
+static SplitKBuffers s_splitk_buffers[64] = {};
+
+static SplitKBuffers get_splitk_buffers(int dev, int n_head, int head_dim) {
+    if (dev < 0 || dev >= 64) dev = 0;
+    if (s_splitk_buffers[dev].part_acc == nullptr) {
+        size_t acc_bytes = (size_t) n_head * SPLIT_K_P * head_dim * sizeof(float);
+        size_t ml_bytes = (size_t) n_head * SPLIT_K_P * sizeof(float);
+        cudaMalloc(&s_splitk_buffers[dev].part_acc, acc_bytes);
+        cudaMalloc(&s_splitk_buffers[dev].part_m, ml_bytes);
+        cudaMalloc(&s_splitk_buffers[dev].part_l, ml_bytes);
+    }
+    return s_splitk_buffers[dev];
+}
+
 // ================= 7. qsa_gate_apply =================
 
 __global__ void qsa_gate_apply_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
@@ -656,16 +804,42 @@ void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_
 
 void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* v_scratch,
                      const int32_t* step, int64_t max_ids, const QsaShapes& s, float* attn, float* weights,
-                     void* stream) {
+                     void* stream, float* scratch) {
     validate(s, "qsa_attend");
     if (step == nullptr) fail("qsa_attend: step is null");
     if (max_ids <= 0) fail("qsa_attend: max_ids must be positive");
-    // THE SHARED SIZE IS THE CAPACITY.  Shared memory is part of the LAUNCH CONFIGURATION, so sizing it from
-    // this token's `n_ids` bakes the sequence length in: a captured layer would allocate room for token 1 and
-    // then index past it at token 500.  The kernel reads the real count from `step`, so a larger allocation is
-    // exactly what it wants.  The opt-in therefore happens once, for the capacity.
+
+    if (weights == nullptr && max_ids >= 1024) {
+        float* p_acc = nullptr;
+        float* p_m = nullptr;
+        float* p_l = nullptr;
+        if (scratch != nullptr) {
+            p_acc = scratch;
+            p_m = scratch + (size_t) s.n_head * SPLIT_K_P * s.head_dim;
+            p_l = p_m + (size_t) s.n_head * SPLIT_K_P;
+        } else {
+            int cur_dev = 0;
+            cudaGetDevice(&cur_dev);
+            SplitKBuffers b = get_splitk_buffers(cur_dev, (int) s.n_head, (int) s.head_dim);
+            p_acc = b.part_acc;
+            p_m = b.part_m;
+            p_l = b.part_l;
+        }
+        const size_t part_capacity = (size_t) ((max_ids + SPLIT_K_P - 1) / SPLIT_K_P);
+        const size_t smem = (part_capacity + 32) * sizeof(float);
+        const dim3 grid((unsigned) SPLIT_K_P, (unsigned) s.n_head);
+        qsa_attend_splitk_kernel<<<grid, (unsigned) s.head_dim, smem, (cudaStream_t) stream>>>(
+            q, k_scratch, v_scratch, step, (int) s.n_head, (int) s.n_head_kv, (int) s.head_dim,
+            p_acc, p_m, p_l);
+        check_launch("qsa_attend_splitk");
+        qsa_attend_splitk_reduce_kernel<<<(unsigned) s.n_head, (unsigned) s.head_dim, 0, (cudaStream_t) stream>>>(
+            p_acc, p_m, p_l, (int) s.n_head, (int) s.head_dim, attn);
+        check_launch("qsa_attend_splitk_reduce");
+        if (stream == nullptr) check_sync("qsa_attend_splitk");
+        return;
+    }
+
     const size_t smem = (size_t) (max_ids + 32) * sizeof(float);
-    // per DEVICE: the opt-in is a device setting (a layer split runs this on two cards)
     static size_t s_configured_dev[64] = {};
     int cur_dev = 0;
     cudaGetDevice(&cur_dev);

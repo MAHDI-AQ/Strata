@@ -82,12 +82,14 @@ The table below exhaustively details every external architectural innovation, ke
   - **Static Graph Re-binding:** vLLM established that dynamic sequence variations can be accommodated within static CUDA graphs by updating device pointer indirections rather than incurring graph re-capture penalties.
   - **Chunked Prefill & Decode Piggybacking:** Piggybacking latency-sensitive decode operations on chunked prefill forward passes to ensure uniform token delivery times.
 
-### 4.3. FlashInfer & TensorRT-LLM (UW / NVIDIA)
-- **Repository:** [`flashinfer-ai/flashinfer`](https://github.com/flashinfer-ai/flashinfer)
-- **Key Researchers:** Zihao Ye, Ruihang Lai, Lianmin Zheng, Yineng Zhang, Joseph E. Gonzalez, Arvind Krishnamurthy (University of Washington / UC Berkeley).
+### 4.3. FlashInfer, FlashAttention-2 & TensorRT-LLM (UW / Tri Dao / NVIDIA)
+- **Repositories & Citations:**
+  - [`flashinfer-ai/flashinfer`](https://github.com/flashinfer-ai/flashinfer) — Zihao Ye, Ruihang Lai, Lianmin Zheng, Yineng Zhang, Joseph E. Gonzalez, Arvind Krishnamurthy (UW / UC Berkeley).
+  - *FlashAttention-2:* Tri Dao — *"FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning"* (ICLR 2024, arXiv:2307.08691).
 - **Core Insights Adapted:**
+  - **Split-K Flash-Decoding:** When context depth reaches $N \ge 1024$, serial per-head attention starves SMs (24 blocks on Ada 128-SM silicon). Strata AGX partitions the sequence dimension across $P = 8$ threadblocks per query head ($24 \times 8 = 192$ blocks in `src/kernels/cuda/qsa.cu`) and performs online softmax reduction (FlashAttention-2 online rescaling: $\tilde{m} = \max(m_1, m_2), \tilde{O} = O_1 e^{m_1 - \tilde{m}} + O_2 e^{m_2 - \tilde{m}}$), saturating SMs and minimizing latency at 262K contexts.
   - **Warp-Cooperative Reduction:** FlashInfer pioneered high-throughput warp-level reductions for MoE gating and sparse attention. Strata implements this in `router_top10.cu`, utilizing warp shuffle instructions (`__shfl_xor_sync`) to reduce 512-expert routing latency from 20.97 μs to 3.54 μs (5.93x speedup).
-  - **Fused GEMM Epilogues:** Executing normalization (RMSNorm) and dequantization directly inside Shared Memory (SRAM) and register tiles, eliminating high-bandwidth memory (HBM) round-trips.
+  - **Fused GDN Vector Recurrence & Direct Q8_0 Epilogue:** In `src/kernels/cuda/fused_gdn.cu`, replacing scalar state access with 128-bit `float4` vector memory transactions (32 transactions per row) and evaluating inline symmetric quantization ($d = \max(|x|) / 127$) to directly emit `b.y_q8_0` alongside `b.y`, eliminating 36 `quantize_q8_0` kernel launches and 1.77 MB redundant VRAM roundtrips per single decode step.
 
 ### 4.4. EAGLE-1/2, Sequoia & DeepSeek-AI (Speculative Acceleration)
 - **Research Citations:**
