@@ -7,6 +7,8 @@
 //   - EAGLE-2: Dynamic entropy-gated speculative depth calibration and decay (Li et al., Peking University, arXiv:2406.16858)
 //
 #include "strata/program/concurrent_serve.hpp"
+#include "strata/core/nanobatch.hpp"
+#include "strata/core/triple_buffer_ipc.hpp"
 #include "strata/program/batch_schedule.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_head.hpp"
@@ -218,7 +220,7 @@ struct ConcurrentServe::Impl {
     // C4: one hand-off buffer per stage boundary (n_stages - 1), mapped pinned and portable: the stages on
     // either side read it from different devices.  All of a stage's slot verifiers and batch coordinators
     // point at the same buffer (C2's packed row0/phase-5 hand-off writes consume it there).
-    struct Boundary { float* host[2] = {}; float* dev[2] = {}; };   // lane overlap: parity A/B
+    struct Boundary { float* host[3] = {}; float* dev[3] = {}; };   // Task 8.2: TripleBufferIPC 3-slot circular ring
     std::vector<Boundary> hand;
     // Lane prefill: the chunk pump.  One thread owns every Prefill::run call; the loop thread keeps running
     // decode rounds while a chunk is in flight (different streams, disjoint slot state).  `pump_paused`
@@ -275,7 +277,7 @@ struct ConcurrentServe::Impl {
             if (rt.prompt_stream) cudaStreamDestroy(rt.prompt_stream);
             if (rt.prompt_workspace) cudaFree(rt.prompt_workspace);
         }
-        for (auto& h : hand) for (int p = 0; p < 2; ++p)   // C4 + lane overlap: the per-boundary mapped hand-off buffers
+        for (auto& h : hand) for (int p = 0; p < 3; ++p)   // Task 8.2: 3-slot mapped hand-off buffers
             if (h.host[p]) cudaFreeHost(h.host[p]);
     }
 };
@@ -393,7 +395,7 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
         // verifier's captures are keyed by the parity too (verify.hpp set_stage_pingpong).
         m.hand.push_back(Impl::Boundary{});
         auto& boundary = m.hand.back();
-        for (int p = 0; p < 2; ++p) {
+        for (int p = 0; p < 3; ++p) {
             float* host = nullptr;
             if (cudaHostAlloc((void**) &host, hand_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
                 err = "concurrency: the layer-split hand-off allocation failed";
@@ -472,9 +474,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         auto& b = batch[st];
         b.set_batch_cache(c.graph_cache, 128);
         b.set_batch_parallel(c.parallel_batch);
-        b.set_stage_pingpong(sg.lb, last ? -1 : sg.le,
-                             st == 0 ? nullptr : m.hand[st - 1].dev[0], last ? nullptr : m.hand[st].dev[0],
-                             st == 0 ? nullptr : m.hand[st - 1].dev[1], last ? nullptr : m.hand[st].dev[1]);
+        b.set_stage_ring(sg.lb, last ? -1 : sg.le,
+                         st == 0 ? nullptr : m.hand[st - 1].dev[0], last ? nullptr : m.hand[st].dev[0],
+                         st == 0 ? nullptr : m.hand[st - 1].dev[1], last ? nullptr : m.hand[st].dev[1],
+                         st == 0 ? nullptr : m.hand[st - 1].dev[2], last ? nullptr : m.hand[st].dev[2]);
         if (!b.init(*sg.wt, g, *m.slots[0]->stages[st].state, sg.hits, sg.head, std::max(2, c.rows), err, true)) return 1;
         b.set_pcie_mode(2); // Match the stock Windows-safe kernel-copy path.
         if (!last) b.set_next(&batch[st + 1], user);
@@ -489,11 +492,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             const auto& sg = m.stages[st];
             const core::OnDevice on(sg.device);
             const bool last = st + 1 == m.stages.size();
-            s.stages[st].verify.set_stage_pingpong(sg.lb, last ? -1 : sg.le,   // set_stage BEFORE init
-                                                   st == 0 ? nullptr : m.hand[st - 1].dev[0],
-                                                   last ? nullptr : m.hand[st].dev[0],
-                                                   st == 0 ? nullptr : m.hand[st - 1].dev[1],
-                                                   last ? nullptr : m.hand[st].dev[1]);
+            s.stages[st].verify.set_stage_ring(sg.lb, last ? -1 : sg.le,   // set_stage BEFORE init
+                                               st == 0 ? nullptr : m.hand[st - 1].dev[0],
+                                               last ? nullptr : m.hand[st].dev[0],
+                                               st == 0 ? nullptr : m.hand[st - 1].dev[1],
+                                               last ? nullptr : m.hand[st].dev[1],
+                                               st == 0 ? nullptr : m.hand[st - 1].dev[2],
+                                               last ? nullptr : m.hand[st].dev[2]);
             if (!s.stages[st].verify.init(*sg.wt, g, *s.stages[st].state, sg.hits, sg.head, c.window, err)) return 1;
             s.stages[st].verify.set_pcie_mode(2);
             if (!last) s.stages[st].verify.set_next(&s.stages[st + 1].verify, user);   // user = &split_drive
@@ -1024,19 +1029,19 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // current, so the guards are no-ops and the call sequence is unchanged.
     const int overlap_dev0 = m.stages.empty() ? -1 : m.stages[0].device;
     const int overlap_dev1 = m.stages.size() > 1 ? m.stages[1].device : overlap_dev0;
-    cudaEvent_t ev0[2] = {}, ev1[2] = {};
-    bool ev1_valid[2] = {false, false};
+    cudaEvent_t ev0[3] = {}, ev1[3] = {};
+    bool ev1_valid[3] = {false, false, false};
     struct OverlapEventsGuard {   // every exit path of run() destroys them, each on its own device
         cudaEvent_t* ev0; cudaEvent_t* ev1; int dev0; int dev1;
         ~OverlapEventsGuard() {
-            for (int q = 0; q < 2; ++q) {
+            for (int q = 0; q < 3; ++q) {
                 if (ev0[q]) { const core::OnDevice on(dev0); cudaEventDestroy(ev0[q]); }
                 if (ev1[q]) { const core::OnDevice on(dev1); cudaEventDestroy(ev1[q]); }
             }
         }
     } overlap_events_guard{ev0, ev1, overlap_dev0, overlap_dev1};
     if (overlap) {
-        for (int q = 0; q < 2; ++q) {
+        for (int q = 0; q < 3; ++q) {
             bool made = false;
             { const core::OnDevice on(overlap_dev0); made = cudaEventCreateWithFlags(&ev0[q], cudaEventDisableTiming) == cudaSuccess; }
             if (made) { const core::OnDevice on(overlap_dev1); made = cudaEventCreateWithFlags(&ev1[q], cudaEventDisableTiming) == cudaSuccess; }
@@ -1046,7 +1051,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
         }
         std::fprintf(stderr, "strata-agx concurrent: stage overlap on: stage0[N+1] runs with stage1[N] "
-                             "(ping-pong hand-off, per-parity captures)\n");
+                             "(3-slot TripleBufferIPC ring hand-off, per-slot captures)\n");
     }
 
     // N1 (C2 acceptance kit, env-gated, default off): the stale-sink negative control.  Point a
@@ -1313,11 +1318,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             const auto& sg = m.stages[st];
             const core::OnDevice on(sg.device);
             const bool last = st + 1 == m.stages.size();
-            s.stages[st].verify.set_stage_pingpong(sg.lb, last ? -1 : sg.le,
-                                                   st == 0 ? nullptr : m.hand[st - 1].dev[0],
-                                                   last ? nullptr : m.hand[st].dev[0],
-                                                   st == 0 ? nullptr : m.hand[st - 1].dev[1],
-                                                   last ? nullptr : m.hand[st].dev[1]);
+            s.stages[st].verify.set_stage_ring(sg.lb, last ? -1 : sg.le,
+                                               st == 0 ? nullptr : m.hand[st - 1].dev[0],
+                                               last ? nullptr : m.hand[st].dev[0],
+                                               st == 0 ? nullptr : m.hand[st - 1].dev[1],
+                                               last ? nullptr : m.hand[st].dev[1],
+                                               st == 0 ? nullptr : m.hand[st - 1].dev[2],
+                                               last ? nullptr : m.hand[st].dev[2]);
             if (!s.stages[st].verify.init(*sg.wt, g, *s.stages[st].state, sg.hits, sg.head, c.window, err)) return false;
             s.stages[st].verify.set_pcie_mode(2);
             if (!last) s.stages[st].verify.set_next(&s.stages[st + 1].verify, user);
@@ -1719,8 +1726,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // When overlap is enabled and nothing is currently in flight (!prev.valid),
         // partition the eligible slots into two micro-batches so that Unit A and Unit B
         // can ping-pong across Stage 0 (GPU 1) and Stage 1 (GPU 0) concurrently.
+        // Task 8.1: Overlapped Nanobatch Partitioning (K in [2..4])
         size_t max_unit_slots = m.slots.size();
         static bool alt_unit = false;
+        const int nanobatch_k = (c.nanobatch >= 2 && c.nanobatch <= 4) ? c.nanobatch : [] {
+            const char* nb = std::getenv("STRATA_NANOBATCH");
+            return nb != nullptr ? std::clamp(std::atoi(nb), 2, 4) : 2;
+        }();
+        core::NanobatchScheduler nanobatch_sched(nanobatch_k);
         if (overlap && !prev.valid) {
             size_t eligible = 0;
             for (size_t j = 0; j < m.slots.size(); ++j) {
@@ -1729,7 +1742,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     s.position.load() < s.max_context && s.generated < s.request.max_new)
                     ++eligible;
             }
-            if (eligible >= 2) {
+            if (eligible >= (size_t) nanobatch_k) {
+                max_unit_slots = (eligible + nanobatch_k - 1) / nanobatch_k;
+            } else if (eligible >= 2) {
                 if (eligible % 2 != 0) {
                     max_unit_slots = alt_unit ? (eligible / 2) : ((eligible + 1) / 2);
                     alt_unit = !alt_unit;
@@ -1986,7 +2001,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 // LANE hostloop: the previous unit's epilogue runs now - while u's stage-1 pass is in
                 // flight and the next stage-0 is being built - instead of idling both devices.
                 if (ret.valid && !retire_unit(ret)) return 1;
-                unit_parity ^= 1;
+                unit_parity = (unit_parity + 1) % 3;
                 ++rounds;
                 core::progress_beat();
                 if (adaptive && rounds % c.adapt_every == 0) {

@@ -12,6 +12,7 @@ struct ConcurrentConfig {
     int graph_cache = 8;
     bool pad_batch = false;
     bool parallel_batch = false;
+    int nanobatch = 0;   // Task 8.1: fine-grained micro-partitioning K in [2..4]
     bool depth = false;
     int64_t context = 32768, draft_context = 32768;
     int reserve_mib = 1536, suffix = 0;

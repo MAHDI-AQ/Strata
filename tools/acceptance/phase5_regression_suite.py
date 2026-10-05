@@ -75,6 +75,11 @@ def run_stage1_kernel_parity():
             "name": "Lockless CRC32C RadixTree Prefix Cache (radix_tree_test)",
             "bin": os.path.join(BUILD_DIR, "radix_tree_test"),
             "must_contain": ["All RadixTree & HiCache L2 unit tests passed successfully!"]
+        },
+        {
+            "name": "Nanobatch & TripleBufferIPC Pipeline (nanobatch_test)",
+            "bin": os.path.join(BUILD_DIR, "nanobatch_test"),
+            "must_contain": ["All Phase 8 Nanobatch & TripleBufferIPC unit tests passed successfully!"]
         }
     ]
     

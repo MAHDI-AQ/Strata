@@ -108,4 +108,14 @@ void spec_tree_verify_dp(const int32_t* tree_tokens,
                          int T,
                          void* stream);
 
+/// Task 8.3: Hardware-Level Event Orchestration & Timeline Barriers
+/// Signals a 64-bit timeline counter in device/mapped memory from a stream.
+void gpu_timeline_signal(uint64_t* timeline, uint64_t val, void* stream);
+
+/// Non-blocking device-side wait: kernel waits until timeline >= val.
+void gpu_timeline_wait_ge(const uint64_t* timeline, uint64_t val, void* stream);
+
+/// Atomic device-side stamp for stage flag coordination.
+void gpu_stamp(uint32_t* flag, uint32_t val, void* stream);
+
 }  // namespace strata::kernels

@@ -716,6 +716,31 @@ __global__ void spec_tree_verify_dp_kernel(
         *n_accepted = count;
     }
 }
+__global__ void gpu_timeline_signal_kernel(uint64_t* timeline, uint64_t val) {
+    if (threadIdx.x == 0 && timeline != nullptr) {
+        __threadfence_system();
+        atomicMax((unsigned long long*) timeline, (unsigned long long) val);
+        __threadfence_system();
+    }
+}
+
+__global__ void gpu_timeline_wait_ge_kernel(const volatile uint64_t* timeline, uint64_t val) {
+    if (threadIdx.x == 0 && timeline != nullptr) {
+        while (*timeline < val) {
+            __nanosleep(50);
+        }
+        __threadfence_system();
+    }
+}
+
+__global__ void gpu_stamp_kernel(uint32_t* flag, uint32_t val) {
+    if (threadIdx.x == 0 && flag != nullptr) {
+        __threadfence_system();
+        atomicExch((unsigned int*) flag, (unsigned int) val);
+        __threadfence_system();
+    }
+}
+
 }  // namespace
 
 void spec_tree_verify_dp(const int32_t* tree_tokens,
@@ -731,6 +756,24 @@ void spec_tree_verify_dp(const int32_t* tree_tokens,
     spec_tree_verify_dp_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(
         tree_tokens, target_tokens, parents, log_probs, best_path_indices, n_accepted, actual_t);
     check("spec_tree_verify_dp");
+}
+
+void gpu_timeline_signal(uint64_t* timeline, uint64_t val, void* stream) {
+    if (!timeline) return;
+    gpu_timeline_signal_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(timeline, val);
+    check("gpu_timeline_signal");
+}
+
+void gpu_timeline_wait_ge(const uint64_t* timeline, uint64_t val, void* stream) {
+    if (!timeline) return;
+    gpu_timeline_wait_ge_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(timeline, val);
+    check("gpu_timeline_wait_ge");
+}
+
+void gpu_stamp(uint32_t* flag, uint32_t val, void* stream) {
+    if (!flag) return;
+    gpu_stamp_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(flag, val);
+    check("gpu_stamp");
 }
 
 }  // namespace strata::kernels

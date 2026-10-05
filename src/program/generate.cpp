@@ -350,6 +350,7 @@ struct Options {
     int batch_graphs = 8;
     int batch_padding = 0;
     int batch_parallel = 0;
+    int nanobatch = 0;
     std::string batch_policy = "fair";
     int aux_slots = 0;
     int64_t aux_context = 0;
@@ -1100,6 +1101,7 @@ int main(int argc, char** argv) {
         else if (a == "--batch-graphs") o.batch_graphs = std::atoi(next("--batch-graphs"));
         else if (a == "--batch-padding") o.batch_padding = std::atoi(next("--batch-padding"));
         else if (a == "--batch-parallel") o.batch_parallel = std::atoi(next("--batch-parallel"));
+        else if (a == "--nanobatch") o.nanobatch = std::atoi(next("--nanobatch"));
         else if (a == "--batch-policy") o.batch_policy = next("--batch-policy");
         else if (a == "--concurrent-prefill") o.concurrent_prefill = std::atoi(next("--concurrent-prefill"));
         else if (a == "--prefill") {
@@ -1239,6 +1241,7 @@ int main(int argc, char** argv) {
         o.batch_graphs < 1 || o.batch_graphs > 64 ||
         o.batch_padding < 0 || o.batch_padding > 1 ||
         o.batch_parallel < 0 || o.batch_parallel > 1 ||
+        o.nanobatch < 0 || o.nanobatch > 4 ||
         (o.batch_policy != "fair" && o.batch_policy != "depth") || o.concurrent_prefill < 256 || o.concurrent_prefill > 4096) {
         std::fprintf(stderr, "strata: --concurrency 1..16, --batch-rows 1..48, --batch-graphs 1..64, --batch-padding 0|1, --batch-parallel 0|1, --batch-policy fair|depth, --concurrent-prefill 256..4096\n");
         return 2;
@@ -2474,6 +2477,8 @@ int main(int argc, char** argv) {
         config.graph_cache = o.batch_graphs;
         config.pad_batch = o.batch_padding != 0;
         config.parallel_batch = o.batch_parallel != 0;
+        config.nanobatch = o.nanobatch;
+        if (const char* nb_env = std::getenv("STRATA_NANOBATCH")) config.nanobatch = std::clamp(std::atoi(nb_env), 2, 4);
         config.window = o.spec; config.mtp_window_rows = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         config.prefill_chunk = o.concurrent_prefill; config.context = o.max_context; config.draft_context = o.mtp_window;
         config.reserve_mib = o.vram_reserve_mib; config.mtp_dir = o.mtp; config.spec_min_p = (float) o.spec_min_p;

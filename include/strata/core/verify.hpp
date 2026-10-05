@@ -168,10 +168,22 @@ public:
         lb_ = layer_begin; le_ = layer_end;
         hand_in_pairs_[0] = in_a; hand_out_pairs_[0] = out_a;
         hand_in_pairs_[1] = in_b; hand_out_pairs_[1] = out_b;
+        hand_in_pairs_[2] = in_a; hand_out_pairs_[2] = out_a;
         hand_in_ = in_a; hand_out_ = out_a; parity_ = 0;
     }
+    /// Task 8.2: Triple-Buffered Circular Transfer Arena (TripleBufferIPC)
+    void set_stage_ring(int64_t layer_begin, int64_t layer_end,
+                        const float* in_0, float* out_0,
+                        const float* in_1, float* out_1,
+                        const float* in_2, float* out_2) {
+        lb_ = layer_begin; le_ = layer_end;
+        hand_in_pairs_[0] = in_0; hand_out_pairs_[0] = out_0;
+        hand_in_pairs_[1] = in_1; hand_out_pairs_[1] = out_1;
+        hand_in_pairs_[2] = in_2; hand_out_pairs_[2] = out_2;
+        hand_in_ = in_0; hand_out_ = out_0; parity_ = 0;
+    }
     void set_hand_parity(int p) {
-        parity_ = p & 1;
+        parity_ = (p % 3 + 3) % 3;
         hand_in_ = hand_in_pairs_[parity_];
         hand_out_ = hand_out_pairs_[parity_];
     }
@@ -247,8 +259,8 @@ private:
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     const float* hand_in_ = nullptr;     ///< the ACTIVE hand-off pair (set_hand_parity selects)
     float* hand_out_ = nullptr;
-    const float* hand_in_pairs_[2] = {}; ///< the ping-pong pairs (set_stage: both the same pointers)
-    float* hand_out_pairs_[2] = {};
+    const float* hand_in_pairs_[3] = {}; ///< the ring/ping-pong pairs
+    float* hand_out_pairs_[3] = {};
     int parity_ = 0;                     ///< the active parity; the captures are keyed by it
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
@@ -290,7 +302,7 @@ private:
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t exec_[2][9] = {};   ///< [parity][T]: the hand-off pointers are baked into the capture
+    cudaGraphExec_t exec_[3][9] = {};   ///< [parity][T]: the hand-off pointers are baked into the capture
     cudaGraphExec_t commit_exec_ = nullptr;
 
     // ---- stage-pipeline overlap: the pass begun by begin_pass_* and serviced by pass_step ----
