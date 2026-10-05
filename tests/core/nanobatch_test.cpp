@@ -157,7 +157,7 @@ void test_triple_buffer_pipeline_fidelity() {
     bool ok = ipc.init(dev0, dev1, kSlotBytes, err);
     if (!ok) {
         std::fprintf(stderr, "TripleBufferIPC init failed: %s\n", err.c_str());
-        assert(false);
+        std::exit(1);
     }
 
     cudaStream_t stream0 = nullptr, stream1 = nullptr;

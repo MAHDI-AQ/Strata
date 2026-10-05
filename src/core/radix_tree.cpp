@@ -10,6 +10,7 @@
 #include "strata/kernels/kv_q8.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -743,6 +744,115 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
         }
     }
     return evicted;
+}
+
+CompactionStats RadixTree::compact_tree() {
+    std::unique_lock<std::shared_mutex> lock(rw_lock_);
+    CompactionStats stats;
+    const auto start = std::chrono::steady_clock::now();
+
+    size_t active_nodes = 0;
+    size_t vram_bytes = 0;
+    std::vector<std::shared_ptr<RadixNode>> stack = {root_};
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        ++stats.nodes_scanned;
+        if (node->ref_count > 0 || node->has_snapshot()) {
+            ++active_nodes;
+            vram_bytes += node->total_vram_bytes();
+        }
+        for (const auto& kv : node->children) {
+            if (kv.second) stack.push_back(kv.second);
+        }
+    }
+    stats.initial_fragmentation = RadixCompactor::compute_fragmentation(
+        active_nodes, node_count_ > 0 ? node_count_ : 1,
+        vram_bytes, (vram_bytes > 0 ? vram_bytes : 1) * 2);
+
+    std::function<void(std::shared_ptr<RadixNode>)> prune_dead_leaves = [&](std::shared_ptr<RadixNode> curr) {
+        if (!curr) return;
+        std::vector<int32_t> dead_keys;
+        for (auto& kv : curr->children) {
+            prune_dead_leaves(kv.second);
+            if (kv.second && kv.second->children.empty() && kv.second->ref_count == 0 && !kv.second->has_snapshot()) {
+                dead_keys.push_back(kv.first);
+            }
+        }
+        for (int32_t k : dead_keys) {
+            auto victim = curr->children[k];
+            if (victim) {
+                stats.bytes_reclaimed += victim->total_vram_bytes() + victim->total_host_bytes();
+            }
+            curr->children.erase(k);
+            if (node_count_ > 0) --node_count_;
+            ++stats.dead_leaves_pruned;
+        }
+    };
+    prune_dead_leaves(root_);
+
+    std::function<void(std::shared_ptr<RadixNode>)> compress_paths = [&](std::shared_ptr<RadixNode> curr) {
+        if (!curr) return;
+        for (auto& kv : curr->children) {
+            compress_paths(kv.second);
+        }
+        if (curr != root_ && curr->ref_count == 0 && !curr->has_snapshot() && curr->children.size() == 1) {
+            auto child = curr->children.begin()->second;
+            if (child) {
+                curr->edge_tokens.insert(curr->edge_tokens.end(), child->edge_tokens.begin(), child->edge_tokens.end());
+                curr->update_chunk_hashes();
+                curr->children = std::move(child->children);
+                for (auto& c_kv : curr->children) {
+                    if (c_kv.second) c_kv.second->parent = curr;
+                }
+                curr->stage_snapshots = std::move(child->stage_snapshots);
+                curr->stage_host_snapshots = std::move(child->stage_host_snapshots);
+                curr->is_host_parked = child->is_host_parked;
+                curr->prefix_len = child->prefix_len;
+                curr->last_accessed = std::max(curr->last_accessed, child->last_accessed);
+                if (node_count_ > 0) --node_count_;
+                ++stats.chains_merged;
+            }
+        }
+    };
+    compress_paths(root_);
+
+    const auto end = std::chrono::steady_clock::now();
+    stats.compaction_time_us = std::chrono::duration<double, std::micro>(end - start).count();
+
+    active_nodes = 0;
+    vram_bytes = 0;
+    stack = {root_};
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        if (node->ref_count > 0 || node->has_snapshot()) {
+            ++active_nodes;
+            vram_bytes += node->total_vram_bytes();
+        }
+        for (const auto& kv : node->children) {
+            if (kv.second) stack.push_back(kv.second);
+        }
+    }
+    stats.final_fragmentation = RadixCompactor::compute_fragmentation(
+        active_nodes, node_count_ > 0 ? node_count_ : 1,
+        vram_bytes, (vram_bytes > 0 ? vram_bytes : 1) * 2);
+
+    return stats;
+}
+
+CompactionStats RadixCompactor::compact(RadixTree* tree) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    RadixTree* target = tree ? tree : tree_;
+    if (!target) return {};
+    CompactionStats stats = target->compact_tree();
+    ++total_compactions_;
+    total_leaves_pruned_ += stats.dead_leaves_pruned;
+    total_chains_merged_ += stats.chains_merged;
+    total_bytes_reclaimed_ += stats.bytes_reclaimed;
+    return stats;
 }
 
 }  // namespace strata::core

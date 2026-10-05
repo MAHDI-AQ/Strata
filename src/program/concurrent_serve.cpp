@@ -5,6 +5,7 @@
 //   - vLLM: Continuous batching, PagedAttention virtual block tables, chunked prefill interleaving (Kwon et al., UC Berkeley, SOSP 2023)
 //   - NanoFlow: Overlapped nanobatch execution, asynchronous device-level DMA scheduling (DeepSeek-AI / Tsinghua, arXiv:2408.12757)
 //   - EAGLE-2: Dynamic entropy-gated speculative depth calibration and decay (Li et al., Peking University, arXiv:2406.16858)
+//   - Orca: Continuous token-level iteration scheduling & sub-15ms preemptive auxiliary insertion (OSDI 2022)
 //
 #include "strata/program/concurrent_serve.hpp"
 #include "strata/core/nanobatch.hpp"
@@ -24,6 +25,9 @@
 #include "strata/core/radix_tree.hpp"
 #include "strata/core/shm_ipc.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/core/continuous_scheduler.hpp"
+#include "strata/program/preemptive_queue.hpp"
+#include "strata/core/radix_compactor.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -723,6 +727,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     //   * fences (pump_fence/pump_resume) hold the pump at a chunk boundary around admission (session_zero
     //     runs on the same stage prompt streams), CSTOP (finish of a slot with a chunk in flight), adapt()
     //     (cache swaps) and exit.  Decode rounds need NO fence: they touch other slots' state only.
+    // Continuous preemptive scheduler and priority queue for iteration-level scheduling
+    core::ContinuousScheduler continuous_sched((int) m.slots.size(), (c.aux_slots > 0) ? 3 : -1);
+    PreemptiveQueue<Request> preemptive_queue(64);
+
     // STRATA_PREFILL_PUMP=0 keeps the pre-change inline path below for the A/B.
     auto run_chunk = [&](size_t i, std::string& chunk_err) -> bool {
         // One bounded prompt chunk for one slot: the same call and the same bookkeeping, whichever thread
@@ -746,6 +754,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // Subtask 1.2.3: Dedicated Aux micro-prefill
         if (rem <= c.prefill_chunk && (s.is_aux || rem <= 1024)) {
             dynamic_chunk = std::min<int64_t>(c.prefill_chunk, rem);
+        }
+        // Task 9.2: Sub-15ms Preemptive Auxiliary Insertion & Micro-Interleaved Wavefronts
+        const bool urgent_preempt = preemptive_queue.should_preempt((int) i);
+        if (urgent_preempt && !s.is_aux) {
+            dynamic_chunk = std::min<int64_t>(dynamic_chunk, 64);
+        } else if (s.is_aux) {
+            dynamic_chunk = std::min<int64_t>(c.prefill_chunk, 128);
         }
         const int64_t n = std::min<int64_t>(dynamic_chunk, rem);
         const auto start = Clock::now();
@@ -898,6 +913,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     core::RadixTree radix_tree(radix_slots, radix_host_slots);
     std::fprintf(stderr, "strata-agx concurrent: RadixTree HiCache L2 host-RAM parking enabled (VRAM slots: %zu, Host-RAM slots: %zu)\n",
                  radix_slots, radix_host_slots);
+    core::RadixCompactor radix_compactor(&radix_tree);
+    std::fprintf(stderr, "strata-agx concurrent: ContinuousScheduler & PreemptiveQueue enabled (slots: %zu, aux_slot: %d)\n",
+                 m.slots.size(), (c.aux_slots > 0) ? 3 : -1);
     auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens) {
         if (prefix_len < 256 || tokens.size() < (size_t) prefix_len) return;
         s.saved_prefix = prefix_len;
@@ -969,6 +987,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         live.erase(s.request.id);
         s.active.store(false);
+        int finish_slot_idx = -1;
+        for (size_t si = 0; si < m.slots.size(); ++si) {
+            if (m.slots[si].get() == &s) { finish_slot_idx = (int) si; break; }
+        }
+        if (finish_slot_idx >= 0) continuous_sched.recycle_slot(finish_slot_idx);
         // LANE sched-impl P1 (admission wake; T4 L7/L13 micro): a freed slot is re-admitted at the
         // next service_input, but the bottom idle park sleeps on input->cv (2 ms tick). Wake it when
         // queued work waits so a STOP re-admits without the tick. Wake-only: no scheduling decision
@@ -1166,7 +1189,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             source_offered[spec_src] += s.count - 1; source_accepted[spec_src] += keep - 1;
             for (int t = 1; t < s.count; ++t) ++pos_offered[std::min(t, 8)];
             for (int t = 1; t < keep; ++t) ++pos_accepted[std::min(t, 8)];
+            int retire_slot_idx = -1;
+            for (size_t si = 0; si < m.slots.size(); ++si) {
+                if (m.slots[si].get() == &s) { retire_slot_idx = (int) si; break; }
+            }
             for (int t = 0; t < keep; ++t) {
+                if (retire_slot_idx >= 0) continuous_sched.step_token(retire_slot_idx, s.output[t], (t == keep - 1 && p.eos));
                 s.consumed.push_back(s.window[t]); s.suffix.append(s.output[t]); ++s.generated;
                 if (ipc::ShmProducer::instance()->is_active()) {
                     ipc::ShmProducer::instance()->write_token(s.request.id, s.output[t]);
@@ -1443,6 +1471,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         s.draft->set_prompt_len((int64_t) s.request.tokens.size());
         s.stages[0].verify.set_sampling(s.request.sampling);
+        int admit_slot_idx = -1;
+        for (size_t si = 0; si < m.slots.size(); ++si) {
+            if (m.slots[si].get() == &s) { admit_slot_idx = (int) si; break; }
+        }
+        if (admit_slot_idx >= 0) {
+            continuous_sched.allocate_slot(s.request.id, (int64_t) s.request.tokens.size(), s.request.max_new, s.max_context, s.is_aux);
+        }
         return true;
     };
     // The input side: commands, admission and ONE bounded prompt chunk.  In the overlapped loop it
@@ -1481,6 +1516,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (live.count(request.id)) { error(request.id, "duplicate request id"); continue; }
             if (pending.size() >= 32) { error(request.id, "request queue is full"); continue; }
             live.insert(request.id);
+            const bool req_is_aux = (c.aux_context > 0 && (int64_t) request.tokens.size() < c.aux_context);
+            preemptive_queue.push(request, req_is_aux ? PriorityLevel::URGENT_AUX : PriorityLevel::NORMAL);
             pending.push_back(std::move(request));
         }
 
@@ -1894,7 +1931,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 if (!adapted) return 1;
             }
 
-                if (rounds % 64 == 0) report_profile();
+                if (rounds % 64 == 0) {
+                    report_profile();
+                    auto cstats = radix_compactor.compact(&radix_tree);
+                    if (cstats.dead_leaves_pruned > 0 || cstats.chains_merged > 0) {
+                        std::fprintf(stderr, "strata-agx concurrent: RadixCompactor defragmented KV tree (pruned %zu leaves, merged %zu chains, reclaimed %zu bytes in %.1f us)\n",
+                                     cstats.dead_leaves_pruned, cstats.chains_merged, cstats.bytes_reclaimed, cstats.compaction_time_us);
+                    }
+                }
             } else {
                 // Unit U_i: launch its stage-0 pass on this unit's parity, drive it together with the
                 // PREVIOUS unit's stage-1 pass (which still reads the other parity), then close both

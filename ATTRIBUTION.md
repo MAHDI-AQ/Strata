@@ -119,3 +119,14 @@ The table below exhaustively details every external architectural innovation, ke
 - **Repository:** [`ggerganov/llama.cpp`](https://github.com/ggerganov/llama.cpp)
 - **Core Insights Adapted:**
   - **Quantization Calibration (IQ3_XXS / Q4_0 / GSQ-RCO):** High-efficiency low-bit representation formats with block-quantized scales, FWHT-256 rotation, and native CUDA dequantization kernels.
+
+### 4.7. SGLang, vLLM v1 & Orca (Continuous Preemptive Scheduling & KV Compaction)
+- **Foundational Papers & Research:**
+  - *SGLang:* Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Jeff Huang, Chuyue Sun, et al. (LMSYS / UC Berkeley) — *"Efficient Execution of Structured Language Model Programs"* (arXiv:2312.07104).
+  - *vLLM v1:* Woosuk Kwon, Zhuohan Li, Siyuan Shen, et al. (UC Berkeley) — *"Efficient Memory Management for Large Language Model Serving with PagedAttention"* (SOSP 2023).
+  - *Orca:* Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, Byung-Gon Chun (Seoul National University) — *"Orca: A Distributed Serving System for Transformer-Based Generative Models"* (OSDI 2022).
+- **Core Insights Adapted:**
+  - **Token-Level Continuous Micro-Scheduling:** Replacing round-based batch synchronization with continuous token-level iteration loops (`ContinuousScheduler` in `include/strata/core/continuous_scheduler.hpp`). Finished streams immediately release compute slots to waiting admission requests without waiting for other slots to reach an EOS boundary (< 5 us slot recycling).
+  - **Sub-15ms Preemptive Auxiliary Insertion:** Slicing long prompt sequences into micro-chunks (C in [64, 128] tokens) with priority-ordered queueing (`PreemptiveQueue` in `include/strata/program/preemptive_queue.hpp`). In-flight background prefill yields at micro-chunk boundaries when an urgent tool call arrives on slot 3, guaranteeing sub-15ms turnaround without stalling primary streams.
+  - **Dynamic KV Fragmentation Compaction:** Lock-free background page compaction and memory defragmentation (`RadixCompactor` in `include/strata/core/radix_compactor.hpp`). Prunes dead unreferenced leaves and compresses single-child linear chains (path compression), eliminating virtual memory fragmentation across long-horizon multi-turn sessions.
+

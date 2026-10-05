@@ -80,6 +80,11 @@ def run_stage1_kernel_parity():
             "name": "Nanobatch & TripleBufferIPC Pipeline (nanobatch_test)",
             "bin": os.path.join(BUILD_DIR, "nanobatch_test"),
             "must_contain": ["All Phase 8 Nanobatch & TripleBufferIPC unit tests passed successfully!"]
+        },
+        {
+            "name": "Continuous Preemptive Scheduling & KV Compaction (continuous_sched_test)",
+            "bin": os.path.join(BUILD_DIR, "continuous_sched_test"),
+            "must_contain": ["All Phase 9 Continuous Preemptive Scheduling & KV Compaction unit tests passed successfully!"]
         }
     ]
     

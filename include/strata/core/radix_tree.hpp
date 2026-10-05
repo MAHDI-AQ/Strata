@@ -13,6 +13,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/radix_compactor.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -267,6 +268,9 @@ public:
 
     size_t evict_lru(size_t max_snapshots, size_t min_free_vram_mib = 0);
     size_t evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mib = 0);
+
+    /// Dynamic KV Fragmentation Compaction (Task 9.3)
+    CompactionStats compact_tree();
 
     size_t cached_snapshot_count() const { return cached_snapshots_; }
     size_t cached_host_snapshot_count() const { return cached_host_snapshots_; }
