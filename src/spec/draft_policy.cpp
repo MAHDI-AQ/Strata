@@ -2,6 +2,7 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace strata::spec {
 namespace {
@@ -52,6 +53,17 @@ double DraftPolicy::mtp_tokens(int t) const {
     return 1.0 + 0.7 * (t - 1);       // before any MTP window of this size: a typical acceptance
 }
 
+int DraftPolicy::decide_depth(float first_prob, int base_t, float spec_min_p) const {
+    ConfidenceMetrics cm;
+    cm.top1_prob = std::max(0.0f, std::min(1.0f, first_prob));
+    cm.logit_margin = (cm.top1_prob > 0.5f) ? (cm.top1_prob - (1.0f - cm.top1_prob)) * 5.0f : 0.0f;
+    cm.entropy = (cm.top1_prob > 0.01f && cm.top1_prob < 0.99f)
+        ? -(cm.top1_prob * std::log(cm.top1_prob) + (1.0f - cm.top1_prob) * std::log(1.0f - cm.top1_prob))
+        : 0.1f;
+    auto d = gater_.decide(cm, base_t, spec_min_p);
+    return d.recommended_t;
+}
+
 DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const {
     Pick p;
     p.t = std::clamp(t_mtp, 1, max_t_);
@@ -86,6 +98,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
+    gater_.observe(t - 1, accepted);
     if (round_ms > 0) {
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;

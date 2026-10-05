@@ -1737,8 +1737,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (s.position.load() >= s.max_context) { finish(s, "length"); continue; }
             int n = s.first ? 1 : c.mtp_window_rows;
             if (!s.first && s.request.spec_min_p > 0) {
+                const float p0 = s.probability[0];
+                const int dyn_depth = s.policy.decide_depth(p0, c.mtp_window_rows, s.request.spec_min_p);
                 n = 1;
-                while (n < c.mtp_window_rows && s.probability[n - 1] >= s.request.spec_min_p) ++n;
+                while (n < dyn_depth && s.probability[n - 1] >= s.request.spec_min_p) ++n;
             }
             s.lookup = false; s.match = 0;
             if (!s.first && c.suffix > 0) {

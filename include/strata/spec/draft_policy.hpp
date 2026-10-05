@@ -15,6 +15,7 @@
 // to the machine and the context length. It only chooses which drafts to verify: the output is unchanged.
 #pragma once
 
+#include "strata/spec/tree_spec.hpp"
 #include <array>
 
 namespace strata::spec {
@@ -38,12 +39,18 @@ public:
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
 
+    /// Task 3.3 Dynamic Confidence Gater & Entropy Throttling
+    int decide_depth(float first_prob, int base_t, float spec_min_p) const;
+    ConfidenceGater& confidence_gater() { return gater_; }
+    const ConfidenceGater& confidence_gater() const { return gater_; }
+
 private:
     static int bucket(int match);
     double mtp_tokens(int t) const;
 
     int max_t_;
     double margin_;
+    ConfidenceGater gater_{2.0f, 0.6f, 1.5f};
     std::array<double, kMaxT + 1> cost_{}, cost_n_{};      // round ms by window size
     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
