@@ -65,6 +65,7 @@ inline uint64_t compute_token_chunk_hash(const int64_t* tokens, size_t count) {
 struct PinnedBuffer {
     void* ptr_ = nullptr;
     size_t size_ = 0;
+    bool is_fallback_ = false;
 
     PinnedBuffer() = default;
     explicit PinnedBuffer(size_t bytes) { allocate(bytes); }
@@ -74,28 +75,47 @@ struct PinnedBuffer {
         if (bytes == size_ && ptr_) return;
         free();
         if (bytes > 0) {
-            cudaHostAlloc(&ptr_, bytes, cudaHostAllocPortable);
-            size_ = bytes;
+            cudaError_t err = cudaHostAlloc(&ptr_, bytes, cudaHostAllocPortable);
+            if (err == cudaSuccess && ptr_) {
+                size_ = bytes;
+                is_fallback_ = false;
+            } else {
+                int rc = posix_memalign(&ptr_, 4096, bytes);
+                if (rc == 0 && ptr_) {
+                    size_ = bytes;
+                    is_fallback_ = true;
+                } else {
+                    ptr_ = nullptr;
+                    size_ = 0;
+                    is_fallback_ = false;
+                }
+            }
         }
     }
     void resize(size_t bytes) { allocate(bytes); }
     void free() {
         if (ptr_) {
-            cudaFreeHost(ptr_);
+            if (is_fallback_) {
+                std::free(ptr_);
+            } else {
+                cudaFreeHost(ptr_);
+            }
             ptr_ = nullptr;
             size_ = 0;
+            is_fallback_ = false;
         }
     }
     PinnedBuffer(const PinnedBuffer&) = delete;
     PinnedBuffer& operator=(const PinnedBuffer&) = delete;
-    PinnedBuffer(PinnedBuffer&& o) noexcept : ptr_(o.ptr_), size_(o.size_) {
-        o.ptr_ = nullptr; o.size_ = 0;
+    PinnedBuffer(PinnedBuffer&& o) noexcept
+        : ptr_(o.ptr_), size_(o.size_), is_fallback_(o.is_fallback_) {
+        o.ptr_ = nullptr; o.size_ = 0; o.is_fallback_ = false;
     }
     PinnedBuffer& operator=(PinnedBuffer&& o) noexcept {
         if (this != &o) {
             free();
-            ptr_ = o.ptr_; size_ = o.size_;
-            o.ptr_ = nullptr; o.size_ = 0;
+            ptr_ = o.ptr_; size_ = o.size_; is_fallback_ = o.is_fallback_;
+            o.ptr_ = nullptr; o.size_ = 0; o.is_fallback_ = false;
         }
         return *this;
     }
@@ -186,6 +206,8 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
     std::vector<RadixStageSnapshot> stage_snapshots;
     std::vector<RadixStageHostSnapshot> stage_host_snapshots;
     bool is_host_parked = false;
+    bool is_l3_offloaded = false;
+    size_t l3_bytes = 0;
 
     void update_chunk_hashes() {
         edge_chunk_hashes.clear();
@@ -205,15 +227,23 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
         return is_host_parked && !stage_host_snapshots.empty();
     }
 
+    bool has_l3_snapshot() const {
+        return is_l3_offloaded;
+    }
+
     bool has_snapshot() const {
-        return has_device_snapshot() || has_host_snapshot();
+        return has_device_snapshot() || has_host_snapshot() || has_l3_snapshot();
     }
 
     size_t total_vram_bytes() const;
     size_t total_host_bytes() const;
+    size_t total_l3_bytes() const { return l3_bytes; }
     void park_to_host();
+    bool offload_to_nvme(class NVMeStorageTier& nvme);
+    bool hydrate_from_nvme(class NVMeStorageTier& nvme);
     void free_device();
     void free_host();
+    void free_nvme(class NVMeStorageTier& nvme);
     ~RadixNode();
 };
 
@@ -272,17 +302,23 @@ public:
     /// Dynamic KV Fragmentation Compaction (Task 9.3)
     CompactionStats compact_tree();
 
+    void set_nvme_tier(std::shared_ptr<class NVMeStorageTier> nvme) { nvme_tier_ = nvme; }
+    std::shared_ptr<class NVMeStorageTier> nvme_tier() const { return nvme_tier_; }
+
     size_t cached_snapshot_count() const { return cached_snapshots_; }
     size_t cached_host_snapshot_count() const { return cached_host_snapshots_; }
+    size_t cached_nvme_snapshot_count() const { return cached_nvme_snapshots_; }
     size_t total_nodes() const { return node_count_; }
 
 private:
     mutable std::shared_mutex rw_lock_;
     std::shared_ptr<RadixNode> root_;
+    std::shared_ptr<class NVMeStorageTier> nvme_tier_;
     size_t max_cached_snapshots_ = 4;
     size_t max_host_snapshots_ = 64;
     size_t cached_snapshots_ = 0;
     size_t cached_host_snapshots_ = 0;
+    size_t cached_nvme_snapshots_ = 0;
     size_t node_count_ = 0;
     int64_t next_node_id_ = 1;
 

@@ -10,7 +10,7 @@
 cmake_minimum_required(VERSION 3.24)
 project(strata-agx VERSION 0.1.38 LANGUAGES CXX)
 option(STRATA_BUILD_CONCURRENCY_TESTS "Build CPU-only request scheduling tests" OFF)
-set(STRATA_AGX_VERSION "0.1.38-agx.1.0.4")
+set(STRATA_AGX_VERSION "0.1.38-agx.1.0.5")
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 add_compile_definitions(STRATA_AGX_VERSION="${STRATA_AGX_VERSION}")
 
@@ -375,7 +375,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
-    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/radix_tree.cpp src/core/peer_experts.cpp)
+    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/radix_tree.cpp src/core/peer_experts.cpp src/core/nvme_tier.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   add_executable(radix_tree_test tests/core/radix_tree_test.cpp)
@@ -386,6 +386,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(nanobatch_test PRIVATE strata_engine)
   add_executable(continuous_sched_test tests/core/continuous_sched_test.cpp)
   target_link_libraries(continuous_sched_test PRIVATE strata_engine)
+  add_executable(nvme_radix_test tests/core/nvme_radix_test.cpp)
+  target_link_libraries(nvme_radix_test PRIVATE strata_engine)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
     enable_testing()
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)

@@ -69,7 +69,7 @@ def run_stage1_kernel_parity():
         {
             "name": "SpecTree Speculative Tree Verification (tree_spec_test)",
             "bin": os.path.join(BUILD_DIR, "tree_spec_test"),
-            "must_contain": ["All Phase 3 Speculative Tree & Confidence Gating unit tests passed successfully!"]
+            "must_contain": ["All Strata AGX Phase 7 SpecTree, Verify Kernel, & Prefill tests passed successfully!"]
         },
         {
             "name": "Lockless CRC32C RadixTree Prefix Cache (radix_tree_test)",
@@ -85,6 +85,11 @@ def run_stage1_kernel_parity():
             "name": "Continuous Preemptive Scheduling & KV Compaction (continuous_sched_test)",
             "bin": os.path.join(BUILD_DIR, "continuous_sched_test"),
             "must_contain": ["All Phase 9 Continuous Preemptive Scheduling & KV Compaction unit tests passed successfully!"]
+        },
+        {
+            "name": "3-Tier NVMe DirectStorage L3 RadixTree (nvme_radix_test)",
+            "bin": os.path.join(BUILD_DIR, "nvme_radix_test"),
+            "must_contain": ["ALL 4/4 GATE G10.1 NVME RADIXTREE SUITES PASSED!"]
         }
     ]
     
