@@ -916,6 +916,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     core::RadixCompactor radix_compactor(&radix_tree);
     std::fprintf(stderr, "strata-agx concurrent: ContinuousScheduler & PreemptiveQueue enabled (slots: %zu, aux_slot: %d)\n",
                  m.slots.size(), (c.aux_slots > 0) ? 3 : -1);
+    // WEDGE FIX (2026-10-05): the radix snapshot/insert/evict path issues device-syncing frees
+    // (RadixNode::park_to_host -> cudaFree).  Run while a stage-1 pass is in flight, that free parks
+    // the host inside cuMemFree while the GPU spins on unserviced doorbells (the crossdev x retention
+    // wedge; gdb: evict_lru_locked -> park_to_host -> cudaFree under retire_unit).  Snapshots taken
+    // while the overlap loop runs are queued here and flushed at the safe points below, strictly
+    // before every admission (service_input), where nothing is in flight.
+    std::vector<Impl::Slot*> pending_snapshots;
+    bool defer_snapshots = false;   // set from the overlap gate below (finish() is defined earlier)
     auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens) {
         if (prefix_len < 256 || tokens.size() < (size_t) prefix_len) return;
         s.saved_prefix = prefix_len;
@@ -972,8 +980,16 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             radix_tree.acquire(s.radix_node);
         }
     };
+    auto flush_pending_snapshots = [&]() {
+        for (auto* q : pending_snapshots) {
+            save_slot_snapshot(*q, (int64_t) q->consumed.size(), q->consumed);
+            if (q->radix_node) { radix_tree.release(q->radix_node); q->radix_node = nullptr; }
+        }
+        pending_snapshots.clear();
+    };
     auto finish = [&](Impl::Slot& s, const char* reason) {
-        save_slot_snapshot(s, (int64_t) s.consumed.size(), s.consumed);
+        const bool defer_snapshot = defer_snapshots;
+        if (!defer_snapshot) save_slot_snapshot(s, (int64_t) s.consumed.size(), s.consumed);
         const double decode = s.first ? 0 : elapsed(s.decode_start);
         // P4: the trailing field is reused_prefix_tokens (server.py _parse_done maps it to
         // `reused`/cached_tokens). Live retention fills it with the tokens this request resumed;
@@ -982,7 +998,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     (long long) s.generated, s.request.tokens.size(), s.prompt_ms.load(), decode, reason,
                     (long long) s.accepted, (long long) s.offered, (long long) s.reused_prefix);
         std::fflush(stdout);
-        if (s.radix_node) {
+        if (defer_snapshot) {
+            pending_snapshots.push_back(&s);   // flushed with its snapshot at a safe point
+        } else if (s.radix_node) {
             radix_tree.release(s.radix_node);
             s.radix_node = nullptr;
         }
@@ -1044,6 +1062,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         return true;                                                       // same-device: default on
     }();
+    defer_snapshots = overlap;   // WEDGE FIX: finish() (defined earlier) defers radix snapshots under overlap
     // R2 (split1-v3): a completion event is a CUDA object of the device whose pass it times - ev0 is
     // recorded on stage 0's stream, ev1 on stage 1's - so each is created (and destroyed, on every
     // exit path) on its OWN stage's device: the same context semantics the same-device overlap always
@@ -1754,6 +1773,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (!launchable && drain_prev_unit()) return 1;
         }
         if (!(overlap && prev.valid)) {   // nothing in flight: the input side runs now (the original position)
+            flush_pending_snapshots();
             if (service_input(quit)) return 1;
             input_done = true;
             if (quit) break;
@@ -2006,7 +2026,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
                     return 1;
                 }
-                if (!input_done) { if (service_input(quit)) return 1; input_done = true; }
+                if (!input_done) { flush_pending_snapshots(); if (service_input(quit)) return 1; input_done = true; }
                 if (!quit) {
                     // Launch U_i's stage-1 pass, gated on ITS stage-0 completion event ONLY.  The
                     // stage>=1 plan sinks are refreshed here: the pool routes by layer through
@@ -2031,6 +2051,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         // previous unit was already retired, so nothing is in flight; unit_parity is
                         // not advanced and the next round retries.
                         if (err.find("below VRAM reserve") == std::string::npos) return 1;
+                        if (ret.valid && !retire_unit(ret)) return 1;   // H3: do not drop the captured unit's epilogue
                         refuse_round(u.ready, err);
                         rotation = (rotation + 1) % m.slots.size();
                         continue;
@@ -2065,7 +2086,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
                 return 1;
             }
-            if (!input_done) { if (service_input(quit)) return 1; input_done = true; }
+            if (!input_done) { flush_pending_snapshots(); if (service_input(quit)) return 1; input_done = true; }
             ++rounds;
             core::progress_beat();
             if (adaptive && rounds % c.adapt_every == 0) {
