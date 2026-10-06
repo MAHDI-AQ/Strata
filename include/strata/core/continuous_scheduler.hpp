@@ -47,7 +47,6 @@ inline const char* slot_state_to_string(SlotState s) {
 struct ScheduledSlot {
     int slot_id = -1;
     uint64_t request_id = 0;
-    bool is_aux = false;
     SlotState state = SlotState::IDLE;
     int64_t prompt_tokens = 0;
     int64_t tokens_generated = 0;
@@ -62,57 +61,34 @@ struct ScheduledSlot {
 /// High-performance continuous scheduler managing iteration-level slot allocations.
 class ContinuousScheduler {
 public:
-    explicit ContinuousScheduler(int num_slots = 4, int aux_slot = 3)
-        : num_slots_(std::max(1, num_slots)), aux_slot_(aux_slot), slots_(num_slots_) {
+    explicit ContinuousScheduler(int num_slots = 4)
+        : num_slots_(std::max(1, num_slots)), slots_(num_slots_) {
         for (int i = 0; i < num_slots_; ++i) {
             slots_[i].slot_id = i;
-            slots_[i].is_aux = (i == aux_slot_);
             slots_[i].state = SlotState::IDLE;
         }
     }
 
     int num_slots() const { return num_slots_; }
-    int aux_slot() const { return aux_slot_; }
 
     /// Find and allocate an available slot for an incoming request.
-    /// If is_aux is true, attempts to allocate the dedicated aux_slot first.
     /// Returns slot_id, or -1 if no suitable slot is idle.
     int allocate_slot(uint64_t request_id, int64_t prompt_tokens, int64_t max_new,
-                      int64_t max_context, bool is_aux) {
+                      int64_t max_context) {
         std::lock_guard<std::mutex> lock(sched_mutex_);
         const auto t0 = std::chrono::steady_clock::now();
 
         int pick = -1;
-        if (is_aux && aux_slot_ >= 0 && aux_slot_ < num_slots_) {
-            if (slots_[aux_slot_].state == SlotState::IDLE) {
-                pick = aux_slot_;
-            }
-        }
-
-        if (pick < 0) {
-            // Find any idle slot; if not aux, prefer non-aux slots first
-            if (!is_aux && aux_slot_ >= 0) {
-                for (int i = 0; i < num_slots_; ++i) {
-                    if (i != aux_slot_ && slots_[i].state == SlotState::IDLE) {
-                        pick = i;
-                        break;
-                    }
-                }
-            }
-            if (pick < 0) {
-                for (int i = 0; i < num_slots_; ++i) {
-                    if (slots_[i].state == SlotState::IDLE) {
-                        pick = i;
-                        break;
-                    }
-                }
+        for (int i = 0; i < num_slots_; ++i) {
+            if (slots_[i].state == SlotState::IDLE) {
+                pick = i;
+                break;
             }
         }
 
         if (pick >= 0) {
             auto& s = slots_[pick];
             s.request_id = request_id;
-            s.is_aux = is_aux;
             s.state = SlotState::PREFILL;
             s.prompt_tokens = prompt_tokens;
             s.tokens_generated = 0;
@@ -254,7 +230,6 @@ private:
     }
 
     int num_slots_ = 4;
-    int aux_slot_ = 3;
     mutable std::mutex sched_mutex_;
     std::vector<ScheduledSlot> slots_;
 

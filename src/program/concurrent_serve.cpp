@@ -5,7 +5,7 @@
 //   - vLLM: Continuous batching, PagedAttention virtual block tables, chunked prefill interleaving (Kwon et al., UC Berkeley, SOSP 2023)
 //   - NanoFlow: Overlapped nanobatch execution, asynchronous device-level DMA scheduling (DeepSeek-AI / Tsinghua, arXiv:2408.12757)
 //   - EAGLE-2: Dynamic entropy-gated speculative depth calibration and decay (Li et al., Peking University, arXiv:2406.16858)
-//   - Orca: Continuous token-level iteration scheduling & sub-15ms preemptive auxiliary insertion (OSDI 2022)
+//   - Orca: Continuous token-level iteration scheduling (OSDI 2022)
 //
 #include "strata/program/concurrent_serve.hpp"
 #include "strata/core/nanobatch.hpp"
@@ -26,7 +26,6 @@
 #include "strata/core/shm_ipc.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/core/continuous_scheduler.hpp"
-#include "strata/program/preemptive_queue.hpp"
 #include "strata/core/radix_compactor.hpp"
 #include <algorithm>
 #include <atomic>
@@ -176,7 +175,6 @@ struct ConcurrentServe::Impl {
         spec::DraftPolicy policy{8};
         Request request;
         int64_t max_context = 0;
-        bool is_aux = false;
         // Lane prefill: `active`/`read`/`position`/`prompt_ms` are touched by the pump thread as well as by
         // the loop.  The gate that keeps them disjoint is `read < position`: only the pump advances `read`
         // during prompt processing, and the loop only decodes (and re-sets `read = position`) once the slot
@@ -324,14 +322,12 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
     m.shared_draft = &draft;
     m.session_k = primary.k;
     static const core::ModelGeometry draft_geometry{};
-    const int primary_slots = (c.aux_slots > 0 && c.aux_slots < c.requests) ? (c.requests - c.aux_slots) : c.requests;
     for (int i = 0; i < c.requests; ++i) {
-        const int64_t slot_context = (i >= primary_slots && c.aux_context > 0) ? c.aux_context : c.context;
+        const int64_t slot_context = c.context;
         // Register ownership before any allocation that can fail partway through initialization.
         m.slots.push_back(std::make_unique<Impl::Slot>(stages.size()));
         auto& s = m.slots.back();
         s->max_context = slot_context;
-        s->is_aux = (i >= primary_slots);
         s->suffix = spec::SuffixDrafter(std::max(1, c.suffix), 64, (size_t) slot_context + 4096);
         for (size_t st = 0; st < stages.size(); ++st) {
             auto& gs = s->stages[st];
@@ -682,8 +678,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     std::printf("INFO engine=" STRATA_AGX_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s%s\n",
                 c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.kv.c_str(), c.suffix, adaptive ? "adaptive" : "static",
                 retain ? " admission=d1" : "");
-    const int primary_slots = (c.aux_slots > 0 && c.aux_slots < c.requests) ? (c.requests - c.aux_slots) : c.requests;
-    if (c.aux_slots > 0) std::fprintf(stderr, "strata-agx concurrent: tiered slots: %d primary @ %lld tokens, %d aux @ %lld tokens\n", primary_slots, (long long) c.context, c.aux_slots, (long long) c.aux_context);
     std::printf("READY %lld stop multiplex\n", (long long) c.context);
     // LANE sched-impl P2 (host-loop O1/O2 surface): echo the effective spin posture so the primary's
     // A/B reads off this log line. Zero wait-posture change: the knobs are honored where they already
@@ -727,9 +721,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     //   * fences (pump_fence/pump_resume) hold the pump at a chunk boundary around admission (session_zero
     //     runs on the same stage prompt streams), CSTOP (finish of a slot with a chunk in flight), adapt()
     //     (cache swaps) and exit.  Decode rounds need NO fence: they touch other slots' state only.
-    // Continuous preemptive scheduler and priority queue for iteration-level scheduling
-    core::ContinuousScheduler continuous_sched((int) m.slots.size(), (c.aux_slots > 0) ? 3 : -1);
-    PreemptiveQueue<Request> preemptive_queue(64);
+    // Continuous iteration-level scheduler: token-level slot recycling (uniform slots)
+    core::ContinuousScheduler continuous_sched((int) m.slots.size());
 
     // STRATA_PREFILL_PUMP=0 keeps the pre-change inline path below for the A/B.
     auto run_chunk = [&](size_t i, std::string& chunk_err) -> bool {
@@ -737,7 +730,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // runs it (the pump, or this loop when the pump is off).
         auto& s = *m.slots[i];
         const int64_t read0 = s.read.load(std::memory_order_acquire);
-        // Task 1.2: Fine-grained dynamic chunk sizing & Aux micro-prefill
+        // Task 1.2: Fine-grained dynamic chunk sizing & micro-prefill
         int active_decodes = 0;
         for (const auto& ptr : m.slots) {
             const auto& sl = *ptr;
@@ -751,16 +744,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         else if (active_decodes == 1) dynamic_chunk = std::min<int64_t>(dynamic_chunk, 1024);
 
         const int64_t rem = s.position.load(std::memory_order_relaxed) - read0;
-        // Subtask 1.2.3: Dedicated Aux micro-prefill
-        if (rem <= c.prefill_chunk && (s.is_aux || rem <= 1024)) {
+        // Subtask 1.2.3: micro-prefill bypass for short prompts
+        if (rem <= c.prefill_chunk && rem <= 1024) {
             dynamic_chunk = std::min<int64_t>(c.prefill_chunk, rem);
-        }
-        // Task 9.2: Sub-15ms Preemptive Auxiliary Insertion & Micro-Interleaved Wavefronts
-        const bool urgent_preempt = preemptive_queue.should_preempt((int) i);
-        if (urgent_preempt && !s.is_aux) {
-            dynamic_chunk = std::min<int64_t>(dynamic_chunk, 64);
-        } else if (s.is_aux) {
-            dynamic_chunk = std::min<int64_t>(c.prefill_chunk, 128);
         }
         const int64_t n = std::min<int64_t>(dynamic_chunk, rem);
         const auto start = Clock::now();
@@ -914,8 +900,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     std::fprintf(stderr, "strata-agx concurrent: RadixTree HiCache L2 host-RAM parking enabled (VRAM slots: %zu, Host-RAM slots: %zu)\n",
                  radix_slots, radix_host_slots);
     core::RadixCompactor radix_compactor(&radix_tree);
-    std::fprintf(stderr, "strata-agx concurrent: ContinuousScheduler & PreemptiveQueue enabled (slots: %zu, aux_slot: %d)\n",
-                 m.slots.size(), (c.aux_slots > 0) ? 3 : -1);
+    std::fprintf(stderr, "strata-agx concurrent: ContinuousScheduler enabled (slots: %zu)\n",
+                 m.slots.size());
     // WEDGE FIX (2026-10-05): the radix snapshot/insert/evict path issues device-syncing frees
     // (RadixNode::park_to_host -> cudaFree).  Run while a stage-1 pass is in flight, that free parks
     // the host inside cuMemFree while the GPU spins on unserviced doorbells (the crossdev x retention
@@ -1494,7 +1480,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (m.slots[si].get() == &s) { admit_slot_idx = (int) si; break; }
         }
         if (admit_slot_idx >= 0) {
-            continuous_sched.allocate_slot(s.request.id, (int64_t) s.request.tokens.size(), s.request.max_new, s.max_context, s.is_aux);
+            continuous_sched.allocate_slot(s.request.id, (int64_t) s.request.tokens.size(), s.request.max_new, s.max_context);
         }
         return true;
     };
@@ -1534,8 +1520,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (live.count(request.id)) { error(request.id, "duplicate request id"); continue; }
             if (pending.size() >= 32) { error(request.id, "request queue is full"); continue; }
             live.insert(request.id);
-            const bool req_is_aux = (c.aux_context > 0 && (int64_t) request.tokens.size() < c.aux_context);
-            preemptive_queue.push(request, req_is_aux ? PriorityLevel::URGENT_AUX : PriorityLevel::NORMAL);
             pending.push_back(std::move(request));
         }
 
@@ -1631,11 +1615,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
 
             const int64_t req_len = (int64_t) pending[pick_q].tokens.size();
             Impl::Slot* pick_child = nullptr;
-            if (c.aux_context > 0 && req_len < c.aux_context) {
-                for (auto& ptr : m.slots) {
-                    if (!ptr->active.load() && ptr->is_aux && req_len < ptr->max_context) { pick_child = ptr.get(); break; }
-                }
-            }
             if (pick_child == nullptr) {
                 for (auto& ptr : m.slots) {
                     if (!ptr->active.load() && req_len < ptr->max_context) { pick_child = ptr.get(); break; }
@@ -1680,11 +1659,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
 
             const int64_t req_len = (int64_t) pending[pick_q].tokens.size();
             Impl::Slot* pick_child = nullptr;
-            if (c.aux_context > 0 && req_len < c.aux_context) {
-                for (auto& ptr : m.slots) {
-                    if (!ptr->active.load() && ptr->is_aux && req_len < ptr->max_context && ptr.get() != pick_parent) { pick_child = ptr.get(); break; }
-                }
-            }
             if (pick_child == nullptr) {
                 for (auto& ptr : m.slots) {
                     if (!ptr->active.load() && req_len < ptr->max_context && ptr.get() != pick_parent) { pick_child = ptr.get(); break; }
@@ -1709,26 +1683,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             const int64_t req_len = (int64_t) req.tokens.size();
             Impl::Slot* pick = nullptr;
 
-            if (c.aux_context > 0 && req_len < c.aux_context) {
-                for (auto& ptr : m.slots) {
-                    if (!ptr->active.load() && ptr->is_aux && req_len < ptr->max_context) {
-                        pick = ptr.get();
-                        break;
-                    }
-                }
-            }
-            if (pick == nullptr) {
-                // Task 1.4: Idle-Slot Lending - only lend primary slots to aux tasks if no primary requests are queued!
-                const bool primary_waiting = (c.aux_context > 0 && req_len < c.aux_context) &&
-                    std::any_of(pending.begin(), pending.end(),
-                        [&](const Request& r) { return (int64_t) r.tokens.size() >= c.aux_context; });
-                if (!primary_waiting) {
-                    for (auto& ptr : m.slots) {
-                        if (!ptr->active.load() && req_len < ptr->max_context) {
-                            pick = ptr.get();
-                            break;
-                        }
-                    }
+            for (auto& ptr : m.slots) {
+                if (!ptr->active.load() && req_len < ptr->max_context) {
+                    pick = ptr.get();
+                    break;
                 }
             }
             if (pick != nullptr) {

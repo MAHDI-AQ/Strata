@@ -352,8 +352,6 @@ struct Options {
     int batch_parallel = 0;
     int nanobatch = 0;
     std::string batch_policy = "fair";
-    int aux_slots = 0;
-    int64_t aux_context = 0;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
@@ -467,8 +465,6 @@ void usage() {
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --concurrency N      experimental shared-model serving, 1..16 requests (default 1)\n"
-                 "  --aux-slots N        reserve N slots for auxiliary tasks with --aux-context (default 0)\n"
-                 "  --aux-context N      maximum context for auxiliary slots in tokens (default 0 = same as --max-context)\n"
                  "  --batch-rows N       target rows across requests, 1..48 (default 8)\n"
                  "  --batch-graphs N     cached batch layouts, 1..64 (default 8; respects VRAM reserve)\n"
                  "  --batch-padding N    stabilize verification shapes with discarded padding, 0|1 (default 0)\n"
@@ -1095,8 +1091,6 @@ int main(int argc, char** argv) {
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--concurrency") o.concurrency = std::atoi(next("--concurrency"));
-        else if (a == "--aux-slots") o.aux_slots = std::atoi(next("--aux-slots"));
-        else if (a == "--aux-context") o.aux_context = std::atoll(next("--aux-context"));
         else if (a == "--batch-rows") o.batch_rows = std::atoi(next("--batch-rows"));
         else if (a == "--batch-graphs") o.batch_graphs = std::atoi(next("--batch-graphs"));
         else if (a == "--batch-padding") o.batch_padding = std::atoi(next("--batch-padding"));
@@ -1230,10 +1224,6 @@ int main(int argc, char** argv) {
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
     if (o.concurrency <= 1 && o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0 && !o.layer_split.empty()) {
         std::fprintf(stderr, "strata serve: legacy single-stream conversation parking does not support --layer-split; use --concurrency >= 2 for multi-device RadixTree HiCache L2\n");
-        return 2;
-    }
-    if (o.aux_slots < 0 || o.aux_slots >= o.concurrency) {
-        std::fprintf(stderr, "strata: --aux-slots must be in range 0..concurrency-1\n");
         return 2;
     }
     if (o.concurrency < 1 || o.concurrency > 16 || o.batch_rows < 1 ||
@@ -2471,9 +2461,6 @@ int main(int argc, char** argv) {
     if (o.concurrency > 1) {
         strata::program::ConcurrentConfig config;
         config.requests = o.concurrency; config.rows = o.batch_rows; config.depth = o.batch_policy == "depth";
-        config.aux_slots = o.aux_slots; config.aux_context = o.aux_context;
-        if (const char* as_env = std::getenv("STRATA_AUX_SLOTS")) config.aux_slots = std::atoi(as_env);
-        if (const char* ac_env = std::getenv("STRATA_AUX_CONTEXT")) config.aux_context = std::atoll(ac_env);
         config.graph_cache = o.batch_graphs;
         config.pad_batch = o.batch_padding != 0;
         config.parallel_batch = o.batch_parallel != 0;

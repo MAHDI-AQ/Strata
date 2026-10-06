@@ -39,6 +39,7 @@ v<upstream-version>-agx.<major>.<minor>.<patch>
 *Phase 8 Milestone:* **`v0.1.38-agx.1.0.3`** (2026-10-05: NanoFlow-Style Device-Level Nanobatching K in [2..4], Lockless TripleBufferIPC 3-Slot Ring, and Overlapped PCIe Pipeline).
 *Phase 9 Milestone:* **`v0.1.38-agx.1.0.4`** (2026-10-05: Continuous Preemptive Scheduling, Sub-15ms Preemptive Auxiliary Insertion, and Dynamic RadixTree KV Compaction).
 *Phase 10 Milestone:* **`v0.1.38-agx.1.0.5`** (2026-10-05: 3-Tier Storage Hierarchy & Persistent NVMe RadixTree L3 DirectStorage).
+*Post-seal (2026-10-06):* removed the tiered auxiliary-slot / preemptive-insertion experiment — uniform N-slot pool with queue admission (regression source).
 
 ---
 

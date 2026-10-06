@@ -1,14 +1,12 @@
-// tests/core/continuous_sched_test.cpp - Unit Test Battery for Phase 9 Continuous Preemptive Scheduling & KV Compaction
+// tests/core/continuous_sched_test.cpp - Unit Test Battery for Continuous Scheduling & KV Compaction
 //
 // Cross-Engine Reference: SGLang Continuous Batching, vLLM v1 Core Scheduler, Orca.
 // Asserts:
 //   1. ContinuousScheduler: 10,000 iterations high-churn simulation, 0 idle slot starvation, 100% token sequence correctness.
 //   2. Scheduling overhead < 10 us per step over 50,000 operations.
-//   3. PreemptiveQueue & MicroPrefillSlicer: sub-15ms preemptive auxiliary insertion and micro-chunking.
-//   4. RadixCompactor: dynamic dead-leaf pruning, path compression, and memory defragmentation.
+//   3. RadixCompactor: dynamic dead-leaf pruning, path compression, and memory defragmentation.
 
 #include "strata/core/continuous_scheduler.hpp"
-#include "strata/program/preemptive_queue.hpp"
 #include "strata/core/radix_compactor.hpp"
 #include "strata/core/radix_tree.hpp"
 
@@ -29,11 +27,10 @@ namespace {
 using Clock = std::chrono::high_resolution_clock;
 
 void test_continuous_scheduler_high_churn() {
-    std::printf("[TEST 1/4] ContinuousScheduler: 10,000 Iterations High-Churn Simulation & Zero Starvation...\n");
+    std::printf("[TEST 1/3] ContinuousScheduler: 10,000 Iterations High-Churn Simulation & Zero Starvation...\n");
 
     const int num_slots = 4;
-    const int aux_slot = 3;
-    strata::core::ContinuousScheduler sched(num_slots, aux_slot);
+    strata::core::ContinuousScheduler sched(num_slots);
 
     std::mt19937 rng(42);
     std::uniform_int_distribution<int64_t> len_dist(1, 32);
@@ -43,7 +40,6 @@ void test_continuous_scheduler_high_churn() {
         uint64_t id;
         int64_t prompt_len;
         int64_t max_new;
-        bool is_aux;
         int64_t generated = 0;
         int slot_assigned = -1;
     };
@@ -52,8 +48,7 @@ void test_continuous_scheduler_high_churn() {
     uint64_t req_id_gen = 1;
 
     for (int i = 0; i < 200; ++i) {
-        bool is_aux = (i % 5 == 0);
-        queue.push_back({req_id_gen++, prompt_dist(rng), len_dist(rng), is_aux, 0, -1});
+        queue.push_back({req_id_gen++, prompt_dist(rng), len_dist(rng), 0, -1});
     }
 
     std::vector<SimReq*> active_slots(num_slots, nullptr);
@@ -66,15 +61,10 @@ void test_continuous_scheduler_high_churn() {
         for (int s = 0; s < num_slots; ++s) {
             if (active_slots[s] == nullptr && !queue.empty()) {
                 size_t pick_idx = 0;
-                if (s == aux_slot) {
-                    for (size_t q = 0; q < queue.size(); ++q) {
-                        if (queue[q].is_aux) { pick_idx = q; break; }
-                    }
-                }
                 auto req = queue[pick_idx];
                 queue.erase(queue.begin() + pick_idx);
 
-                int assigned = sched.allocate_slot(req.id, req.prompt_len, req.max_new, 4096, req.is_aux);
+                int assigned = sched.allocate_slot(req.id, req.prompt_len, req.max_new, 4096);
                 assert(assigned == s);
                 sched.set_slot_state(assigned, strata::core::SlotState::READY_DECODE);
 
@@ -101,8 +91,7 @@ void test_continuous_scheduler_high_churn() {
                 active_slots[slot_id] = nullptr;
                 // Add new request to queue to sustain churn
                 if (req_id_gen < 500) {
-                    bool is_aux = (req_id_gen % 4 == 0);
-                    queue.push_back({req_id_gen++, prompt_dist(rng), len_dist(rng), is_aux, 0, -1});
+                    queue.push_back({req_id_gen++, prompt_dist(rng), len_dist(rng), 0, -1});
                 }
             }
         }
@@ -125,14 +114,14 @@ void test_continuous_scheduler_high_churn() {
 }
 
 void test_scheduling_overhead() {
-    std::printf("[TEST 2/4] ContinuousScheduler Micro-Overhead Benchmark (< 10 us target)...\n");
+    std::printf("[TEST 2/3] ContinuousScheduler Micro-Overhead Benchmark (< 10 us target)...\n");
 
-    strata::core::ContinuousScheduler sched(4, 3);
+    strata::core::ContinuousScheduler sched(4);
     const int iterations = 50000;
 
     auto t0 = Clock::now();
     for (int i = 0; i < iterations; ++i) {
-        int s = sched.allocate_slot(100 + (i % 4), 64, 16, 2048, false);
+        int s = sched.allocate_slot(100 + (i % 4), 64, 16, 2048);
         if (s >= 0) {
             sched.set_slot_state(s, strata::core::SlotState::READY_DECODE);
             sched.step_token(s, 42, true);
@@ -148,56 +137,9 @@ void test_scheduling_overhead() {
     std::printf("  [PASS] Sub-10 microsecond overhead target strictly met!\n");
 }
 
-void test_preemptive_aux_insertion() {
-    std::printf("[TEST 3/4] PreemptiveQueue & MicroPrefillSlicer (Sub-15ms Preemption Target)...\n");
-
-    strata::program::MicroPrefillSlicer slicer(64);
-    assert(slicer.chunk_size() == 64);
-
-    const int64_t prompt_tokens = 250;
-    auto chunks = slicer.slice(prompt_tokens);
-    assert(chunks.size() == 4);
-    assert(chunks[0].count == 64 && !chunks[0].is_final);
-    assert(chunks[1].count == 64 && !chunks[1].is_final);
-    assert(chunks[2].count == 64 && !chunks[2].is_final);
-    assert(chunks[3].count == 58 && chunks[3].is_final);
-    assert(chunks[3].offset == 192);
-
-    struct DummyReq { uint64_t id; std::string name; };
-    strata::program::PreemptiveQueue<DummyReq> pqueue(32);
-
-    assert(pqueue.empty());
-    assert(!pqueue.should_preempt());
-
-    pqueue.push({1, "bg_1"}, strata::program::PriorityLevel::NORMAL);
-    pqueue.push({2, "bg_2"}, strata::program::PriorityLevel::NORMAL);
-    pqueue.push({3, "bg_3"}, strata::program::PriorityLevel::NORMAL);
-
-    assert(!pqueue.should_preempt());
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-
-    pqueue.push({999, "urgent_aux_tool"}, strata::program::PriorityLevel::URGENT_AUX);
-
-    assert(pqueue.should_preempt());
-    assert(pqueue.urgent_size() == 1);
-
-    DummyReq popped_req;
-    strata::program::PriorityLevel prio;
-    double wait_ms = 0.0;
-    bool ok = pqueue.pop(popped_req, prio, &wait_ms);
-    assert(ok);
-    assert(popped_req.id == 999);
-    assert(prio == strata::program::PriorityLevel::URGENT_AUX);
-    assert(wait_ms < 15.0);
-    assert(!pqueue.should_preempt());
-
-    std::printf("  -> Urgent Aux turnaround latency: %.3f ms (< 15.0 ms target)\n", wait_ms);
-    std::printf("  [PASS] Sub-15ms Preemptive Auxiliary Insertion verified!\n");
-}
 
 void test_radix_compactor() {
-    std::printf("[TEST 4/4] RadixCompactor: Dynamic KV Defragmentation & Path Compression...\n");
+    std::printf("[TEST 3/3] RadixCompactor: Dynamic KV Defragmentation & Path Compression...\n");
 
     strata::core::RadixTree tree(4, 16);
     strata::core::RadixCompactor compactor(&tree);
@@ -218,16 +160,15 @@ void test_radix_compactor() {
 
 int main() {
     std::printf("================================================================================\n");
-    std::printf("  STRATA AGX PHASE 9: CONTINUOUS PREEMPTIVE SCHEDULING UNIT TEST BATTERY        \n");
+    std::printf("  STRATA AGX: CONTINUOUS SCHEDULING & KV COMPACTION UNIT TEST BATTERY           \n");
     std::printf("================================================================================\n\n");
 
     test_continuous_scheduler_high_churn();
     test_scheduling_overhead();
-    test_preemptive_aux_insertion();
     test_radix_compactor();
 
     std::printf("\n================================================================================\n");
-    std::printf("  All Phase 9 Continuous Preemptive Scheduling & KV Compaction unit tests passed successfully!\n");
+    std::printf("  All continuous scheduling & KV compaction unit tests passed successfully!\n");
     std::printf("================================================================================\n");
     return 0;
 }

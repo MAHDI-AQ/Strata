@@ -1,7 +1,7 @@
 <h1 align="center">Strata AGX</h1>
 
 <p align="center"><b>Multi-Agent Concurrency & Speculative Serving Fork for 125B MoE Models</b><br>
-Dual NVIDIA GeForce RTX 4090 · Dynamic RadixTree KV · Preemptive Micro-Scheduling</p>
+Dual NVIDIA GeForce RTX 4090 · Dynamic RadixTree KV · Continuous Multi-Agent Scheduling</p>
 
 ---
 
@@ -9,14 +9,14 @@ Dual NVIDIA GeForce RTX 4090 · Dynamic RadixTree KV · Preemptive Micro-Schedul
 
 **Strata AGX** is a downstream C++/CUDA serving fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) tailored for **multi-agent swarm concurrency**, **heterogeneous context scaling**, and **low-latency speculative decoding** on Dual NVIDIA GeForce RTX 4090 GPUs.
 
-Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Next) can execute on dual consumer GPUs in single-stream mode ($C=1$). This fork focuses on the multi-agent serving constraints: eliminating FIFO queue head-of-line blocking, enabling zero-copy prefix sharing across parallel agent branches, and providing deterministic sub-15ms turnaround for auxiliary tool calls under heavy generation loads.
+Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Next) can execute on dual consumer GPUs in single-stream mode ($C=1$). This fork focuses on the multi-agent serving constraints: eliminating FIFO queue head-of-line blocking, enabling zero-copy prefix sharing across parallel agent branches, and serving agent and tool traffic alike through one continuous-batching pool with a fair queue and prefix caching.
 
 ### Key Additions Over Upstream
 
 1. **Continuous Multi-Agent Concurrency ($C=1$ to $C=5$):**
    - Replaced coarse round-based batching with token-level continuous micro-scheduling (Orca / vLLM v1 model).
    - Lockless dynamic slot recycling (< 5 µs overhead) upon stream completion.
-   - Tiered heterogeneous slot sizing: supports 3 Primary Agent slots at 262,144 context + 1 Auxiliary slot at 65,536 context (**851,968 tokens total virtual context**).
+   - Uniform agent slots at full context: $C$ concurrent streams at up to 262,144 tokens each; additional requests queue and are admitted as slots free (standard continuous-batching admission).
 2. **Dynamic RadixTree KV Cache & 3-Tier Storage:**
    - Zero-copy prefix sharing across branching subagent sessions.
    - Sub-millisecond prefix forking for concurrent agent swarms.
@@ -24,12 +24,9 @@ Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Ne
 3. **Speculative Decoding Engine (SpecTree DAG + Fused GDN):**
    - Multi-Branch SpecTree DAG expansion with 64-bit ancestor masks ($T \le 16$).
    - Fused GDN recurrence and Split-K online softmax attention, raising MTP acceptance yield from ~60% to **75%–90%**.
-4. **Preemptive Auxiliary Insertion:**
-   - Dedicated low-latency priority lane for agent tool calls and lint checks.
-   - Bypasses in-flight prompt prefill passes, reducing auxiliary query turnaround from >15s to **2.07s**.
-5. **Cross-GPU Prefill Pipelining (`STRATA_PREFILL_CHAIN=1`):**
+4. **Cross-GPU Prefill Pipelining (`STRATA_PREFILL_CHAIN=1`):**
    - Chunk-level stage pipelining across dual GPUs, achieving **3,450 tok/s** on IQ3_XXS and **5,355 tok/s** on Q1 Coder.
-6. **Bitwise Parity Verification:**
+5. **Bitwise Parity Verification:**
    - Test harness confirming bit-for-bit parity against reference ggml across all 18 quant formats.
 
 > [!NOTE]
@@ -82,7 +79,8 @@ Evaluated on `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (IQ3_XXS, 125B MoE wi
 | **$C=5$** | Full Concurrency (Burst) | **220.04 tok/s** | 59.4 – 68.7 tok/s | 5,355.4 tok/s | 100.0% |
 | **$C=5$** | Sustained Sweet Spot (11.5 GHz) | **253.92 tok/s** | 59.2 – 63.2 tok/s | 5,124.2 tok/s | 100.0% |
 
-#### B. Tiered Heterogeneous Swarm — Qwen 3.8 Flash Next `IQ3_XXS` (852K Virtual Context)
+#### B. Retired Tiered Heterogeneous Swarm — Qwen 3.8 Flash Next `IQ3_XXS` (852K Virtual Context)
+*Historical (`v0.1.38-agx.1.0.5`): the tiered auxiliary-slot experiment was removed from the engine on 2026-10-06 as a regression source (it collapsed prefill under load even with no aux traffic). Tool/aux traffic now flows through the standard pool + queue; these figures document the retired build.*
 *Evaluated with 3 Primary slots @ 262K context + 1 Aux slot @ 65K context = **851,968 tokens context** (66.6% VRAM residency; 33.4% streamed dynamically from host DDR4 over PCIe 4.0):*
 
 | Stream / Role | Context Allocation | Measured Decode Speed | Step Latency | Turnaround / Wall Time | MTP Acceptance |
@@ -98,6 +96,8 @@ Evaluated on `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (IQ3_XXS, 125B MoE wi
 ### 3. Head-to-Head: Vanilla Upstream Strata (v0.1.38) vs Strata AGX (`v0.1.38-agx.1.0.5`)
 
 Evaluated side-by-side on the exact same Dual RTX 4090 rig:
+
+> *Note (2026-10-06): the auxiliary-slot machinery referenced in the rows below was removed from the engine as a regression source; concurrent serving is now a uniform N-slot pool with queue admission. Rows document `v0.1.38-agx.1.0.5`.*
 
 | Capability / Benchmark Metric | Vanilla Upstream Strata (v0.1.38) | Strata AGX (`v0.1.38-agx.1.0.5`) | Empirical Difference |
 |---|---|---|---|
