@@ -78,6 +78,18 @@ want "flag_owner_gate rc=0" $rc
 n="$(count_from "$TMP/flag_owner_gate.log")"
 [ "${n:-0}" -ge 12 ]; want "flag_owner_gate checks>=12 (ran ${n:-0})" $?
 
+# ---------------------------------------------------------------- stage 1c: asserts gate (build-class integrity)
+step "stage 1c: asserts gate (build-class integrity)"
+bash "$HERE/asserts_gate.sh" > "$TMP/asserts_gate.log" 2>&1; rc=$?
+if [ "$rc" = "3" ]; then
+  echo "  [SKIP] asserts_gate refused ($(tail -1 "$TMP/asserts_gate.log")) - not counted as a pass"
+  TOTAL=$((TOTAL + 1))
+else
+  want "asserts_gate rc=0" $rc
+  n="$(count_from "$TMP/asserts_gate.log")"
+  [ "${n:-0}" -ge 7 ]; want "asserts_gate checks>=7 (ran ${n:-0})" $?
+fi
+
 # ---------------------------------------------------------------- stage 2: component selftests
 step "stage 2: component selftests (check counts asserted)"
 declare -A FLOORS=( [token_calib]=8 [fairness]=6 [retention_gate]=6 [score_envelope]=4 )

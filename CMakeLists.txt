@@ -10,6 +10,11 @@
 cmake_minimum_required(VERSION 3.24)
 project(strata-agx VERSION 0.1.38 LANGUAGES CXX)
 option(STRATA_BUILD_CONCURRENCY_TESTS "Build CPU-only request scheduling tests" OFF)
+
+# Keep runtime assert() live: strips -DNDEBUG from the Release-class flags and builds the
+# asserts-liveness sentinel (tests/core/asserts_active_check.cpp). Default OFF: the shipping
+# Release class is unchanged.
+option(STRATA_ENABLE_ASSERTS "Keep runtime assert() active (strips -DNDEBUG from the Release-class flags)" OFF)
 set(STRATA_AGX_VERSION "0.1.38-agx.1.0.5")
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 add_compile_definitions(STRATA_AGX_VERSION="${STRATA_AGX_VERSION}")
@@ -51,6 +56,17 @@ if(STRATA_BUILD_CONCURRENCY_TESTS)
 endif()
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+if(STRATA_ENABLE_ASSERTS)
+  string(REPLACE "-DNDEBUG" "" _strata_cxx_rel "${CMAKE_CXX_FLAGS_RELEASE}")
+  set(CMAKE_CXX_FLAGS_RELEASE "${_strata_cxx_rel}" CACHE STRING "" FORCE)
+  if(DEFINED CMAKE_CUDA_FLAGS_RELEASE)
+    string(REPLACE "-DNDEBUG" "" _strata_cuda_rel "${CMAKE_CUDA_FLAGS_RELEASE}")
+    set(CMAKE_CUDA_FLAGS_RELEASE "${_strata_cuda_rel}" CACHE STRING "" FORCE)
+  endif()
+  enable_testing()
+  add_executable(asserts_active_check tests/core/asserts_active_check.cpp)
+  add_test(NAME asserts_active_check COMMAND asserts_active_check)
 endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
