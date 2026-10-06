@@ -1743,10 +1743,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // Task 8.1: Overlapped Nanobatch Partitioning (K in [2..4])
         size_t max_unit_slots = m.slots.size();
         static bool alt_unit = false;
-        const int nanobatch_k = (c.nanobatch >= 2 && c.nanobatch <= 4) ? c.nanobatch : [] {
-            const char* nb = std::getenv("STRATA_NANOBATCH");
-            return nb != nullptr ? std::clamp(std::atoi(nb), 2, 4) : 2;
-        }();
+        const int nanobatch_k = (c.nanobatch >= 2 && c.nanobatch <= 4) ? c.nanobatch : 2;
         core::NanobatchScheduler nanobatch_sched(nanobatch_k);
         if (overlap && !prev.valid) {
             size_t eligible = 0;

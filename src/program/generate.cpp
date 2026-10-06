@@ -2465,22 +2465,17 @@ int main(int argc, char** argv) {
         config.pad_batch = o.batch_padding != 0;
         config.parallel_batch = o.batch_parallel != 0;
         config.nanobatch = o.nanobatch;
-        if (const char* nb_env = std::getenv("STRATA_NANOBATCH")) config.nanobatch = std::clamp(std::atoi(nb_env), 2, 4);
         config.window = o.spec; config.mtp_window_rows = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         config.prefill_chunk = o.concurrent_prefill; config.context = o.max_context; config.draft_context = o.mtp_window;
         config.reserve_mib = o.vram_reserve_mib; config.mtp_dir = o.mtp; config.spec_min_p = (float) o.spec_min_p;
-        if (const char* smp_env = std::getenv("STRATA_SPEC_MIN_P")) config.spec_min_p = (float) std::atof(smp_env);
         config.suffix = o.suffix_draft; config.eos = o.eos_ids; config.kv = o.kv;
         config.adapt_every = o.adapt_every; config.adapt_swaps = o.adapt_swaps;
-        if (const char* ae_env = std::getenv("STRATA_ADAPT_EVERY")) config.adapt_every = std::atoi(ae_env);
-        if (const char* asw_env = std::getenv("STRATA_ADAPT_SWAPS")) config.adapt_swaps = std::atoi(asw_env);
         config.conversation_cache_mib = o.conversation_cache_mib;
         config.conversation_cache_slots = o.conversation_cache_slots;
         config.conversation_cache_min_free_mib = o.conversation_cache_min_free_mib;
         // P1-cache-revive: the #189 parking core has no concurrent/split save/restore yet
         // (the serial path already refuses split+parking at startup; this path parks nothing).
-        // Refuse early with the kill-switch named; the env override lets a fleet force off.
-        if (const char* cc_env = std::getenv("STRATA_CONCURRENT_CACHE_MIB")) config.conversation_cache_mib = std::atoll(cc_env);
+        // Refuse early with the kill-switch named; the value is owned by --conversation-cache-mib.
         if (config.conversation_cache_mib > 0) {
             std::fprintf(stderr, "strata concurrent: HiCache L2 host-RAM conversation cache enabled (budget: %lld MiB)\n", (long long) config.conversation_cache_mib);
         }

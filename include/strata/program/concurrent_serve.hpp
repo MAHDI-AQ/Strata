@@ -21,7 +21,7 @@ struct ConcurrentConfig {
     // (0 = disabled, mirrors --conversation-cache-mib on the serial path). The #189 core
     // is in-tree since 0.1.30 but the concurrent/split save/restore lift is not landed, so
     // any nonzero value is refused at startup; the fields exist so the flag surface is stable
-    // when the lift lands. Kill-switch: 0 (flag or STRATA_CONCURRENT_CACHE_MIB=0).
+    // when the lift lands. Kill-switch: 0 (--conversation-cache-mib 0).
     int64_t conversation_cache_mib = 0;
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;

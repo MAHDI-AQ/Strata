@@ -71,6 +71,13 @@ done
 run="$(head -40 "$HERE/run_envelope.sh" | grep -c 'dry-run')"
 [ "$run" -ge 1 ]; want "run_envelope.sh advertises dry-run" $?
 
+# ---------------------------------------------------------------- stage 1b: serving-value flag ownership (G11.2)
+step "stage 1b: flag/env owner gate"
+"$PY" "$HERE/flag_owner_gate.py" --root "$(cd "$HERE/../.." && pwd)" > "$TMP/flag_owner_gate.log" 2>&1; rc=$?
+want "flag_owner_gate rc=0" $rc
+n="$(count_from "$TMP/flag_owner_gate.log")"
+[ "${n:-0}" -ge 12 ]; want "flag_owner_gate checks>=12 (ran ${n:-0})" $?
+
 # ---------------------------------------------------------------- stage 2: component selftests
 step "stage 2: component selftests (check counts asserted)"
 declare -A FLOORS=( [token_calib]=8 [fairness]=6 [retention_gate]=6 [score_envelope]=4 )
