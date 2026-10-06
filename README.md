@@ -25,7 +25,7 @@ Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Ne
    - Multi-Branch SpecTree DAG expansion with 64-bit ancestor masks ($T \le 16$).
    - Fused GDN recurrence and Split-K online softmax attention, raising MTP acceptance yield from ~60% to **75%–90%**.
 4. **Cross-GPU Prefill Pipelining (`STRATA_PREFILL_CHAIN=1`):**
-   - Chunk-level stage pipelining across dual GPUs, achieving **3,450 tok/s** on IQ3_XXS and **5,355 tok/s** on Q1 Coder.
+   - Chunk-level stage pipelining across dual GPUs, achieving **3,450 tok/s** on IQ3_XXS (single-request path) and **5,355 tok/s** on Q1 Coder.
 5. **Bitwise Parity Verification:**
    - Test harness confirming bit-for-bit parity against reference ggml across all 18 quant formats.
 
@@ -58,10 +58,12 @@ Evaluated on `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (IQ3_XXS, 125B MoE wi
 | **Single-Stream Decode (Medium Context, 2.8K)** | 105.2 tok/s | **107.6 tok/s** *(9.30 ms/tok)* | **+2.3%** |
 | **Single-Stream Decode (Peak Observed)** | 108.6 tok/s | **129.2 tok/s** *(7.74 ms/tok)* | **+19.0%** |
 | **MTP Speculative Acceptance Yield** | ~60.0% – 65.0% | **75.0% – 89.7%** | **+15.0% to +29.7%** |
-| **Cold Prefill Throughput** | ~850 tok/s *(Unpipelined)* | **3,450.2 tok/s** *(`STRATA_PREFILL_CHAIN=1`)* | **4.1× speedup** |
+| **Cold Prefill Throughput** | ~850 tok/s *(Unpipelined)* | **3,450.2 tok/s** *(`STRATA_PREFILL_CHAIN=1`, single-request path `--prefill auto`, 16,384-token chunks)* | **4.1× speedup** |
 | **VRAM Expert Residency (262K Context)** | 86.3% (21,209 / 24,576 slots) | 86.3% (21,209 / 24,576 slots) | Preserved |
 
 *Note: Upstream Strata natively supports 262,144 context in single-stream mode; Strata AGX accelerates this single-stream decode path via fused GDN recurrence and Split-K FMHA.*
+
+*Note on the prefill row: the 3,450.2 tok/s figure is the single-request path at `--prefill auto` (16,384-token chunks); the concurrent serving path chunks via `--concurrent-prefill` (≤4096) and measures ≈2.1–2.3K tok/s at depth — raising the concurrent cap is a tracked engine lever.*
 
 ---
 

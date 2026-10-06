@@ -5,7 +5,6 @@ tools/acceptance/phase5_regression_suite.py - Phase 5 Automated Regression & Par
 Asserts:
   1. Kernel Parity Battery: qsa_parity, router_top10_parity, kv_q4_parity, kv_hybrid_parity, tree_spec_test, radix_tree_test.
   2. Live End-to-End Serving & 4-Stream Concurrency on Dual NVIDIA RTX 4090 (Port 8096).
-  3. Obsidian Brain Consistency & Gate Verification.
 
 Usage:
   python3 tools/acceptance/phase5_regression_suite.py [--skip-serving] [--skip-parity] [--build-dir ./build]

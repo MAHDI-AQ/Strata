@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
 done
 
 # ---------------------------------------------------------------- preconditions (refusal, never vacuous)
-[ -n "$RECIPE" ] || { echo "REFUSED: --recipe DIR required (e.g. /srv/lab/recipes/<name>)"; exit 3; }
+[ -n "$RECIPE" ] || { echo "REFUSED: --recipe DIR required (e.g. /path/to/recipes/<name>)"; exit 3; }
 [ -d "$RECIPE" ] || { echo "REFUSED: recipe dir '$RECIPE' not found"; exit 3; }
 for f in start_server.sh stop_server.sh config.json; do
   [ -f "$RECIPE/$f" ] || { echo "REFUSED: $RECIPE/$f missing"; exit 3; }

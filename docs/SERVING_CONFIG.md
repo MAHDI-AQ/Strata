@@ -135,6 +135,7 @@ diagnostic flags. Effect notes marked "measured" come from engine receipts on du
 | `STRATA_MMQ_BLOB` | MMQ blob expert path toggle (A/B arm; check the receipt in `docs/` before enabling). |
 | `STRATA_VERIFY_DEVICE_PLAN` | verifier device-plan validation arm. |
 | `STRATA_BATCH_HEAD` | batched head path. |
+| `STRATA_NVME_TIER_DIR` | directory for the NVMe L3 storage tier (radix parking); default = per-user cache. |
 
 ~130 `STRATA_*` gates exist in total; the rest are A/B experiments, kernel arm selectors,
 and diagnostics. Find any of them with `grep -rn "STRATA_" src include serve`. **Rule:

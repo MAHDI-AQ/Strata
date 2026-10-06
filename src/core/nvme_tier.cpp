@@ -16,21 +16,9 @@ std::string NVMeStorageTier::detect_default_storage_path() {
     if (env_path && std::strlen(env_path) > 0) {
         return std::string(env_path);
     }
-    // High-performance primary coordinate on ai-server: WD_BLACK SN850X 4TB NVMe SSD (/srv/lab)
-    const std::string srv_lab_path = "/srv/lab/cache/strata/nvme_radix";
+    // Placement is explicit: STRATA_NVME_TIER_DIR (checked above) names the fast-disk location;
+    // without it, the per-user cache is used.
     std::error_code ec;
-    if (fs::exists("/srv/lab", ec) && !ec) {
-        fs::create_directories(srv_lab_path, ec);
-        if (!ec) {
-            std::string probe_file = srv_lab_path + "/.probe";
-            int fd = ::open(probe_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd >= 0) {
-                ::close(fd);
-                ::unlink(probe_file.c_str());
-                return srv_lab_path;
-            }
-        }
-    }
     // User cache fallback
     const char* home = std::getenv("HOME");
     if (home) {
