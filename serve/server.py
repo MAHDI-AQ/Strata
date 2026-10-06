@@ -1954,7 +1954,8 @@ class Service:
                             ft = self.status.get("first_token")
                             rate = n / max(1e-6, now - ft) if ft else 0.0
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
-                            print(f"[strata-agx] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                            label = f"[strata-agx request {request_id}]" if request_id is not None else "[strata-agx]"
+                            print(f"{label} done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if finish == "length" and parser.state == "reasoning":   # #530
                                 print("[strata-agx] the reply reached max tokens while still thinking, so it has no "
