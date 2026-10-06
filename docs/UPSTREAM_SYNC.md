@@ -65,6 +65,23 @@ Tracking upstream commits on `origin/main` beyond fork base `99f3dbd` (October 3
 | `4f3973a` | Niko1221 | serve: read the /load and /unload body before replying | **ACCEPTED (CHERRY-PICKED)** | Clean HTTP handling fix for server.py. |
 | `4ba35fd` – `7021c80` (48 commits) | Community / Intel | Intel Arc / SYCL Port & oneAPI backend integration | **OUT-OF-SCOPE** | Focuses on Intel Arc (B70 / Battlemage) and SYCL runtime. Strata AGX is strictly specialized for high-throughput NVIDIA Ada Lovelace / CUDA SM89 dual-GPU architectures. |
 
+*v0.1.39 wave — inventory 2026-10-06 (217 upstream commits beyond `v0.1.38`; tip `6f32ec0`). CANDIDATE-PORT items require per-file port triage and full gates (build → serial ctest → boot) before landing; CANDIDATE-EVALUATE items need a conflict/structure review first.*
+
+| Upstream Commit | Author / PR | Subject | AGX Classification | Rationale |
+|---|---|---|---|---|
+| `cff608c` | Niko1221 | Engine 0.1.39 batch: #577 file-tier regression fix, OpenAI Responses API (#451), #606 #620 #458 #533 | **EVALUATING (batch)** | The #577 storage-tier fix overlaps AGX cache layers; triage per file. |
+| `fd95405` | sf-nrunner | perf(qsa): fewer shuffles and q-shared traffic, bit-exact | **CANDIDATE-PORT** | QSA hot path; bit-exact ⇒ G1-verifiable against the split-K QSA path. |
+| `cce52db` | Niko1221 | qsa_select: warp-histogram top-k past the register kernel (9–12× at 262K–524K cells) | **CANDIDATE-PORT** | Deep-context QSA select scaling; gate with qsa_parity at 262K. |
+| `cfd3b72` | Community | perf(cuda,decode): zero-doorbell verify graph, sub-warp expert packing, shared-mem staging, batched PLE/MTP | **CANDIDATE-EVALUATE (large)** | Heavy overlap with AGX's verify/overlap chain; structure review first. |
+| `f945515` | Niko1221 | #646: single-matrix mmvq grid staging | **CANDIDATE-EVALUATE** | Overlaps AGX MMQ-blob work; both-modes perf receipt required. |
+| `b30e815` `e82947f` | Niko1221 | native experts: AVX-2 gating, Q2_0 on ggml-cpu (#595/#394) | **CANDIDATE-EVALUATE** | Host-side gating; relevant on AVX-2-only hosts. |
+| `dd24a55` `3a64d02` `016ea2e` `dd0ce1e` | Niko1221 | iq_avx2: grid gather + sign-table builds | **CANDIDATE-EVALUATE** | AVX-2 IQ kernels; measurable on this host. |
+| `055122c` | Community | sm_120 IQ3_S fix | **OUT-OF-SCOPE** | Blackwell target. |
+| `5fa9e7f` `06a90a2` `8fb3c91` | Community | Volta kernels / QSA sub-sm_75 | **OUT-OF-SCOPE** | Non-Ada targets. |
+| `fa8dd5c` `f0b3d17` `5c544dd` `8534ee1` | Community | gfx906 (MI50/MI60) support | **OUT-OF-SCOPE** | AMD targets. |
+| `3ee292a` `bf8e11d` | Community | SYCL fixes | **OUT-OF-SCOPE** | Intel/SYCL targets. |
+| `e809f7f` `4f691be` `a481806` `c2d1f19` `6f32ec0` | Niko1221 | setup / MCP / serve-test polish | **EVALUATING (utility)** | Setup-surface polish; with the next setup pass. |
+
 ---
 
 ## 4. Synchronization Procedure for AGX Maintainers
