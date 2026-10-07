@@ -350,17 +350,28 @@ class ShmConsumer:
         return False
 
     def poll(self):
-        if not self.m:
+        if not self.m or self.m.closed:
+            # the channel's mapping can go stale (the engine re-creates the file at its lazy
+            # concurrent-serve init); a stale mapping must self-heal, never kill the facade's
+            # poll thread mid-run (observed 2026-10-07: ValueError: mmap closed or invalid).
+            self.close()
+            self.open(0.5)
             return
-        head, = struct.unpack_from("<I", self.m, 0)
-        while self.tail < head:
-            idx = self.tail & (self.capacity - 1)
-            off = self.HEADER_SIZE + idx * self.ENTRY_SIZE
-            msg_type, flags, reserved, token, req_id, p_read, p_total = struct.unpack_from(self.ENTRY_FMT, self.m, off)
-            if msg_type != 0:
-                yield (req_id, msg_type, token, p_read, p_total)
-            self.tail += 1
-            struct.pack_into("<I", self.m, 4, self.tail)
+        try:
+            head, = struct.unpack_from("<I", self.m, 0)
+            while self.tail < head:
+                idx = self.tail & (self.capacity - 1)
+                off = self.HEADER_SIZE + idx * self.ENTRY_SIZE
+                msg_type, flags, reserved, token, req_id, p_read, p_total = struct.unpack_from(self.ENTRY_FMT, self.m, off)
+                if msg_type != 0:
+                    yield (req_id, msg_type, token, p_read, p_total)
+                self.tail += 1
+                struct.pack_into("<I", self.m, 4, self.tail)
+        except ValueError:
+            # mmap closed/invalid mid-read: reopen and skip this cycle
+            self.close()
+            self.open(0.5)
+            return
 
     def close(self):
         if self.m:
