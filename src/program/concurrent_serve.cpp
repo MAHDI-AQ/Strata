@@ -1774,7 +1774,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         static bool alt_unit = false;
         const int nanobatch_k = (c.nanobatch >= 2 && c.nanobatch <= 4) ? c.nanobatch : 2;
         core::NanobatchScheduler nanobatch_sched(nanobatch_k);
-        if (overlap && !prev.valid) {
+        if (overlap && !prev.valid && !c.unit_all) {
             size_t eligible = 0;
             for (size_t j = 0; j < m.slots.size(); ++j) {
                 const auto& s = *m.slots[j];
@@ -1794,6 +1794,30 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
         }
 
+        // S27e: optionally hold the boundary briefly for a straggler slot, so the unit can pack two
+        // arrivals (the phase-locked rotation staggers slots ~1 round apart).  Default 0 = off.
+        if (c.unit_wait_ms > 0 && overlap && !prev.valid) {
+            // Only worth waiting when another slot is genuinely mid-flight (a straggler that will
+            // arrive); a lone agent must never pay the wait.  S27e-3 refinement.
+            size_t inflight = 0;
+            for (size_t j = 0; j < m.slots.size(); ++j) {
+                const auto& s = *m.slots[j];
+                if (s.active.load() && s.read.load(std::memory_order_acquire) < s.position.load() &&
+                    s.position.load() < s.max_context && s.generated < s.request.max_new)
+                    ++inflight;
+            }
+            if (inflight > 0) {
+                const auto t_wait = Clock::now();
+                for (;;) {
+                    size_t launchable_now = 0;
+                    for (size_t j = 0; j < m.slots.size(); ++j)
+                        if (slot_launchable(*m.slots[j])) ++launchable_now;
+                    if (launchable_now >= 2) break;
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t_wait).count() >= c.unit_wait_ms) break;
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                }
+            }
+        }
         std::vector<Impl::Slot*> ready;
         std::vector<int> wanted;
         for (size_t j = 0; j < m.slots.size(); ++j) {

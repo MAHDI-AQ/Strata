@@ -13,6 +13,8 @@ struct ConcurrentConfig {
     bool pad_batch = false;
     bool parallel_batch = false;
     int nanobatch = 0;   // Task 8.1: fine-grained micro-partitioning K in [2..4]
+    bool unit_all = false;   // S27e: form ONE unit from ALL eligible slots (skip the micro-batch split)
+    int unit_wait_ms = 0;    // S27e: hold the boundary up to N ms for a straggler slot (packing trade)
     bool depth = false;
     int64_t context = 32768, draft_context = 32768;
     int reserve_mib = 1536, suffix = 0;

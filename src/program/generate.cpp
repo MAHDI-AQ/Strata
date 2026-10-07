@@ -347,6 +347,8 @@ struct Options {
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     int concurrency = 1, batch_rows = 8, concurrent_prefill = 256;
+    bool unit_all = false;   // S27e --unit-slots all
+    int unit_wait_ms = 0;    // S27e --unit-wait-ms
     int batch_graphs = 8;
     int batch_padding = 0;
     int batch_parallel = 0;
@@ -514,6 +516,8 @@ void usage() {
                  "                       waits for the next driver entry and does not overlap at all.\n"
                  "  --no-ple-prefetch     A/B arm: read the PLE table's sixteen rows one at a time, instead of\n"
                  "                       issuing them in one PrefetchVirtualMemory call.\n"
+                 "  --unit-slots split|all  S27e: micro-batch split (default) or one unit from all eligible slots\n"
+                 "  --unit-wait-ms N      S27e: hold the boundary up to N ms for a straggler slot (default 0)\n"
                  "  --expert-cache N     R4: keep N expert blobs resident in VRAM and compute their rows on the\n"
                  "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  Measured at 4096 slots\n"
                  "                       with --expert-cache-per-layer: 54.4%% hits, CPU pool drain 19.1 -> 10.3\n"
@@ -1092,6 +1096,8 @@ int main(int argc, char** argv) {
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--concurrency") o.concurrency = std::atoi(next("--concurrency"));
         else if (a == "--batch-rows") o.batch_rows = std::atoi(next("--batch-rows"));
+        else if (a == "--unit-slots") o.unit_all = (std::string(next("--unit-slots")) == "all");
+        else if (a == "--unit-wait-ms") o.unit_wait_ms = std::atoi(next("--unit-wait-ms"));
         else if (a == "--batch-graphs") o.batch_graphs = std::atoi(next("--batch-graphs"));
         else if (a == "--batch-padding") o.batch_padding = std::atoi(next("--batch-padding"));
         else if (a == "--batch-parallel") o.batch_parallel = std::atoi(next("--batch-parallel"));
@@ -2465,6 +2471,7 @@ int main(int argc, char** argv) {
     if (o.concurrency > 1) {
         strata::program::ConcurrentConfig config;
         config.requests = o.concurrency; config.rows = o.batch_rows; config.depth = o.batch_policy == "depth";
+        config.unit_all = o.unit_all; config.unit_wait_ms = o.unit_wait_ms;
         config.graph_cache = o.batch_graphs;
         config.pad_batch = o.batch_padding != 0;
         config.parallel_batch = o.batch_parallel != 0;
