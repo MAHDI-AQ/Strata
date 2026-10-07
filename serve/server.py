@@ -378,7 +378,9 @@ class ShmConsumer:
             return
 
     def close(self):
-        if self.m:
+        # identity check first - `if self.m:` on a closed mapping raises ValueError via __len__
+        # (this exact line was the real crash site behind the 2026-10-07 facade deaths).
+        if self.m is not None:
             try:
                 self.m.close()
             except Exception:
