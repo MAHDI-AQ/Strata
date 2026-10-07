@@ -1605,8 +1605,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 const int64_t nmax = (int64_t) tokens.size() - 1;
                 if (nmax < 256 || nmax <= best) continue;
                 auto match = radix_tree.match_prefix(tokens.data(), tokens.size());
-                if (match.matched_tokens >= 256 && match.matched_tokens <= nmax && match.matched_tokens > best && match.node) {
-                    best = match.matched_tokens;
+                if (match.matched_tokens >= 256 && match.matched_tokens > best && match.node) {
+                    // the identical-prompt case matches the FULL length; reuse min(matched, nmax)
+                    // so the last token is always re-read (its logits drive the first sample).
+                    best = std::min<int64_t>(match.matched_tokens, nmax);
                     best_node = match.node;
                     pick_q = q;
                 }
