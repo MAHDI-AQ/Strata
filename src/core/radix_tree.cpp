@@ -506,7 +506,10 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
         if (match_edge == edge.size()) {
             matched_len += edge.size();
             curr = child;
-            if (curr->has_snapshot() || curr->has_host_snapshot()) {
+            // P18 L1: a node is fork-usable only when the query extends at least one token past its
+            // coverage (the reused prefix must not pass the query's last index); a shorter hit falls
+            // back to the next-shallower snapshotted ancestor already held in `best`.
+            if ((curr->has_snapshot() || curr->has_host_snapshot()) && (int64_t) n - 1 >= (int64_t) matched_len) {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {
@@ -563,7 +566,10 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
         if (match_edge == edge.size()) {
             matched_len += edge.size();
             curr = child;
-            if (curr->has_snapshot() || curr->has_host_snapshot()) {
+            // P18 L1: a node is fork-usable only when the query extends at least one token past its
+            // coverage (the reused prefix must not pass the query's last index); a shorter hit falls
+            // back to the next-shallower snapshotted ancestor already held in `best`.
+            if ((curr->has_snapshot() || curr->has_host_snapshot()) && (int64_t) n - 1 >= (int64_t) matched_len) {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {

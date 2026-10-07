@@ -201,6 +201,7 @@ struct ConcurrentServe::Impl {
         std::atomic<double> prompt_ms{0};
         Clock::time_point decode_start{};
         int64_t saved_prefix = 0;
+        bool prompt_snap_done = false;   // P18 L1: the prompt-end snapshot was captured this admission
         std::shared_ptr<core::RadixNode> radix_node = nullptr;
         std::vector<int32_t> saved_consumed;
         ~Slot() {
@@ -973,6 +974,21 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         pending_snapshots.clear();
     };
+    // P18 L1: capture the prompt-end state (state@position - exactly where the first verify window
+    // opens) for every slot whose prefill just completed.  With the sound gate in place, an
+    // identical or longer resend of the same prompt then forks at `position` and runs only the
+    // window - the serial path's own first-window shape.  Runs in the same safe-point envelope as
+    // flush_pending_snapshots; the one-per-admission flag keeps it single-shot.
+    auto capture_prompt_end_snapshots = [&]() {
+        for (auto& ptr : m.slots) {
+            auto& s = *ptr;
+            if (!s.active.load() || !s.first || s.prompt_snap_done) continue;
+            const int64_t pos = s.position.load();
+            if (pos < 256 || (int64_t) s.consumed.size() != pos) continue;
+            s.prompt_snap_done = true;
+            save_slot_snapshot(s, pos, s.consumed);
+        }
+    };
     auto finish = [&](Impl::Slot& s, const char* reason) {
         const bool defer_snapshot = defer_snapshots;
         if (!defer_snapshot) save_slot_snapshot(s, (int64_t) s.consumed.size(), s.consumed);
@@ -1403,6 +1419,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         s.position.store((int64_t) s.request.tokens.size() - 1);
         s.current = (int32_t) s.request.tokens.back();
         s.reused_prefix = reused;
+        s.prompt_snap_done = false;
         if (retain) s.session = s.request.session;   // D1: keep the slot's conversation key current
         if (reused == 0) s.consumed.clear();
         std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
@@ -1738,6 +1755,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         if (!(overlap && prev.valid)) {   // nothing in flight: the input side runs now (the original position)
             flush_pending_snapshots();
+            capture_prompt_end_snapshots();
             if (service_input(quit)) return 1;
             input_done = true;
             if (quit) break;
@@ -1987,7 +2005,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
                     return 1;
                 }
-                if (!input_done) { flush_pending_snapshots(); if (service_input(quit)) return 1; input_done = true; }
+                if (!input_done) { flush_pending_snapshots(); capture_prompt_end_snapshots(); if (service_input(quit)) return 1; input_done = true; }
                 if (!quit) {
                     // Launch U_i's stage-1 pass, gated on ITS stage-0 completion event ONLY.  The
                     // stage>=1 plan sinks are refreshed here: the pool routes by layer through
@@ -2047,7 +2065,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
                 return 1;
             }
-            if (!input_done) { flush_pending_snapshots(); if (service_input(quit)) return 1; input_done = true; }
+            if (!input_done) { flush_pending_snapshots(); capture_prompt_end_snapshots(); if (service_input(quit)) return 1; input_done = true; }
             ++rounds;
             core::progress_beat();
             if (adaptive && rounds % c.adapt_every == 0) {
