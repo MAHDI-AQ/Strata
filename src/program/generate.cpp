@@ -2222,7 +2222,11 @@ int main(int argc, char** argv) {
         const int64_t conc_slot_mib = (concurrent == nullptr) ? (int64_t) (lazy_slots ? std::max(2, o.concurrency - 2) : o.concurrency) * 256 : 0;
         const int64_t extra_drafters_mib = (later && o.concurrency > 1 && concurrent == nullptr) ? (int64_t) (o.concurrency - 1) * 104 : 0;
         const int64_t conc_ws_mib = (later && o.concurrency > 1 && o.concurrent_prefill > 0 && concurrent == nullptr) ? 1986 : 0;
-        const int64_t conc_graphs_mib = (later && o.concurrency > 1) ? (int64_t) std::max(8, o.batch_graphs) * 16 : 0;
+        // 3x262K fix v4: the later stage's verify-graph buffers are ~4x the old 16 MiB/graph
+        // estimate at three concurrent slots (measured: the 3rd slot's graphs left CUDA1 13 MiB
+        // short of its reserve); the stage cache pays ~750 MiB for the third long-context
+        // admission to fit.
+        const int64_t conc_graphs_mib = (later && o.concurrency > 1) ? (int64_t) std::max(8, o.batch_graphs) * 64 : 0;
         const int64_t concurrency_mib = (later && o.concurrency > 1) ? 512 + conc_slot_mib + extra_drafters_mib +
             conc_ws_mib + conc_graphs_mib + (int64_t) o.batch_rows * 8 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib : 0) +
@@ -2620,7 +2624,9 @@ int main(int argc, char** argv) {
         // occupancy: measured need 7x(104+149)+890 = 2661 MiB against 2844 MiB reserved at c8).
         // sessions are already allocated in prepare() before this sizing:
         const int64_t conc_slot_mib = 0;
-        const int64_t concurrent_mib = concurrent ? 512 + conc_slot_mib +
+        // the graph-fix landing: +192 MiB margin - the third slot's graphs need real headroom
+        // at three parallel long prefills (measured 2026-10-07; the cache pays ~100 slots).
+        const int64_t concurrent_mib = concurrent ? 512 + 192 + conc_slot_mib +
             (int64_t) o.batch_rows * 8 + (int64_t) o.batch_graphs * 16 : 0;
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)

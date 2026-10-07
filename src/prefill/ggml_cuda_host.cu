@@ -113,9 +113,16 @@ const ggml_cuda_device_info & ggml_cuda_info() {
     return info;
 }
 
+// graph-OOM fix: a process-wide flush of every CachingPool's unused buffers - the graph
+// instantiate's OOM path frees real VRAM here (~10 MB needed at the peak; the pools hold the
+// surplus). The pool lives in the anonymous namespace below; this trampoline has C linkage.
+static void (*g_pool_flush_fn)() = nullptr;
+extern "C" void strata_mmq_pool_flush_all() { if (g_pool_flush_fn) g_pool_flush_fn(); }
+
 namespace {
 // Buffers are kept and reused: MMQ asks for the same few sizes every launch (its stream-k fixup tiles).
 struct CachingPool : ggml_cuda_pool {
+    CachingPool() { std::lock_guard<std::mutex> lk(g_reg_mu); g_pools.push_back(this); }
     struct Buf { void * p; size_t size; bool used; };
     std::vector<Buf> bufs;
     std::mutex mu;
@@ -124,10 +131,25 @@ struct CachingPool : ggml_cuda_pool {
         for (auto & b : bufs)
             if (!b.used && b.size >= size) { b.used = true; *actual_size = b.size; return b.p; }
         void * p = nullptr;
-        CUDA_CHECK(cudaMalloc(&p, size));
+        if (cudaMalloc(&p, size) != cudaSuccess) {
+            // 3x262K fix: under pressure release the pool's UNUSED buffers and retry once -
+            // the pool kept every distinct scratch size forever ("kept and reused"), which
+            // is what starved the 3-slot concurrent long-prefill peak (the engine died here).
+            cudaGetLastError();
+            for (auto it = bufs.begin(); it != bufs.end(); ) {
+                if (!it->used) { cudaFree(it->p); it = bufs.erase(it); } else ++it;
+            }
+            if (cudaMalloc(&p, size) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+        }
         bufs.push_back({p, size, true});
         *actual_size = size;
         return p;
+    }
+    void flush_unused() {
+        std::lock_guard<std::mutex> lk(mu);
+        for (auto it = bufs.begin(); it != bufs.end(); ) {
+            if (!it->used) { cudaFree(it->p); it = bufs.erase(it); } else ++it;
+        }
     }
     void free(void * ptr, size_t) override {
         std::lock_guard<std::mutex> lk(mu);
@@ -135,9 +157,25 @@ struct CachingPool : ggml_cuda_pool {
             if (b.p == ptr) { b.used = false; return; }
     }
     ~CachingPool() override {
+        { std::lock_guard<std::mutex> lk(g_reg_mu);
+          for (auto it = g_pools.begin(); it != g_pools.end(); ++it)
+              if (*it == this) { g_pools.erase(it); break; } }
         for (auto & b : bufs) cudaFree(b.p);
     }
+    static std::mutex g_reg_mu;
+    static std::vector<CachingPool*> g_pools;
+    static void flush_all() {
+        std::lock_guard<std::mutex> lk(g_reg_mu);
+        for (auto* p : g_pools) p->flush_unused();
+    }
 };
+
+std::mutex CachingPool::g_reg_mu;
+std::vector<CachingPool*> CachingPool::g_pools;
+}  // namespace
+
+namespace {
+struct FlushReg { FlushReg() { g_pool_flush_fn = &CachingPool::flush_all; } } g_flush_reg;
 }  // namespace
 
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int, int) {

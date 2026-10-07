@@ -1196,6 +1196,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 // lookup/capture.  run_batch (serial) and begin_pass_batch (stage-pipeline overlap) both call
 // it; they differ only in what they do with the captured graph (run it here, or launch it as a
 // pass and service it from drive_passes).
+// graph-OOM fix: the MMQ pools' flush (defined in ggml_cuda_host.cu with C linkage)
+extern "C" void strata_mmq_pool_flush_all();
+
 bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
                              std::vector<std::pair<Verifier*, int>>& shape, cudaGraphExec_t& graph_exec,
                              std::string& err) {
@@ -1461,7 +1464,24 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
             }
 #endif
         }
-        const cudaError_t instantiate = cudaGraphInstantiate(&graph_exec, graph, 0);
+        cudaError_t instantiate = cudaGraphInstantiate(&graph_exec, graph, 0);
+        if (instantiate == cudaErrorMemoryAllocation) {
+            // graph-OOM fix v1: free the MMQ pools' unused scratch and retry once - the instantiate
+            // needs only a few MB, the pools hold the surplus (measured 2026-10-07).
+            strata_mmq_pool_flush_all();
+            cudaGetLastError();
+            instantiate = cudaGraphInstantiate(&graph_exec, graph, 0);
+        }
+        if (instantiate != cudaSuccess) {
+            // graph-fix S1: name the real cause (the boolean alone hid it for the 12288 breach
+            // and the 3x262K load alike)
+            size_t n_nodes = 0, n_edges = 0;
+            cudaGraphGetNodes(graph, nullptr, &n_nodes);
+            cudaGraphGetEdges(graph, nullptr, nullptr, &n_edges);
+            std::fprintf(stderr, "batch verify: graph instantiation failed: %s (nodes=%zu edges=%zu "
+                                 "lb=%lld le=%lld)\n",
+                         cudaGetErrorString(instantiate), n_nodes, n_edges, (long long) lb_, (long long) le_);
+        }
         cudaGraphDestroy(graph);
         if (instantiate != cudaSuccess) { err = "batch verify: graph instantiation failed"; return false; }
         if (cudaGraphUpload(graph_exec, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
@@ -1496,6 +1516,16 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
         if (test_refuse_list != nullptr) {
             const std::string list = std::string(",") + test_refuse_list + ",";
             test_refuse = list.find("," + std::to_string(test_capture_ordinal) + ",") != std::string::npos;
+        }
+        if (free_bytes < reserve_bytes) {
+            // graph-OOM fix v2: the guard needs only ~16 MiB; the MMQ pools hold surplus scratch
+            // (their unused buffers), so flush them and re-read before refusing a request the box
+            // can actually hold (measured: the 3rd slot failed at 11 MiB of 16).
+            strata_mmq_pool_flush_all();
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+                cudaGraphExecDestroy(graph_exec);
+                err = "batch verify: cannot query free VRAM"; return false;
+            }
         }
         if (free_bytes < reserve_bytes || test_refuse) {
             if (test_refuse)
