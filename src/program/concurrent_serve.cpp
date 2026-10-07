@@ -909,10 +909,15 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // wedge; gdb: evict_lru_locked -> park_to_host -> cudaFree under retire_unit).  Snapshots taken
     // while the overlap loop runs are queued here and flushed at the safe points below, strictly
     // before every admission (service_input), where nothing is in flight.
+    // Snapshot size ceiling: a capture copies the session's full QSA KV (multi-GB at 254K-class)
+    // and evictions can park those copies to pinned host RAM; the 3x254K acceptance host-OOM'd
+    // once with captures on (2026-10-07).  Prompts above the ceiling stay capture-free (the
+    // pre-capture memory profile), which is the acceptance's own shape.
+    constexpr int64_t kSnapshotMaxPrefixTokens = 131072;
     std::vector<Impl::Slot*> pending_snapshots;
     bool defer_snapshots = false;   // set from the overlap gate below (finish() is defined earlier)
     auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens) {
-        if (prefix_len < 256 || tokens.size() < (size_t) prefix_len) return;
+        if (prefix_len < 256 || prefix_len > kSnapshotMaxPrefixTokens || tokens.size() < (size_t) prefix_len) return;
         s.saved_prefix = prefix_len;
         s.saved_consumed.assign(tokens.begin(), tokens.begin() + prefix_len);
         for (size_t st = 0; st < m.stages.size(); ++st) {
