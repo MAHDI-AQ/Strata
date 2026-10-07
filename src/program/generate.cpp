@@ -2540,7 +2540,13 @@ int main(int argc, char** argv) {
         // Unregistered layers remain in the resident arena and use the CPU expert path.
         // (a layer split across GPUs too: pinning all of it into two contexts leaves WDDM refusing every later
         // allocation - measured on the 5080 + 3090 rig: cudaMemGetInfo and the next cudaMalloc fail)
-        const uint64_t pin_limit = (o.expert_cache_remote[0] > 0 || multi_gpu) ? (8ull << 30) : 0;
+        // P22 slice 1 (STRATA_PIN_LIMIT_GIB, default 8 = the historical WDDM-era guard; the Linux
+        // box has no WDDM: measured 8/16/24 GiB = streaming p50 583/470/391 ms, timeline 1877/1694/1566).
+        static const uint64_t pin_gib = [] {
+            const char* v = std::getenv("STRATA_PIN_LIMIT_GIB");
+            return (uint64_t) ((v != nullptr && std::atof(v) > 0) ? std::atof(v) : 8.0);
+        }();
+        const uint64_t pin_limit = (o.expert_cache_remote[0] > 0 || multi_gpu) ? (pin_gib << 30) : 0;
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
