@@ -334,6 +334,8 @@ class ShmConsumer:
 
     def open(self, timeout_s: float = 5.0) -> bool:
         deadline = time.monotonic() + timeout_s
+        self.fd = -1
+        self.m = None
         while time.monotonic() < deadline:
             if os.path.exists(self.path):
                 try:
@@ -350,7 +352,9 @@ class ShmConsumer:
         return False
 
     def poll(self):
-        if not self.m or self.m.closed:
+        # NOTE: `not self.m` on a CLOSED mmap raises ValueError (bool falls back to __len__),
+        # so the identity check must come first (learned the hard way, 2026-10-07).
+        if self.m is None or self.m.closed:
             # the channel's mapping can go stale (the engine re-creates the file at its lazy
             # concurrent-serve init); a stale mapping must self-heal, never kill the facade's
             # poll thread mid-run (observed 2026-10-07: ValueError: mmap closed or invalid).
