@@ -1605,9 +1605,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 const int64_t nmax = (int64_t) tokens.size() - 1;
                 if (nmax < 256 || nmax <= best) continue;
                 auto match = radix_tree.match_prefix(tokens.data(), tokens.size());
-                if (match.matched_tokens >= 256 && match.matched_tokens > best && match.node) {
-                    // the identical-prompt case matches the FULL length; reuse min(matched, nmax)
-                    // so the last token is always re-read (its logits drive the first sample).
+                // P18 sound gate: a snapshot's captured state covers its node's FULL range, so a
+                // reuse at a shorter prefix would stamp the post-capture recurrent/PLE state onto a
+                // shallower context (the traced resume-shape divergence); a zero-tail read has no
+                // first window.  Accept only full-coverage matches with the query at least one
+                // token longer (nmax >= matched); everything else stays a miss (cold, bit-exact).
+                const bool p18f_full = match.node && match.matched_tokens == match.node->prefix_len;
+                if (p18f_full && match.matched_tokens >= 256 && match.matched_tokens > best && nmax >= match.matched_tokens) {
                     best = std::min<int64_t>(match.matched_tokens, nmax);
                     best_node = match.node;
                     pick_q = q;
