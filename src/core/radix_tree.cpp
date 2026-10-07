@@ -82,6 +82,51 @@ void RadixNode::free_host() {
     is_host_parked = false;
 }
 
+bool RadixNode::unpark_to_device() {
+    if (!is_host_parked || stage_host_snapshots.empty()) return false;
+    stage_snapshots.resize(stage_host_snapshots.size());
+    for (size_t st = 0; st < stage_host_snapshots.size(); ++st) {
+        auto& hss = stage_host_snapshots[st];
+        auto& ss = stage_snapshots[st];
+        ss.device = hss.device;
+        ss.ple_prev_saved[0] = hss.ple_prev_saved[0];
+        ss.ple_prev_saved[1] = hss.ple_prev_saved[1];
+        ss.ple_token_saved = hss.ple_token_saved;
+        ss.qsa_ord0 = hss.qsa_ord0;
+        ss.qsa_alloc = hss.qsa_alloc;
+        if (ss.device < 0) continue;
+        const core::OnDevice on(ss.device);
+        auto up = [](PinnedBuffer& h, void** d, size_t& bytes) {
+            if (h.empty()) return;
+            bytes = h.size();
+            if (cudaMalloc(d, bytes) != cudaSuccess) { *d = nullptr; bytes = 0; return; }
+            cudaMemcpy(*d, h.data(), bytes, cudaMemcpyHostToDevice);
+        };
+        up(hss.gdn_data, (void**) &ss.gdn_saved, ss.gdn_bytes);
+        up(hss.ple_data, (void**) &ss.ple_saved, ss.ple_bytes);
+        up(hss.R_data, (void**) &ss.R_saved, ss.R_bytes);
+        ss.qsa_slices.resize(hss.qsa_slices.size());
+        for (size_t j = 0; j < hss.qsa_slices.size(); ++j) {
+            auto& hs = hss.qsa_slices[j];
+            auto& ds = ss.qsa_slices[j];
+            up(hs.k_q, &ds.k_q, ds.k_bytes);
+            up(hs.v_q4, &ds.v_q4, ds.v_bytes);
+            up(hs.k_scale, &ds.k_scale, ds.k_scale_bytes);
+            up(hs.v_scale, &ds.v_scale, ds.v_scale_bytes);
+            up(hs.idx_tail, &ds.idx_tail, ds.idx_tail_bytes);
+            up(hs.idx_dead, &ds.idx_dead, ds.idx_dead_bytes);
+            up(hs.idx_pooled, &ds.idx_pooled, ds.idx_pooled_bytes);
+            if (hs.has_idx_block_pos) {
+                if (cudaMalloc((void**) &ds.idx_block_pos, sizeof(int32_t)) == cudaSuccess) {
+                    cudaMemcpy(ds.idx_block_pos, &hs.idx_block_pos_val, sizeof(int32_t), cudaMemcpyHostToDevice);
+                }
+            }
+        }
+    }
+    is_host_parked = false;
+    return true;
+}
+
 void RadixNode::park_to_host() {
     if (stage_snapshots.empty()) return;
     stage_host_snapshots.resize(stage_snapshots.size());
@@ -461,10 +506,15 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
         if (match_edge == edge.size()) {
             matched_len += edge.size();
             curr = child;
-            if (curr->has_snapshot()) {
+            if (curr->has_snapshot() || curr->has_host_snapshot()) {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {
+            // P18 fix: a query that ENDS INSIDE an edge is a valid prefix hit (the stored edge is a
+            // longer sequence - e.g. prompt+reply - and the query is a strict prefix of it).
+            if (match_edge == max_comp && match_edge > 0 && child->has_snapshot()) {
+                best = RadixMatch{child, (int64_t) (matched_len + match_edge)};
+            }
             break;
         }
     }
@@ -513,10 +563,15 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
         if (match_edge == edge.size()) {
             matched_len += edge.size();
             curr = child;
-            if (curr->has_snapshot()) {
+            if (curr->has_snapshot() || curr->has_host_snapshot()) {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {
+            // P18 fix: a query that ENDS INSIDE an edge is a valid prefix hit (the stored edge is a
+            // longer sequence - e.g. prompt+reply - and the query is a strict prefix of it).
+            if (match_edge == max_comp && match_edge > 0 && child->has_snapshot()) {
+                best = RadixMatch{child, (int64_t) (matched_len + match_edge)};
+            }
             break;
         }
     }
@@ -762,6 +817,9 @@ bool RadixTree::fork_to_session(
     std::string& err) {
 
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    if (node && !node->has_snapshot() && node->has_host_snapshot()) {
+        node->unpark_to_device();   // P18/P20: an L2-host-parked node restores before the fork
+    }
     if (!node || !node->has_snapshot()) {
         err = "radix_fork: node has no snapshot";
         return false;

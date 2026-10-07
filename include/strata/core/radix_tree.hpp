@@ -239,6 +239,8 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
     size_t total_host_bytes() const;
     size_t total_l3_bytes() const { return l3_bytes; }
     void park_to_host();
+    /// P18/P20: the park's inverse - restore the device snapshot from the host copy (the L2 hit path).
+    bool unpark_to_device();
     bool offload_to_nvme(class NVMeStorageTier& nvme);
     bool hydrate_from_nvme(class NVMeStorageTier& nvme);
     void free_device();
