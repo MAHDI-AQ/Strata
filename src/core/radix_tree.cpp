@@ -513,11 +513,11 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {
-            // P18 fix: a query that ENDS INSIDE an edge is a valid prefix hit (the stored edge is a
-            // longer sequence - e.g. prompt+reply - and the query is a strict prefix of it).
-            if (match_edge == max_comp && match_edge > 0 && child->has_snapshot()) {
-                best = RadixMatch{child, (int64_t) (matched_len + match_edge)};
-            }
+            // P18: a query that ends INSIDE an edge is NOT fork-usable: the hit node's captured
+            // state covers its full range (past the query end), so reuse would stamp a
+            // post-capture state onto a shallower context (the resume-shape class).  The
+            // full-edge arrivals and the prompt-end (L1) nodes carry every sound lane; record
+            // nothing here (the unusable deeper hit would shadow the valid shallower node).
             break;
         }
     }
@@ -573,11 +573,11 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {
-            // P18 fix: a query that ENDS INSIDE an edge is a valid prefix hit (the stored edge is a
-            // longer sequence - e.g. prompt+reply - and the query is a strict prefix of it).
-            if (match_edge == max_comp && match_edge > 0 && child->has_snapshot()) {
-                best = RadixMatch{child, (int64_t) (matched_len + match_edge)};
-            }
+            // P18: a query that ends INSIDE an edge is NOT fork-usable: the hit node's captured
+            // state covers its full range (past the query end), so reuse would stamp a
+            // post-capture state onto a shallower context (the resume-shape class).  The
+            // full-edge arrivals and the prompt-end (L1) nodes carry every sound lane; record
+            // nothing here (the unusable deeper hit would shadow the valid shallower node).
             break;
         }
     }
