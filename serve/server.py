@@ -1877,6 +1877,9 @@ class Service:
                                     if thought >= budget and not parser.buf and not detok.pending():
                                         wrap = True
                                         break
+                            else:                       # the engine's stream ended on its own: a natural
+                                #                     stop (an EOS the engine consumed) unless the budget ran out
+                                finish = "length" if n >= max_new else "stop"
                         except EngineDied as e:
                             finish = "error"
                             self._say_died(e)
