@@ -463,6 +463,10 @@ RadixTree::RadixTree(size_t max_cached_snapshots, size_t max_host_snapshots)
     if (env_l2) {
         max_host_snapshots_ = (size_t) std::strtoul(env_l2, nullptr, 10);
     }
+    const char* env_vb = std::getenv("STRATA_RADIX_VRAM_MIB");
+    if (env_vb && *env_vb) {
+        vram_budget_ = (size_t) std::strtoul(env_vb, nullptr, 10) << 20;
+    }
     root_ = std::make_shared<RadixNode>();
     root_->id = 0;
     root_->prefix_len = 0;
@@ -471,6 +475,45 @@ RadixTree::RadixTree(size_t max_cached_snapshots, size_t max_host_snapshots)
 }
 
 RadixTree::~RadixTree() = default;
+
+// S26f: total device-snapshot bytes across the tree (walk; trees are small).
+size_t RadixTree::device_snapshot_bytes_locked() const {
+    size_t total = 0;
+    std::vector<std::shared_ptr<RadixNode>> stack;
+    stack.push_back(root_);
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        for (auto& ss : node->stage_snapshots) {
+            total += ss.gdn_bytes + ss.ple_bytes + ss.R_bytes;
+            for (auto& sl : ss.qsa_slices) {
+                total += sl.k_bytes + sl.v_bytes + sl.k_scale_bytes + sl.v_scale_bytes
+                       + sl.idx_tail_bytes + sl.idx_dead_bytes + sl.idx_pooled_bytes;
+            }
+        }
+        for (auto& kv : node->children) stack.push_back(kv.second);
+    }
+    return total;
+}
+
+size_t RadixTree::device_snapshot_bytes() const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    return device_snapshot_bytes_locked();
+}
+
+// S26f: evict (LRU, parking to host first) until the budget can hold `need_bytes`.
+size_t RadixTree::evict_to_budget(size_t need_bytes) {
+    size_t evicted = 0;
+    if (vram_budget_ == 0) return 0;
+    while (device_snapshot_bytes_locked() + need_bytes > vram_budget_) {
+        const size_t before = cached_snapshots_;
+        evict_lru_locked(before > 0 ? before - 1 : 0);
+        if (cached_snapshots_ >= before) break;
+        ++evicted;
+    }
+    return evicted;
+}
 
 RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
@@ -592,7 +635,8 @@ std::shared_ptr<RadixNode> RadixTree::insert(
     const std::vector<const SessionState*>& states,
     const std::vector<const float*>& R_ptrs,
     const ModelGeometry& g,
-    const std::vector<void*>& streams) {
+    const std::vector<void*>& streams,
+    bool safe_no_evict) {
 
     if (prefix_len < 256 || (size_t) prefix_len > n ||
         states.size() != stage_devices.size() || streams.size() != stage_devices.size()) {
@@ -671,6 +715,44 @@ std::shared_ptr<RadixNode> RadixTree::insert(
     }
 
     curr->last_accessed = std::chrono::steady_clock::now();
+
+    // S26f: byte-budget the device snapshot tier. Estimate the capture size; evict LRU (park to
+    // host) until it fits; if it still cannot fit, keep the path but refuse the capture (a clean
+    // skip beats a silent partial allocation against the VRAM margin).
+    if (!curr->has_snapshot() && vram_budget_ > 0) {
+        size_t est = 0;
+        strata::kernels::QsaShapes qs_e = strata::kernels::qsa_real_shapes();
+        qs_e.n_head = g.n_head; qs_e.n_head_kv = g.n_head_kv; qs_e.head_dim = g.head_dim;
+        const int64_t pages_e = ((int64_t) prefix_len + qs_e.page_size - 1) / qs_e.page_size;
+        const size_t qsa_rows_e = (size_t) pages_e * qs_e.n_head_kv * qs_e.page_size;
+        for (size_t st = 0; st < stage_devices.size(); ++st) {
+            const auto* s_e = states[st];
+            if (!s_e) continue;
+            est += (size_t) s_e->qsa_alloc * 2 * qsa_rows_e * strata::kernels::kv_q4_bytes_per_head((int) qs_e.head_dim);
+            est += (size_t) core::ple_hist_bytes() + (size_t) g.hc * g.n_embd * sizeof(float);
+            if (s_e->gdn_alloc > 0) est += (size_t) s_e->gdn_alloc * core::gdn_state_floats(g) * sizeof(float);
+        }
+        if (est > vram_budget_) {
+            if (std::getenv("STRATA_S26F_LOG"))
+                std::fprintf(stderr, "S26F capture REFUSED(oversize): prefix=%lld est=%zu budget=%zu\n",
+                            (long long) prefix_len, est, vram_budget_);
+            return curr;   // S26f3: never evict working captures for one that cannot fit at all
+        }
+        if (est > 0 && device_snapshot_bytes_locked() + est > vram_budget_) {
+            const size_t before_ev = device_snapshot_bytes_locked();
+            if (!safe_no_evict) evict_to_budget(est);   // S26f7: safe inserts defer eviction to flush points
+            if (device_snapshot_bytes_locked() + est > vram_budget_) {
+                if (std::getenv("STRATA_S26F_LOG"))
+                    std::fprintf(stderr, "S26F capture REFUSED: prefix=%lld est=%zu bytes=%zu(was %zu) budget=%zu\n",
+                                (long long) prefix_len, est, device_snapshot_bytes_locked(),
+                                before_ev, vram_budget_);
+                return curr;   // S26f: budget refusal - path kept, capture skipped
+            }
+        } else if (std::getenv("STRATA_S26F_LOG")) {
+            std::fprintf(stderr, "S26F capture ADMIT: prefix=%lld est=%zu bytes=%zu budget=%zu\n",
+                        (long long) prefix_len, est, device_snapshot_bytes_locked(), vram_budget_);
+        }
+    }
 
     if (!curr->has_snapshot()) {
         const size_t n_stages = stage_devices.size();
@@ -799,8 +881,35 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             const core::OnDevice on(stage_devices[st]);
             cudaStreamSynchronize((cudaStream_t) streams[st]);
         }
+        // S26f: verify the capture actually landed (cudaMalloc OOMs are otherwise silent here).
+        // A failed capture frees its partial allocations and leaves the path snapshot-less.
+        bool snap_ok = true;
+        for (size_t st = 0; st < n_stages && snap_ok; ++st) {
+            auto& ss = curr->stage_snapshots[st];
+            const auto* s = states[st];
+            if (!s) continue;
+            if (s->gdn_alloc > 0 && s->gdn_state && !ss.gdn_saved) snap_ok = false;
+            if (s->ple_hist && !ss.ple_saved) snap_ok = false;
+            for (int64_t j = 0; j < s->qsa_alloc && snap_ok; ++j) {
+                const QsaState& qst = s->qsa_states[s->qsa_ord0 + j];
+                auto& sl = ss.qsa_slices[j];
+                if ((qst.k_q4 || qst.k_q) && !sl.k_q) snap_ok = false;
+                if ((qst.v_q4 || qst.v_q) && !sl.v_q4) snap_ok = false;
+            }
+        }
+        if (!snap_ok) {
+            if (std::getenv("STRATA_S26F_LOG"))
+                std::fprintf(stderr, "S26F capture FAILED: prefix=%lld (alloc failure; freed partial)\n",
+                            (long long) prefix_len);
+            for (auto& ss2 : curr->stage_snapshots) ss2.free_device();
+            curr->stage_snapshots.clear();
+            return curr;   // S26f: failed capture -> path only, never a broken snapshot
+        }
+        if (std::getenv("STRATA_S26F_LOG"))
+            std::fprintf(stderr, "S26F capture OK: prefix=%lld node=%lld bytes_now=%zu\n",
+                        (long long) prefix_len, (long long) curr->id, device_snapshot_bytes_locked());
         ++cached_snapshots_;
-        evict_lru_locked(max_cached_snapshots_);
+        if (!safe_no_evict) evict_lru_locked(max_cached_snapshots_);   // S26f7
     }
     return curr;
 }

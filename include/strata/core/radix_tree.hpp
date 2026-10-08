@@ -273,7 +273,8 @@ public:
         const std::vector<const SessionState*>& states,
         const std::vector<const float*>& R_ptrs,
         const ModelGeometry& g,
-        const std::vector<void*>& streams);
+        const std::vector<void*>& streams,
+        bool safe_no_evict = false);
 
     std::shared_ptr<RadixNode> insert(
         const std::vector<int32_t>& tokens,
@@ -282,8 +283,9 @@ public:
         const std::vector<const SessionState*>& states,
         const std::vector<const float*>& R_ptrs,
         const ModelGeometry& g,
-        const std::vector<void*>& streams) {
-        return insert(tokens.data(), tokens.size(), prefix_len, stage_devices, states, R_ptrs, g, streams);
+        const std::vector<void*>& streams,
+        bool safe_no_evict = false) {
+        return insert(tokens.data(), tokens.size(), prefix_len, stage_devices, states, R_ptrs, g, streams, safe_no_evict);
     }
 
     void acquire(const std::shared_ptr<RadixNode>& node);
@@ -307,6 +309,11 @@ public:
     void set_nvme_tier(std::shared_ptr<class NVMeStorageTier> nvme) { nvme_tier_ = nvme; }
     std::shared_ptr<class NVMeStorageTier> nvme_tier() const { return nvme_tier_; }
 
+    /// S26f: byte budget for the device snapshot tier (deep captures coexist instead of failing silently).
+    void set_vram_budget(size_t bytes) { vram_budget_ = bytes; }
+    size_t vram_budget() const { return vram_budget_; }
+    size_t device_snapshot_bytes() const;
+
     size_t cached_snapshot_count() const { return cached_snapshots_; }
     size_t cached_host_snapshot_count() const { return cached_host_snapshots_; }
     size_t cached_nvme_snapshot_count() const { return cached_nvme_snapshots_; }
@@ -323,6 +330,10 @@ private:
     size_t cached_nvme_snapshots_ = 0;
     size_t node_count_ = 0;
     int64_t next_node_id_ = 1;
+    size_t vram_budget_ = (size_t) 768 << 20;   // S26f: device snapshot byte budget (STRATA_RADIX_VRAM_MIB)
+
+    size_t device_snapshot_bytes_locked() const;
+    size_t evict_to_budget(size_t need_bytes);
 
     void collect_unreferenced_leaves(
         const std::shared_ptr<RadixNode>& curr,

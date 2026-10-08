@@ -916,7 +916,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     constexpr int64_t kSnapshotMaxPrefixTokens = 131072;
     std::vector<Impl::Slot*> pending_snapshots;
     bool defer_snapshots = false;   // set from the overlap gate below (finish() is defined earlier)
-    auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens) {
+    bool pipeline_in_flight = true; // S26f3: maintained by the round loop; gates admission-time flushes
+    auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens, bool safe_no_evict = false) {
         if (prefix_len < 256 || prefix_len > kSnapshotMaxPrefixTokens || tokens.size() < (size_t) prefix_len) return;
         s.saved_prefix = prefix_len;
         s.saved_consumed.assign(tokens.begin(), tokens.begin() + prefix_len);
@@ -964,8 +965,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             r_R.push_back(s.stages[st].R_saved ? s.stages[st].R_saved : s.stages[st].state->block.R);
             r_streams.push_back((void*) m.stage_rt[st].prompt_stream);
         }
-        radix_tree.evict_lru(radix_slots);
-        auto r_node = radix_tree.insert(tokens.data(), tokens.size(), prefix_len, r_devs, r_states, r_R, g, r_streams);
+        if (!safe_no_evict) radix_tree.evict_lru(radix_slots);   // S26f7
+        auto r_node = radix_tree.insert(tokens.data(), tokens.size(), prefix_len, r_devs, r_states, r_R, g, r_streams, safe_no_evict);
         if (r_node) {
             if (s.radix_node && s.radix_node != r_node) radix_tree.release(s.radix_node);
             s.radix_node = r_node;
@@ -989,9 +990,15 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             auto& s = *ptr;
             if (!s.active.load() || !s.first || s.prompt_snap_done) continue;
             const int64_t pos = s.position.load();
-            if (pos < 256 || (int64_t) s.consumed.size() != pos) continue;
+            const int64_t n = (int64_t) s.consumed.size();
+            // S26f9: end-append prompts re-tokenize at the junction, so a snapshot at the very end
+            // is unusable for the next (appended) turn.  Capture the deepest real state below the
+            // end instead: either exactly at the end (small prompts) or the last pre-end state
+            // (within the final prefill chunk).  The state is copied NOW, so its position is real.
+            if (n < 256 || n > pos) continue;
+            if (n != pos && (pos - n) > 6208) continue;
             s.prompt_snap_done = true;
-            save_slot_snapshot(s, pos, s.consumed);
+            save_slot_snapshot(s, n, s.consumed, /*safe_no_evict=*/true);   // S26f7/S26f9
         }
     };
     auto finish = [&](Impl::Slot& s, const char* reason) {
@@ -1552,6 +1559,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         const bool admitting = !pending.empty() &&
             std::any_of(m.slots.begin(), m.slots.end(), [](const auto& ptr) { return !ptr->active.load(); });
         if (admitting && !pump_fence()) return 1;
+        // S26f3: flush deferred radix captures strictly before every admission (the design intent;
+        // continuous traffic previously never reached the loop's input-side flush). Safe: the pump
+        // fence just ran and the overlap pipeline is drained (pipeline_in_flight false).
+        if (admitting && !pipeline_in_flight) {
+            flush_pending_snapshots();
+            capture_prompt_end_snapshots();
+        }
         // P4 live retention (retain): the slot's `consumed` IS the conversation its sessions hold (the
         // invariant every writer keeps - see the Slot comment). A queued request whose prompt starts
         // with a slot's FULL retained history, and is longer than it, continues that slot with no
@@ -1627,6 +1641,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 const int64_t nmax = (int64_t) tokens.size() - 1;
                 if (nmax < 256 || nmax <= best) continue;
                 auto match = radix_tree.match_prefix(tokens.data(), tokens.size());
+                if (std::getenv("STRATA_S26F_LOG"))
+                    std::fprintf(stderr, "S26F match: qlen=%zu matched=%lld node=%lld nodecov=%lld\n",
+                                 tokens.size(), (long long) match.matched_tokens,
+                                 match.node ? (long long) match.node->id : -1LL,
+                                 match.node ? (long long) match.node->prefix_len : -1LL);
                 // P18 sound gate: a snapshot's captured state covers its node's FULL range, so a
                 // reuse at a shorter prefix would stamp the post-capture recurrent/PLE state onto a
                 // shallower context (the traced resume-shape divergence); a zero-tail read has no
@@ -1747,6 +1766,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     bool quitting = false;
     while (!quitting) {
         bool quit = false, input_done = false;
+        capture_prompt_end_snapshots();   // S26f7: per-round L1 scan (safe insert; evictions deferred to flush points)
         core::progress().busy.store(!live.empty());
         // LANE overlap-width (merged drain): when the in-flight unit owns every slot that could
         // launch, retire it HERE and fall through - the successor unit is built and launched in
@@ -1758,6 +1778,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 launchable = slot_launchable(*m.slots[(rotation + j) % m.slots.size()]);
             if (!launchable && drain_prev_unit()) return 1;
         }
+        pipeline_in_flight = (overlap && prev.valid);   // S26f3
         if (!(overlap && prev.valid)) {   // nothing in flight: the input side runs now (the original position)
             flush_pending_snapshots();
             capture_prompt_end_snapshots();
@@ -2029,6 +2050,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     ret = std::move(prev);
                     ret.valid = true;
                     prev.valid = false;
+                    pipeline_in_flight = false;   // S26f4: a unit just retired; safe window until the next launch
+                    // S26f6: the inter-unit moment is the only safe point that sees a slot whose prefill
+                    // just completed (state@position, before its first window opens) - capture the
+                    // prompt-end snapshot here; admissions alone never hit that one-round window.
+                    capture_prompt_end_snapshots();
                 }
                 if (dispatch.failed) {
                     err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
@@ -2044,6 +2070,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         return 1;
                     }
                     unit_parity_set(u, u.parity);
+                    pipeline_in_flight = true;   // S26f4: a unit is in flight again
                     for (size_t st = 1; st < m.stages.size(); ++st)
                         if (stage_plans)
                             stage_plans[st] = u.single ? u.slot->stages[st].verify.plan_sink() : batch[st].plan_sink();
