@@ -580,6 +580,10 @@ void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip,
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
                                  void* stream) {
     if (n <= 0) return;
+    if (n > 0x7fffffffLL) {   // D2 bounds: the kernel's n is int; fail closed, never truncate
+        std::fprintf(stderr, "copy_i32_from_mapped_unless: n=%lld exceeds the kernel bound; refusing\n", n);
+        std::exit(1);
+    }
     copy_i32_unless_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n, skip, value);
     check("copy_i32_from_mapped_unless");
 }

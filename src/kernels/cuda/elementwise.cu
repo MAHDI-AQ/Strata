@@ -353,6 +353,10 @@ __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const vol
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
+    if (n > 0x7fffffffLL) {   // D2 bounds: the kernel's n is int; fail closed, never truncate
+        std::fprintf(stderr, "copy_i32_from_mapped: n=%lld exceeds the kernel bound; refusing\n", (long long) n);
+        std::exit(1);
+    }
     int dev = -1;
     cudaGetDevice(&dev);
     const cudaError_t pre = cudaGetLastError();
