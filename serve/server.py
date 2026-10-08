@@ -49,7 +49,7 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-STRATA_AGX_VERSION = "0.1.38-agx.1.1.1"
+STRATA_AGX_VERSION = "0.1.38-agx.1.1.2"
 
 def get_git_commit() -> str:
     commit = os.environ.get("STRATA_COMMIT")
@@ -77,6 +77,7 @@ IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+REASONING_ANSWER_RESERVE = 256   # #P28: tokens kept free for the answer when the budget is auto-derived
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
@@ -1347,18 +1348,25 @@ class Service:
         asked = req.get("model") if isinstance(req, dict) else None
         return asked if isinstance(asked, str) and asked in self.aliases else self.model
 
-    def reasoning_budget(self, req) -> int | None:
+    def reasoning_budget(self, req, max_new: int = 0) -> int | None:
         """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else the
         config's.  0 (or less) means no budget, so a request can turn a configured one off.  ValueError (a 400) for
-        anything that is not a whole number."""
+        anything that is not a whole number.  #P28: when NEITHER source sets a budget and the request carries a
+        finite generation budget (max_new), derive one that always leaves room for the answer - the model wraps
+        its own thinking up (REASONING_WRAP_UP) instead of running the whole budget out and returning nothing."""
         value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
+        explicit = value is not None or self.reasoning_budget_tokens != 0
         if value is None:
             value = self.reasoning_budget_tokens
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
-        return value if value > 0 else None
+        if value > 0:
+            return value
+        if not explicit and max_new > REASONING_ANSWER_RESERVE + 64:
+            return max_new - REASONING_ANSWER_RESERVE   # #P28: never starve the answer
+        return None
 
     def _vision_down(self) -> bool:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
@@ -1800,7 +1808,7 @@ class Service:
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
-        budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
+        budget = self.reasoning_budget(sampling, max_new) if thinking else None   # #123 + #P28 auto-budget
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
