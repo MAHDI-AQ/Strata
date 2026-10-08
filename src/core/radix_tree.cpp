@@ -719,10 +719,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
     // S26f: byte-budget the device snapshot tier. Estimate the capture size; evict LRU (park to
     // host) until it fits; if it still cannot fit, keep the path but refuse the capture (a clean
     // skip beats a silent partial allocation against the VRAM margin).
-    // S26f11: the byte budget governs the L1 (safe) lane only. The session-end lane keeps the
-    // count-LRU park-rotate flow (evict_lru parks overflow to the host tier; forks unpark on
-    // demand) - budget-refusing deep session captures collapsed census reuse (62.8% -> 19.8-51.3%).
-    if (!curr->has_snapshot() && vram_budget_ > 0 && safe_no_evict) {
+    if (!curr->has_snapshot() && vram_budget_ > 0) {
         size_t est = 0;
         strata::kernels::QsaShapes qs_e = strata::kernels::qsa_real_shapes();
         qs_e.n_head = g.n_head; qs_e.n_head_kv = g.n_head_kv; qs_e.head_dim = g.head_dim;
