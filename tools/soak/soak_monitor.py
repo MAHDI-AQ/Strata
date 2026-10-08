@@ -8,6 +8,7 @@ OUT = sys.argv[1] if len(sys.argv) > 1 else "."
 INTERVAL = int(sys.argv[2]) if len(sys.argv) > 2 else 300
 STOP = os.path.join(OUT, "soak.stop")
 URL = "http://127.0.0.1:8096"
+REC = os.environ.get("SOAK_RECIPE", "")
 
 os.makedirs(OUT, exist_ok=True)
 csv_path = os.path.join(OUT, "soak-monitor.csv")
@@ -64,8 +65,8 @@ while not os.path.exists(STOP):
             return round(os.path.getsize(p) / 1048576, 1)
         except Exception:
             return -1
-    sl = mib("/srv/lab/recipes/q3-xxs-3x262k/logs/server.log")
-    el = mib("/srv/lab/recipes/q3-xxs-3x262k/logs/engine.log")
+    sl = mib(os.path.join(REC, "logs/server.log")) if REC else -1
+    el = mib(os.path.join(REC, "logs/engine.log")) if REC else -1
     note = ""
     if health != "ok":
         note = "HEALTH-FAIL"

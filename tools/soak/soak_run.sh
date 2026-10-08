@@ -10,8 +10,9 @@ CTXCAP=${4:-131072}
 MSGT=${5:-2000}
 MAXT=${6:-128}
 HERE=$(cd "$(dirname "$0")" && pwd)
-REC=/srv/lab/recipes/q3-xxs-3x262k
-SERVE_LOG=/home/mhd67/strata-serving-lab/serve-8096.log
+REC=${SOAK_RECIPE:-}
+[ -n "$REC" ] || { echo "soak_run: set SOAK_RECIPE=<recipe dir with logs/>"; exit 2; }
+SERVE_LOG=${SOAK_SERVE_LOG:-$HOME/serve-8096.log}
 mkdir -p "$OUT"
 rm -f "$OUT/soak.stop"
 setsid nohup python3 "$HERE/soak_monitor.py" "$OUT" 300 >"$OUT/monitor.out" 2>&1 &

@@ -6,8 +6,8 @@ Wave baseline primary: 5 agents x 128K (defaults: --agents 5 --ctx-cap 122880
 option (--agents 8 --ctx-cap 96000 --steady-min-ctx 60000).
 
     python3 agent_sim.py --url http://127.0.0.1:8096 --model strata-coder \
-        --serve-log /home/mhd67/strata-serving-lab/serve-8096.log \
-        --engine-log /home/mhd67/strata-serving-lab/serve-combined-8-engine.log \
+        --serve-log /path/to/serve-8096.log \
+        --engine-log /path/to/engine.log \
         --agents 5 --turns 64 --minutes 45 --max-tokens 256 --ctx-cap 122880 \
         --msg-tokens 2500 --seed 20261001 [--dry-run]
 
@@ -75,8 +75,8 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_SERVE_LOG = "/home/mhd67/strata-serving-lab/serve-8096.log"
-DEFAULT_ENGINE_LOG = "/home/mhd67/strata-serving-lab/serve-combined-8-engine.log"
+DEFAULT_SERVE_LOG = os.environ.get("SOAK_SERVE_LOG", "serve-8096.log")
+DEFAULT_ENGINE_LOG = os.environ.get("SOAK_ENGINE_LOG", "engine.log")
 DEFAULT_MODEL = "strata-coder"
 
 ID_RE = re.compile(r"^\[strata(?:-agx)? request (\d+)\]")
