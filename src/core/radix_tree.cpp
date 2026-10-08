@@ -467,6 +467,10 @@ RadixTree::RadixTree(size_t max_cached_snapshots, size_t max_host_snapshots)
     if (env_vb && *env_vb) {
         vram_budget_ = (size_t) std::strtoul(env_vb, nullptr, 10) << 20;
     }
+    const char* env_dr = std::getenv("STRATA_RADIX_DEEP_RESERVE_MIB");
+    if (env_dr && *env_dr) {
+        deep_reserve_ = (size_t) std::strtoul(env_dr, nullptr, 10) << 20;
+    }
     root_ = std::make_shared<RadixNode>();
     root_->id = 0;
     root_->prefix_len = 0;
@@ -737,6 +741,21 @@ std::shared_ptr<RadixNode> RadixTree::insert(
                 std::fprintf(stderr, "S26F capture REFUSED(oversize): prefix=%lld est=%zu budget=%zu\n",
                             (long long) prefix_len, est, vram_budget_);
             return curr;   // S26f3: never evict working captures for one that cannot fit at all
+        }
+        // S26g capture-priority: shallow/mid captures leave a deep reserve inside the tier;
+        // deep captures keep the full budget.  Per-byte value rises with prefix_len (a deep
+        // snapshot serves every later turn of its session), and the leaf-only LRU can never
+        // reclaim the interior nodes the early shallow/mid flood creates - so admission is
+        // the only lever that keeps deep captures alive under the census arrival pattern
+        // (the 33%-vs-54.6% class: P-1 proved the ceiling is the tier itself, not the gate).
+        const size_t admit_cap = ((int64_t) prefix_len >= kDeepPrefixTokens)
+                               ? vram_budget_
+                               : (deep_reserve_ < vram_budget_ ? vram_budget_ - deep_reserve_ : 0);
+        if (est > 0 && device_snapshot_bytes_locked() + est > admit_cap) {
+            if (std::getenv("STRATA_S26F_LOG"))
+                std::fprintf(stderr, "S26F capture REFUSED(reserve): prefix=%lld est=%zu bytes=%zu reserve=%zu budget=%zu\n",
+                            (long long) prefix_len, est, device_snapshot_bytes_locked(), deep_reserve_, vram_budget_);
+            return curr;   // S26g: shallow/mid capture refused to preserve deep headroom
         }
         if (est > 0 && device_snapshot_bytes_locked() + est > vram_budget_) {
             const size_t before_ev = device_snapshot_bytes_locked();

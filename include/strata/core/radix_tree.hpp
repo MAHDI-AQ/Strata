@@ -331,6 +331,8 @@ private:
     size_t node_count_ = 0;
     int64_t next_node_id_ = 1;
     size_t vram_budget_ = (size_t) 768 << 20;   // S26f: device snapshot byte budget (STRATA_RADIX_VRAM_MIB)
+    size_t deep_reserve_ = (size_t) 1280 << 20;   // S26g: tier bytes reserved for deep captures (STRATA_RADIX_DEEP_RESERVE_MIB)
+    static constexpr int64_t kDeepPrefixTokens = 12288;   // S26g: prefix at/above which a capture is deep (value-per-byte)
 
     size_t device_snapshot_bytes_locked() const;
     size_t evict_to_budget(size_t need_bytes);
