@@ -18,11 +18,26 @@ header{height:70px;padding:0 32px;display:flex;align-items:center;justify-conten
 <div class="top"><div><h1>API Monitor</h1><p class="sub">Model status and every request, in one place.</p></div><div class="controls"><button id="load" class="primary" disabled>Load model</button><button id="unload" disabled>Unload model</button></div></div>
 <div id="error" class="notice" role="status" hidden></div>
 <form id="auth" class="panel" hidden><label for="api-key">API key</label><input id="api-key" type="password" autocomplete="off" placeholder="Only needed if the server has a key"><button class="primary">Connect</button></form>
-<div class="cards">
-<div class="card"><div class="label">Model</div><div id="model-state" class="value"><span class="dot"></span><span id="loaded">Connecting…</span></div><div id="model" class="model">127.0.0.1:5001/v1</div></div>
-<div class="card"><div class="label">Requests retained</div><div id="count" class="value">—</div><div id="active" class="small">Waiting for server</div></div>
-<div class="card"><div class="label">Last wall-clock</div><div id="wall" class="value">—</div><div class="small">Includes queue and model loading</div></div>
-<div class="card"><div class="label">Last decode speed</div><div id="speed" class="value">—</div><div class="small">Engine timing · tokens / second</div></div>
+<div class="cards" style="grid-template-columns: repeat(4, 1fr); margin-bottom: 12px;">
+<div class="card"><div class="label">Model & Concurrency</div><div id="model-state" class="value"><span class="dot"></span><span id="loaded">Connecting…</span></div><div id="model" class="model">127.0.0.1:8096 (C=2 Slots)</div></div>
+<div class="card"><div class="label">Requests Retained</div><div id="count" class="value">—</div><div id="active" class="small">Waiting for server</div></div>
+<div class="card"><div class="label">Last Wall-Clock</div><div id="wall" class="value">—</div><div class="small">Includes queue and prefill</div></div>
+<div class="card"><div class="label">Last Decode Speed</div><div id="speed" class="value">—</div><div class="small">Engine timing · tokens / second</div></div>
+</div>
+
+<div class="cards" id="gpu-cards" style="grid-template-columns: repeat(2, 1fr); margin: 0 0 20px 0; gap: 14px;">
+<div class="card" style="border-left: 4px solid var(--st-accent);">
+  <div class="row" style="align-items: baseline;"><div class="label" style="font-weight: 600; color: var(--st-accent);">CUDA 0 · RTX 4090 #1</div><span class="small" id="gpu0-temp" style="font-family: var(--st-font-mono);">—</span></div>
+  <div class="value" style="font-size: 22px; margin: 4px 0;"><span id="gpu0-vram">—</span> <span style="font-size: 13px; font-weight: normal; color: var(--st-ink-muted);">/ 24.0 GB</span></div>
+  <div class="small" style="color: var(--st-ink-muted);">Layers 0–26 (27 layers) · <b id="gpu0-experts" style="color: var(--st-ink);">12,077</b> MoE cache slots (17.56 GB)</div>
+  <div style="background: var(--st-surface-2); height: 6px; border-radius: 3px; margin-top: 8px; overflow: hidden;"><div id="gpu0-bar" style="background: var(--st-accent); height: 100%; width: 95%;"></div></div>
+</div>
+<div class="card" style="border-left: 4px solid #3b82f6;">
+  <div class="row" style="align-items: baseline;"><div class="label" style="font-weight: 600; color: #3b82f6;">CUDA 1 · RTX 4090 #2</div><span class="small" id="gpu1-temp" style="font-family: var(--st-font-mono);">—</span></div>
+  <div class="value" style="font-size: 22px; margin: 4px 0;"><span id="gpu1-vram">—</span> <span style="font-size: 13px; font-weight: normal; color: var(--st-ink-muted);">/ 24.0 GB</span></div>
+  <div class="small" style="color: var(--st-ink-muted);">Layers 27–47 (21 layers) + Head · <b id="gpu1-experts" style="color: var(--st-ink);">8,662</b> MoE cache slots (16.11 GB)</div>
+  <div style="background: var(--st-surface-2); height: 6px; border-radius: 3px; margin-top: 8px; overflow: hidden;"><div id="gpu1-bar" style="background: #3b82f6; height: 100%; width: 96%;"></div></div>
+</div>
 </div>
 <section class="panel"><div class="panel-bar"><h2>Requests</h2><div class="filters"><input id="search" aria-label="Filter requests" placeholder="Search ID or endpoint"><select id="filter" aria-label="Request status"><option value="all">All statuses</option><option value="active">Active</option><option value="completed">Completed</option><option value="error">Errors</option></select></div></div>
 <div class="workspace"><div id="requests" class="requests" aria-label="Request list"></div><div class="detail">
