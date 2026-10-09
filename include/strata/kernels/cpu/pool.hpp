@@ -113,7 +113,7 @@ struct ThreadAffinity {
 ThreadAffinity pin_current_thread(int core);
 void restore_thread_affinity(const ThreadAffinity& previous);
 
-void remember_spawn_mask(long long mask);
+void remember_spawn_mask(const ThreadAffinity& mask);
 void adopt_spawn_mask();
 
 class ExpertPool {
