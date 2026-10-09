@@ -185,10 +185,31 @@ print(response.choices[0].message.content)
 
 ---
 
+## Cherry-Pick & Porting Status
+
+Strata AGX merges the upstream **0.1.39b performance and bit-exactness core** (`11bb74cc`) while curating an active ledger of stability cherry-picks and explicit standing bans:
+
+| Commit / Feature | Upstream Ref | Category | Description | Status |
+|---|---|---|---|---|
+| `deee447` | Upstream Core | **Performance** | Multi-token parallel resident plan on Dual RTX 4090s | **Merged (0.1.39b)** |
+| `055122c` | Upstream Core | **Correctness** | Bit-exactness restore & zero-doorbell CUDA verify graph | **Merged (0.1.39b)** |
+| `6f32ec07` | Upstream Core | **Performance** | Sub-warp cooperative expert packing & shared-memory staging | **Merged (0.1.39b)** |
+| `37cc2589` | `98b7ea94` | **Stability** | Sanitizes literal control tokens (`<|im_start|>`, `<|im_end|>`) in user messages | **Landed** |
+| `e8b4f84a` | `bae372b9` | **Agent Caching** | Pins Claude Code / Anthropic billing header stamps for prefix cache hits | **Landed** |
+| `e740f956` | `c34dd571` | **Concurrency** | Sets `STRATA_HTTP_BACKLOG 256` to absorb high-burst client connections | **Landed** |
+| `6c2bd1ab` | Fork Feature | **Serving API** | Restores `/v1/tokenize` endpoint with full RadixTree reservation facts | **Landed** |
+| `12447529` | Fork Feature | **Observability** | Real-time dual-GPU independent hardware & MoE cache telemetry | **Landed** |
+| `5df35dcb` | Upstream Reject | **Prohibited** | `STRATA_ROUTE_RESIDENT` (MoE routing bias; perturbs logits & breaks bit-exactness) | **REJECTED / BANNED** |
+| `--aux-slots` | Fork Experiment | **Prohibited** | Asymmetric slot slicing; caused scheduler starvation; replaced by uniform $C=2$ pool | **PURGED (`a3da023c`)** |
+
+> For the comprehensive commit-by-commit porting analysis, technical rationale, and verification receipts, see the detailed documentation in [**`docs/cherry-pick-ledger.md`**](docs/cherry-pick-ledger.md).
+
+---
+
 ## Documentation & Porting Ledgers
 
 - [**`ATTRIBUTION.md`**](ATTRIBUTION.md) — Comprehensive upstream attribution, community contributor credits, and architectural lineage matrix.
-- [**`docs/cherry-pick-ledger.md`**](docs/cherry-pick-ledger.md) — Exact ledger of merged upstream 0.1.39b commits, stability cherry-picks, and rejected candidates.
+- [**`docs/cherry-pick-ledger.md`**](docs/cherry-pick-ledger.md) — Detailed authoritative cherry-pick ledger, commit tracking, and exclusion justifications.
 
 ---
 
