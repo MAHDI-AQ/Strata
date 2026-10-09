@@ -2039,6 +2039,30 @@ class Service:
             },
         }
 
+    def tokenize_request(self, req):
+        messages = req.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("a nonempty messages list is required")
+        tools = req.get("tools")
+        ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
+        kwargs = dict(ctk)
+        prompt = self.template.render(messages, tools=tools, **kwargs)
+        ids = self.tok.encode(prompt, parse_special=True)
+        ctx = int(getattr(self.engine, "max_context", 0) or 0)
+        return {
+            "count": len(ids),
+            "model": self.model,
+            "reservation": {
+                "block_overhead_tokens": CTX_SLACK,
+                "lookahead_tokens": 4,
+                "semantics": "token_granular_kv_radix",
+                "max_output_tokens": 65536,
+                "recommended_agent_reserve_tokens": 16384,
+                "slots": int(getattr(self, "concurrency", 1)),
+                "context": ctx,
+            },
+        }
+
     def request_records(self, request_id=None):
         with self.status_lock:
             records = list(self.api_requests)
@@ -3180,6 +3204,9 @@ def make_handler(svc: Service):
                         self._json(200, svc.vram(r))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return
+                if path == "/v1/tokenize":
+                    self._json(200, svc.tokenize_request(req))
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
