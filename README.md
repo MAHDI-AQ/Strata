@@ -62,7 +62,7 @@ All figures below represent real physical hardware benchmarks measured on live m
 | **Sustained Decode Speed (Warm)** | **105.0 – 120.4 tok/s** | Sustained real-world generation (7.2 – 8.9 ms/token) |
 | **Peak Decode Speed** | **141.0 – 156.2 tok/s** | High speculative acceptance runs |
 | **Speculative Acceptance Rate** | **78.2% – 86.4%** | Average 19 to 23 of every 23 offered draft tokens accepted |
-| **Cold Prefill Throughput** | **3,450.2 tok/s** | Single-request path via chunked pipelining (`STRATA_PREFILL_CHAIN=1`) |
+| **Cold Prefill Throughput** | **5,631.7 – 6,325.0 tok/s** | Single-request path via CCD0-pinned CPU MoE staging (0s initial stall on 62k+ prompts) |
 | **Concurrent Prefill Throughput** | **1,850 – 2,200 tok/s** | 12,288-token concurrent chunk limit |
 | **Time to First Token (TTFT)** | **~24 – 35 ms** | On cached prompts (50k+ prefix match via RadixTree) |
 | **Concurrent Throughput ($C=2$)** | **152.4 tok/s aggregate** | 2 parallel streams @ 100 tok/s per stream with zero cross-talk |
@@ -199,6 +199,7 @@ Strata AGX merges the upstream **0.1.39b performance and bit-exactness core** (`
 | `e740f956` | `c34dd571` | **Concurrency** | Sets `STRATA_HTTP_BACKLOG 256` to absorb high-burst client connections | **Landed** |
 | `6c2bd1ab` | Fork Feature | **Serving API** | Restores `/v1/tokenize` endpoint with full RadixTree reservation facts | **Landed** |
 | `12447529` | Fork Feature | **Observability** | Real-time dual-GPU independent hardware & MoE cache telemetry | **Landed** |
+| `c628f801` | Fork Tuning | **Hardware Tuning** | Pins processes and thread pools to AMD Ryzen 5950X CCD0 (cores 0–7, 16–23); eliminates 30s 0% GPU freeze on 62k+ prompts | **Landed** |
 | `5df35dcb` | Upstream Reject | **Prohibited** | `STRATA_ROUTE_RESIDENT` (MoE routing bias; perturbs logits & breaks bit-exactness) | **REJECTED / BANNED** |
 | `--aux-slots` | Fork Experiment | **Prohibited** | Asymmetric slot slicing; caused scheduler starvation; replaced by uniform $C=2$ pool | **PURGED (`a3da023c`)** |
 

@@ -31,6 +31,7 @@ The following commits were cherry-picked onto the merged line to ensure rock-sol
 | `e740f956` | `c34dd571` | **STRATA_HTTP_BACKLOG 256**: Increases server socket listen backlog from default to 256 to absorb concurrent multi-agent burst connections without TCP resets. | **LANDED**: Burst connection reliability verified. |
 | `6c2bd1ab` | Fork Feature | **Restore /v1/tokenize endpoint with reservation facts**: Returns token count along with exact RadixTree reservation metadata (`block_overhead_tokens: 8`, `lookahead_tokens: 4`, `max_output_tokens: 65536`, `recommended_agent_reserve_tokens: 16384`) required for GPUStack automated admission. | **LANDED**: Endpoints verified live on ports 8096 & 40101. |
 | `12447529` | Fork Feature | **Dual-GPU telemetry & monitor upgrade**: Upgraded `/metrics` and embedded web dashboard to report independent VRAM, temperature, power, and MoE cache slot telemetry for CUDA 0 and CUDA 1. | **LANDED**: Real-time per-card telemetry verified. |
+| `c628f801` | Fork Tuning | **CCD0 CPU Core Affinity & Prefill Freeze Elimination**: Pins server process, worker pools, and engine threads to AMD Ryzen 5950X CCD0 (cores 0–7, threads 0–7, 16–23). Eliminates cross-CCD Infinity Fabric stalls during MoE expert staging on 62k+ prompts, collapsing initial prefill stall from ~30s to 0s and boosting 62k prompt prefill speed 6.5x (875 tok/s -> 5,631 tok/s). | **LANDED**: Physical dual-4090 verified on real Hermes agent payload. |
 
 ---
 
