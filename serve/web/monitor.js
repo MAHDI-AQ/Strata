@@ -72,7 +72,7 @@ async function showDetail() {
 }
 async function refresh() {
   try {
-    const [status, history] = await Promise.all([api("/v1/status"), api("/api/requests")]);
+    const [status, history, metrics] = await Promise.all([api("/v1/status"), api("/api/requests"), api("/metrics").catch(() => null)]);
     state = status; records = history.requests;
     status.loaded = history.loaded; status.auto_load = history.auto_load;
     if (selected && !records.some(r => r.id === selected)) {
@@ -86,6 +86,22 @@ async function refresh() {
     text("active", inflight ? `${inflight} active / queued` : status.auto_load ? "Loads automatically on the next request" : "No active requests");
     const last = records.find(r => !active(r));
     text("wall", last ? seconds(last.wallclock_s) : "—"); text("speed", speed(last?.timings?.predicted_per_second));
+    if (metrics && metrics.hardware && Array.isArray(metrics.hardware.gpus)) {
+      const g0 = metrics.hardware.gpus[0];
+      const g1 = metrics.hardware.gpus[1];
+      if (g0) {
+        text("gpu0-vram", (g0.mem_used / 1073741824).toFixed(1) + " GB");
+        text("gpu0-temp", (g0.temp != null ? g0.temp + " °C" : "—") + (g0.util != null ? " · " + g0.util + "% util" : ""));
+        const bar0 = document.getElementById("gpu0-bar");
+        if (bar0 && g0.mem_total) bar0.style.width = Math.min(100, (100 * g0.mem_used / g0.mem_total)).toFixed(1) + "%";
+      }
+      if (g1) {
+        text("gpu1-vram", (g1.mem_used / 1073741824).toFixed(1) + " GB");
+        text("gpu1-temp", (g1.temp != null ? g1.temp + " °C" : "—") + (g1.util != null ? " · " + g1.util + "% util" : ""));
+        const bar1 = document.getElementById("gpu1-bar");
+        if (bar1 && g1.mem_total) bar1.style.width = Math.min(100, (100 * g1.mem_used / g1.mem_total)).toFixed(1) + "%";
+      }
+    }
     $("load").disabled = operating || Boolean(inflight) || status.loaded; $("unload").disabled = operating || Boolean(inflight) || !status.loaded;
     list(); if (selected) await showDetail();
     text("updated", `Live · updated ${new Date().toLocaleTimeString()}`);

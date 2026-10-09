@@ -33,18 +33,20 @@ Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Ne
 > **Attribution & Upstream Boundary:**
 > This repository is a standalone research fork. We credit **Niko1221** and the 15+ community contributors who created Strata. See [**`ATTRIBUTION.md`**](ATTRIBUTION.md) for full contributor credits. All commits are maintained modularly for upstream cherry-picking.
 
-### Latest line — `v0.1.38-agx.1.1.5` (continuous-concurrency track)
+### Latest Line — `v0.1.39-agx.1.2.0` (Upstream 0.1.39b Merged Baseline & Stability Pack)
 
-Since the Program v3 seal (`1.1.0`), five patch releases hardened the concurrent-serving path:
+On 2026-10-09, Strata AGX completed the full upstream merge of the **0.1.39b performance and bit-exactness line** (`6f32ec07`) and applied the curated cherry-picks pack:
 
-- **Deep-session reuse:** repeating a long prompt forks in place off existing deep RadixTree captures instead of re-prefilling from scratch.
-- **Capture-priority admission:** shallow turns no longer flood the tier ahead of deep captures — deep-capture census rose from ~33% to **58–62%** (admission-only reserve; no new eviction paths).
-- **Concurrent prefill cap raised to 12,288** (`--concurrent-prefill`): solo-prompt throughput **+15.7%**, the 2×254K battery wall time **−18%**.
-- **3 × 262K-class agents in parallel:** three 256,942-token prompts complete concurrently (~78 s each ≈ **3,300 tok/s prefill per agent**).
-- **2-agent packed decode:** **210.9 tok/s** aggregate on the pinned two-stream instrument.
-- **Fail-closed kernel bounds:** mapped i32 copy kernels refuse out-of-range lengths instead of silently truncating.
+- **Zero-Doorbell Multi-Token Verify Graph:** Eliminated host-driver submission bottlenecks during speculative verification; multi-token windows (1–4 tokens) captured into persistent CUDA execution graphs.
+- **Sub-Warp Expert Packing & Shared-Mem Staging:** Replaced coarse expert launches with warp-level cooperative packing, raising warm decode from ~38 tok/s to **80–100+ tok/s** bit-exact across Dual RTX 4090s.
+- **Claude Code Multi-Turn Cache Hit Pinned:** Cherry-pick `bae372b9` pins `x-anthropic-billing-header` per-request stamps, ensuring agent turns hit identical prefix hashes across consecutive prompts.
+- **Literal Control Token Encoding:** Cherry-pick `98b7ea94` sanitizes literal control tokens (`<|im_start|>`, `<|im_end|>`) in user messages to prevent template desync.
+- **High-Burst HTTP Backlog:** Cherry-pick `c34dd571` sets `STRATA_HTTP_BACKLOG 256` to absorb multi-agent burst connection attempts without TCP drop.
+- **GPUStack Native Reservation & Tokenize Endpoint:** Restored `/v1/tokenize` endpoint with full token-granular radix reservation metadata for automated GPUStack admission.
+- **Dual-GPU Real-Time Monitoring:** Upgraded the embedded monitor dashboard with dedicated per-card telemetry for CUDA 0 (layers 0–26, 12,077 MoE cache slots) and CUDA 1 (layers 27–47 + head, 8,662 MoE cache slots).
+- **Auxiliary Slot Total Purge:** Aux-slot experiments and urgent preemption clamps permanently purged (`a3da023c`). All agent requests and tool calls pass through the single continuous queue with $C=2$ concurrent streams ($2 \times 262\text{k}$ KV pool).
 
-Engine identity: `0.1.38-agx.1.1.5` @ commit `0058778`.
+Engine identity: `0.1.39-agx.1.2.0` @ tag `v0.1.39-agx.1.2.0` (git tree verified).
 
 ---
 
