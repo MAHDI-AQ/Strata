@@ -26,6 +26,16 @@
 
 namespace strata::core {
 
+inline uint64_t ple_hist_bytes() {
+    return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
+}
+
+inline uint64_t gdn_state_floats(const ModelGeometry& g) {
+    return (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+           (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+}
+
+
 /// Everything a sequence needs that is NOT a weight: the per-layer state, the block scratch, and the pinned
 /// handoff between the GPU and the CPU expert pool.
 struct SessionState {

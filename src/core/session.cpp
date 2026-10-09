@@ -38,18 +38,13 @@ uint64_t align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
 /// The floats one GDN layer's recurrent + conv state needs.  `gdn_buffers_bytes` carves them for ONE layer and
 /// `GdnBuffers::state`/`conv_state` point INTO that carve, so a session with 36 GDN layers has to give each one
 /// its own - they cannot share, because the recurrence is the whole point.
-uint64_t gdn_state_floats(const ModelGeometry& g) {
-    return (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-           (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
-}
+
 
 }  // namespace
 
 /// `NG_HIST` rows of `hc_dim` floats: the PLE conv's history, which is the ONLY PLE state that lives in the
 /// session arena.  The table and the weights are model-level and the caller owns them.
-static uint64_t ple_hist_bytes() {
-    return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
-}
+
 
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
