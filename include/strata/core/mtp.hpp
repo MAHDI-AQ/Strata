@@ -25,7 +25,6 @@
 
 #include <cuda_runtime.h>
 
-#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -44,24 +43,17 @@ public:
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-              int64_t window = 32768, const MtpDrafter* shared_weights = nullptr);
-    void reset();
+              int64_t window = 32768);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
-    /// S1c-fix: the round's fair per-slot row allocation (schedule_rows' round-robin floor: rows /
-    /// served slots) - the fused draft chain's budget-aware L clamp.  Default = "no budget info"
-    /// (the envelope alone); the serve loop sets it once per unit, before any slot's draft.
-    void set_alloc_share(int per_slot_rows) { alloc_share_ = per_slot_rows; }
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
     void kv_restore(int64_t upto);
-    /// Sprint 1: Forks the drafter KV state from parent up to prefix_tokens
-    bool fork_from(const MtpDrafter& parent, int64_t prefix_tokens, std::string& err);
     /// The VRAM bind() will allocate for a native head of `head_row_bytes` per vocabulary row: the draft logits and
     /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this.
     uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
@@ -77,12 +69,6 @@ public:
     /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
-    /// LANE spec-fuse (STRATA_DRAFT_WAVEFRONT): split of one round into launch and finish - draft_begin
-    /// stages and launches (the whole fused chain with STRATA_MTP_FUSE_CHAIN, else the round graph the
-    /// step chain continues in draft_end); draft_end syncs, reads the drafts back and finishes the chain.
-    /// draft() is exactly begin + end; the split lets the serve loop launch every slot before waiting any.
-    bool draft_begin(int T, const int32_t* tokens, int64_t p, int a, std::string& err);
-    bool draft_end(int32_t* drafts, std::string& err, float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
@@ -111,24 +97,17 @@ public:
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
     bool idle(std::string& err) {
-        if (!pending_) return true;
         if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
-        pending_ = pending_fused_ = false;
         return true;
     }
 
 private:
-    const MtpDrafter* shared_weights_ = nullptr; // owner must outlive this slot
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
-    /// The fused draft chain for (T, L): catch-up + row a + L-1 steps as ONE graph, one sync, one readback.
-    bool capture_fused(int T, int L, bool coupled, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
-    cudaGraphExec_t fused_exec_[9][9] = {};     ///< per (T, L); L = the S1c budget-aware chain length
-    cudaGraphExec_t fused_exec_c_[9][9] = {};   ///< coupled variants (STRATA_SPEC_COUPLED)
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
@@ -153,14 +132,6 @@ private:
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
-    int alloc_share_ = 1 << 30;   ///< S1c-fix: the round's fair per-slot row allocation (serve loop; fused cap only)
-    // draft_begin/draft_end hand-off (lane spec-fuse): the launched chain's finish needs only these.
-    bool pending_ = false, pending_fused_ = false;
-    int pending_L_ = 1;
-    int64_t pending_p_ = 0;
-    int pending_a_ = 0;
-    std::chrono::steady_clock::time_point pending_t0_{};
-    void put_row(int row, int64_t cell);   ///< stage one step row's cell/position records (mapped inputs)
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
