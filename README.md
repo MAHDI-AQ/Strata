@@ -33,6 +33,19 @@ Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Ne
 > **Attribution & Upstream Boundary:**
 > This repository is a standalone research fork. We credit **Niko1221** and the 15+ community contributors who created Strata. See [**`ATTRIBUTION.md`**](ATTRIBUTION.md) for full contributor credits. All commits are maintained modularly for upstream cherry-picking.
 
+### Latest line — `v0.1.38-agx.1.1.5` (continuous-concurrency track)
+
+Since the Program v3 seal (`1.1.0`), five patch releases hardened the concurrent-serving path:
+
+- **Deep-session reuse:** repeating a long prompt forks in place off existing deep RadixTree captures instead of re-prefilling from scratch.
+- **Capture-priority admission:** shallow turns no longer flood the tier ahead of deep captures — deep-capture census rose from ~33% to **58–62%** (admission-only reserve; no new eviction paths).
+- **Concurrent prefill cap raised to 12,288** (`--concurrent-prefill`): solo-prompt throughput **+15.7%**, the 2×254K battery wall time **−18%**.
+- **3 × 262K-class agents in parallel:** three 256,942-token prompts complete concurrently (~78 s each ≈ **3,300 tok/s prefill per agent**).
+- **2-agent packed decode:** **210.9 tok/s** aggregate on the pinned two-stream instrument.
+- **Fail-closed kernel bounds:** mapped i32 copy kernels refuse out-of-range lengths instead of silently truncating.
+
+Engine identity: `0.1.38-agx.1.1.5` @ commit `0058778`.
+
 ---
 
 ## Empirical Benchmark Verification
@@ -63,7 +76,7 @@ Evaluated on `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (IQ3_XXS, 125B MoE wi
 
 *Note: Upstream Strata natively supports 262,144 context in single-stream mode; Strata AGX accelerates this single-stream decode path via fused GDN recurrence and Split-K FMHA.*
 
-*Note on the prefill row: the 3,450.2 tok/s figure is the single-request path at `--prefill auto` (16,384-token chunks); the concurrent serving path chunks via `--concurrent-prefill` (≤4096) and measures ≈2.1–2.3K tok/s at depth — raising the concurrent cap is a tracked engine lever.*
+*Note on the prefill row: the 3,450.2 tok/s figure is the single-request path at `--prefill auto` (16,384-token chunks); the concurrent serving path chunks via `--concurrent-prefill` — raised from ≤4096 to **12,288** in `v0.1.38-agx.1.1.5` (+15.7% on the 128K-class solo prompt probe, −18% on the 2×254K parallel battery).*
 
 ---
 
@@ -146,6 +159,13 @@ Verify that all custom SM89 kernels and RadixTree implementations match referenc
 ### Starting the Server
 ```bash
 python3 -m serve.server --port 8096 --host 0.0.0.0
+```
+
+### Reference Concurrent-Serving Posture (3 × 262K slots)
+```bash
+python3 serve/server.py --engine strata --config q3-xxs-3x262k/config.json --port 8096
+# config highlights: 3 slots × 262,144-token context, --concurrent-prefill 12288,
+# --kv q4_0, dynamic RadixTree L1/L2/L3 (VRAM → host RAM → NVMe)
 ```
 
 ### Client Example (Python / OpenAI SDK)
