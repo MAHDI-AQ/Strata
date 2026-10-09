@@ -1,0 +1,78 @@
+{
+  "exe": "./build/strata",
+  "cwd": ".",
+  "tokenizer": "/path/to/models/packs/iq3_xxs/tokenizer",
+  "gpu": [
+    0,
+    1
+  ],
+  "host": "127.0.0.1",
+  "port": 8096,
+  "env": {
+    "STRATA_WATCHDOG_S": "180",
+    "STRATA_STAGE_OVERLAP": "1",
+    "STRATA_PREFILL_CHAIN": "1",
+    "STRATA_PREFILL_RING": "8",
+    "STRATA_PLE_PREFETCH": "1",
+    "STRATA_MMQ_BLOB": "1",
+    "STRATA_STAGE_OVERLAP_CROSSDEV": "1",
+    "STRATA_PIN_LIMIT_GIB": "32",
+    "STRATA_OLD_SAMPLER": "1"
+  },
+  "sampling": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "min_p": 0.05
+  },
+  "model_name": "Qwen3.8-Flash-Next-IQ3_XXS",
+  "log": "./logs/engine.log",
+  "api_monitor": true,
+  "args": [
+    "--pack",
+    "/path/to/models/packs/iq3_xxs",
+    "--native",
+    "/path/to/models/flash-next-iq3_xxs/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+    "--ple-gguf",
+    "/path/to/models/flash-next-iq3_xxs/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+    "--expert-cache",
+    "auto",
+    "--expert-profile",
+    "./data/expert-profile.bin",
+    "--prefill",
+    "auto",
+    "--spec",
+    "4",
+    "--mtp-max-t",
+    "2",
+    "--suffix-draft",
+    "3",
+    "--spec-min-p",
+    "0.55",
+    "--mtp",
+    "/path/to/models/mtp/rt",
+    "--max-context",
+    "262144",
+    "--kv",
+    "q4_0",
+    "--layer-split",
+    "27",
+    "--split-device",
+    "1",
+    "--ple-row-cache",
+    "320001536",
+    "--vram-reserve-mib",
+    "960",
+    "--adapt-every",
+    "0",
+    "--pcie-frac",
+    "0.85"
+  ],
+  "cors_origins": [
+    "http://127.0.0.1:8096",
+    "http://localhost:8096"
+  ],
+  "allowed_hosts": [
+    "127.0.0.1",
+    "localhost"
+  ]
+}
