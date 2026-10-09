@@ -32,6 +32,56 @@ header{height:70px;padding:0 32px;display:flex;align-items:center;justify-conten
 <div id="detail-error" class="detail-error" hidden></div><div class="tabs" role="tablist" aria-label="Request content"><button role="tab" data-pane="input" aria-selected="true">Input</button><button role="tab" data-pane="output" aria-selected="false">Output</button><button role="tab" data-pane="reasoning" aria-selected="false">Reasoning</button><button role="tab" data-pane="response" aria-selected="false">API response</button><button id="copy">Copy</button></div>
 <div id="content-note" class="small" style="margin-top:10px"></div><pre id="content" role="tabpanel" aria-label="Request content"></pre></div>
 </div></div></section>
+<section id="fork-panel" aria-label="Fork features and concurrency" style="margin:14px 0 6px">
+<h2 style="margin:0 0 6px;font-size:15px">Strata AGX — fork features &amp; concurrency</h2>
+<p class="small" style="margin:0 0 10px">Continuous multi-agent concurrency · unit-packing wait · routed-only expert staging · capture-priority deep reserve · 3-tier RadixTree KV (VRAM → host → NVMe) · MTP speculative decoding · cross-GPU prefill chaining.</p>
+<div id="fork-live" class="small" style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px"><span>engine —</span><span>version —</span><span>slots —</span><span>active —</span></div>
+<div id="fork-grid" class="small" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:4px 18px"></div>
+</section>
 <footer><span>Last 100 requests kept in memory until restart. Inputs and outputs stay on this machine.</span><span id="updated">Connecting…</span></footer>
 </main>
+<script>
+(function(){
+  const grid = document.getElementById("fork-grid");
+  if (grid) {
+    const facts = ["Continuation concurrency", "c2 slots x 262,144 tokens + queue"],
+ ["Unit packing (--unit-wait-ms)", "12 ms boundary wait: 2-agent aggregate ~211 tok/s"],
+ ["Routed-only expert staging (ring)", "wait-copy 590-1165 ms \u2192 46-67 ms per chunk"],
+ ["Capture-priority deep reserve", "deep RadixTree captures kept: census 33% \u2192 58-62%"],
+ ["RadixTree KV tiers", "8 VRAM / 8 host slots + NVMe tier (O_DIRECT)"],
+ ["Speculative decoding", "--spec 4 / MTP depth 2 / suffix-draft 3, acceptance ~75-90%"],
+ ["Cross-GPU prefill chain", "chunk-level S0\u21920 pipeline across both 4090s"],
+ ["Concurrent prefill cap", "12,288 (was 4096); solo +15.7%, 2x254K -18% wall"],
+ ["Batch formation", "fair policy, 16 rows, 16 graphs, batch-parallel 1"],
+ ["KV format", "q4_0 (max expert residency; k8v4 rejected for -10.6% residency)"],
+ ["Expert residency", "auto byte budget, 66%+ pairs resident, PCIe fetch on miss"],
+ ["Pass-stall relief", "250 ms --pass-stall-ms (driver lock thrash class)"]];
+    grid.replaceChildren(...facts.map(([k, v]) => {
+      const d = document.createElement("div");
+      const b = document.createElement("b"); b.textContent = k;
+      d.appendChild(b); d.appendChild(document.createTextNode(" — " + v));
+      return d;
+    }));
+  }
+  async function live() {
+    try {
+      const r = await fetch("health", {cache: "no-store"});
+      if (!r.ok) return;
+      const h = await r.json();
+      const el = document.getElementById("fork-live");
+      const recs = (typeof records !== "undefined" && Array.isArray(records)) ? records : [];
+      const act = recs.filter(x => !["completed", "error", "disconnected"].includes(x.state)).length;
+      const bits = [["engine", h.service || "strata-agx"], ["version", h.version || "?"], ["slots", "2"], ["active", act], ["events kept", recs.length]];
+      el.replaceChildren(...bits.map(([k, v]) => {
+        const sp = document.createElement("span");
+        sp.appendChild(document.createTextNode(k + " "));
+        const b2 = document.createElement("b"); b2.textContent = String(v);
+        sp.appendChild(b2);
+        return sp;
+      }));
+    } catch (e) {}
+  }
+  setInterval(live, 3000); live();
+})();
+</script>
 </body></html>
