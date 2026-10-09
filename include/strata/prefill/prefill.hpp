@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -112,9 +113,36 @@ public:
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);
+    /// #583: the auto chunk scan's byte-budget ring, for chunks above `small_max` (0.1.39's auto chunk: a prompt that
+    /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
+    static void set_ring_budget(int slots, int64_t small_max);
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
+
+    /// The same without the streamed ring: what the chunk's own buffers cost.  The auto chunk scan sizes the chunk
+    /// first and hands the ring what the chunk leaves over, so it needs the chunk priced on its own.
+    static uint64_t bytes_needed_no_ring(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
+
+    /// The streamed ring's byte budget as a slot count for this pack (the measured slot count x Q2_0's blob, over
+    /// max_blob, never past ring_cap()):
+    /// what the auto chunk scan treats as a full ring.  A slot is one whole blob, so a pack with bigger blobs than
+    /// Q2_0's gets fewer of them for the same bytes - 384 on Q2_0, 199 on a 2.54 MiB-blob IQ3_S pack.
+    static int64_t ring_max_slots();
+    /// 0.1.39's ring for this PC (1024 fused / 384 pinned / 96), within ring_cap().
+    static int64_t ring_default_slots();
+    /// #583: the ring the auto scan keeps full, given the chunk 0.1.39's rule picked: its byte budget where that rule's
+    /// chunk was small (< 6144), else 0.1.39's ring (measured: shrinking it for a bigger chunk lost there).
+    static int64_t ring_cap_for(int64_t old_chunk);
+
+    /// What the ring actually resolves to for a chunk of `chunk` tokens, after the override, STRATA_PREFILL_RING
+    /// and the pinned-share rule - the slot count `init` lays out.  The engine reports it on its INFO line so the
+    /// Monitor tab shows the pair the run really got, not what it asked for.
+    static int64_t ring_slots_for(int64_t chunk);
+
+    /// 0.1.39b (#583, the default): the ring as a byte budget, the loan's corrected count and the auto chunk scan that
+    /// keeps the ring full.  STRATA_RING_BYTES=0: 0.1.39's ring, loan and chunk list.
+    static bool ring_bytes_enabled();
 
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
@@ -154,31 +182,34 @@ public:
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
 
-    /// Lane pipeline-prefill (STRATA_PREFILL_CHAIN, default off): allow `run` to leave its last chunk's
-    /// stage-1 run in flight when it returns; the concurrent pump drains it with `chain_wait` before it
-    /// publishes the slot's prompt as read.  Only the concurrent path opts in; a leaked env is inert.
-    void set_chain_defer(bool on);
-    /// Wait the deferred stage-1 run (a no-op when none is in flight).  false with `err` on stage-1 failure.
+    /// Lane pipeline-prefill (STRATA_PREFILL_CHAIN, default off)
     bool chain_wait(std::string& err);
-    /// Lane w3-chaingate: the shared gate of the engine this prompt belongs to.  `run` takes it at the
-    /// deferred-run spawn point (chain arm only), so at most ONE stage-1 run is in flight engine-wide;
-    /// null (default): no gating.  Set on the stage that SPAWNS the deferred run (stage 0 of a split).
+    void set_chain_defer(bool on);
     void set_chain_gate(ChainGate* gate);
-
-    /// Lane prefill R2 (STRATA_PLE_PREFETCH, default off): prefetch the PLE rows of a successor chunk on a
-    /// thread, into the Impl's other host buffer (the concurrent pump calls it after a mid-prompt chunk).
-    /// The next `run` consumes it when the count, the tokens and the two before them still match; any other
-    /// key is drained and dropped, and that call gathers inline.  The tokens are copied, so the caller's
-    /// array need not outlive the call.  false: feature off, one already outstanding, or not this stage.
     bool ple_prefetch_next(const int64_t* next_tokens, int64_t n_next);
-    /// Drain an in-flight prefetch (a no-op when none): the pump fences and ~Prefill call it for quiescence.
     void ple_prefetch_drain();
 
+    /// LAYER SPLIT helper (upstream)
+    bool set_stage_helper(Prefill* helper, std::string& err);
+
 private:
+    // Stage-1 pipeline: intermediate stages return after handing their chunk to
+    // the direct successor. The public run() drains the chain once at prompt end.
+    bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    bool drain_pipeline(std::string& err);
+
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
-    ChainGate* chain_gate_ = nullptr;   ///< lane w3-chaingate: the engine-wide stage-1 gate (null: off)
+    ChainGate* chain_gate_ = nullptr;
+    Prefill* helper_ = nullptr;
+    bool single_chunk_ = false;
+    bool bind_stage_helper(int64_t T);
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+
+    std::string next_err_;
+    std::future<bool> next_run_;
+    int hand_buf_ = 0;
+
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;

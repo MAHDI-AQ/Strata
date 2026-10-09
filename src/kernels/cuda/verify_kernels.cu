@@ -67,23 +67,24 @@ __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __
     hist[c * 3 + 2] = seq[2];
 }
 
-__global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
-                                                           const uint16_t* __restrict__ wb,
-                                                           const float* __restrict__ dt,
-                                                           const float* __restrict__ ssm_a, float* __restrict__ gate,
-                                                           float* __restrict__ beta, int n, int h_v, int T) {
-    const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+template <int MAX_T = kVerifyMaxT>
+__global__ void __launch_bounds__(64) gdn_ab_multi_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
+                                                          const uint16_t* __restrict__ wb,
+                                                          const float* __restrict__ dt,
+                                                          const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                                          float* __restrict__ beta, int n, int h_v, int T) {
+    const int row = blockIdx.x * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= 2 * h_v) return;
     const bool is_beta = row >= h_v;
     const int r = is_beta ? row - h_v : row;
     const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n);
-    float acc[kVerifyMaxT];
+    float acc[MAX_T];
 #pragma unroll
-    for (int t = 0; t < kVerifyMaxT; ++t) acc[t] = 0.0f;
+    for (int t = 0; t < MAX_T; ++t) acc[t] = 0.0f;
     for (int j = lane; j < n / 8; j += 32) {
         const uint4 wv = __ldg(w4 + j);
 #pragma unroll
-        for (int t = 0; t < kVerifyMaxT; ++t) {
+        for (int t = 0; t < MAX_T; ++t) {
             if (t >= T) break;
             const float* xt = x + (size_t) t * n;
             const float4 xa = *reinterpret_cast<const float4*>(xt + j * 8);
@@ -97,7 +98,7 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
         }
     }
 #pragma unroll
-    for (int t = 0; t < kVerifyMaxT; ++t) {
+    for (int t = 0; t < MAX_T; ++t) {
         if (t >= T) break;
         float a = acc[t];
         for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
@@ -110,6 +111,50 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
             gate[(size_t) t * h_v + r] = sp * ssm_a[r];
         }
     }
+}
+
+// State-only commit kernel: each head's 128 independent state columns are split across 4 blocks of 32 columns
+// (48 * 4 = 192 blocks of 128 threads across all SMs, vs 48 blocks of 512 threads), with no sq/o/norm/z/y work.
+__global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restrict__ state,
+                                                                  const float* __restrict__ hbuf, int C,
+                                                                  const float* __restrict__ gate,
+                                                                  const float* __restrict__ beta,
+                                                                  int h_k, int h_v,
+                                                                  const int32_t* __restrict__ n_keep) {
+    const int n = *n_keep;
+    if (n <= 0) return;
+    __shared__ float sk[S];
+    __shared__ float red[RG][32];
+    const int head = blockIdx.x;
+    const int col_local = threadIdx.x;
+    const int col = blockIdx.y * 32 + col_local;
+    const int rg = threadIdx.y;
+    const int tid = rg * 32 + col_local;    // 0 .. 127
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int t = 0; t < n; ++t) {
+        const float* ht = hbuf + (size_t) t * C;
+        __syncthreads();
+        sk[tid] = ht[qk + qh * S + tid];
+        __syncthreads();
+        const float g = __expf(gate[(size_t) t * h_v + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+        red[rg][col_local] = kv;
+        __syncthreads();
+        const float kv_col = red[0][col_local] + red[1][col_local] + red[2][col_local] + red[3][col_local];
+        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
 }
 
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
@@ -138,8 +183,12 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
     for (int t = 0; t < n; ++t) {
         const float* ht = hbuf + (size_t) t * C;
+        const bool need_out = (t >= t_out_begin);
         __syncthreads();                // the previous token is done with sk/sq/red/wsum
-        if (tid < S) { sk[tid] = ht[qk + qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
+        if (tid < S) {
+            sk[tid] = ht[qk + qh * S + tid];
+            if (need_out) sq[tid] = ht[qh * S + tid];
+        }
         __syncthreads();
         const float g = __expf(gate[(size_t) t * h_v + head]);
         float kv = 0.0f;
@@ -149,6 +198,11 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         __syncthreads();
         const float kv_col = red[0][col] + red[1][col] + red[2][col] + red[3][col];
         const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+        if (!need_out) {
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+            continue;
+        }
         float o = 0.0f;
 #pragma unroll
         for (int r = 0; r < RPG; ++r) {
@@ -163,7 +217,6 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
             oc = (red[0][col] + red[1][col] + red[2][col] + red[3][col]) * rsqrtf((float) S);
             sq_part = oc * oc;
         }
-        if (t < t_out_begin) continue;   // a replayed token: its state update is needed, its output is not
         for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
         if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
         __syncthreads();
@@ -285,11 +338,13 @@ __global__ void mtp_select_kernel(const float* __restrict__ R_src, int64_t strid
     const int row = *row_dev;
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < stride; i += (int64_t) gridDim.x * blockDim.x)
         R_dst[i] = R_src[(size_t) row * stride + i];
+    __syncthreads();
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         const int32_t tok = ids[row];
         *tok_dst = tok;
-        if (out != nullptr) ((volatile int32_t*) out)[j] = tok;
         if (probs != nullptr && out_p != nullptr) ((volatile float*) out_p)[j] = probs[row];
+        __threadfence_system();
+        if (out != nullptr) ((volatile int32_t*) out)[j] = tok;
     }
 }
 
@@ -331,8 +386,8 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
 
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs, float* out_p) {
-    mtp_select_kernel<<<16, 256, 0, (cudaStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,
-                                                             probs, out_p);
+    mtp_select_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,
+                                                            probs, out_p);
     check("mtp_select");
 }
 
@@ -404,8 +459,14 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::fprintf(stderr, "gdn_ab_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_ab_multi_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(
-        x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    const unsigned blocks = (unsigned) ((2 * h_v + 1) / 2);
+    if (n_tok <= 4) {
+        gdn_ab_multi_kernel<4><<<blocks, 64, 0, (cudaStream_t) stream>>>(
+            x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    } else {
+        gdn_ab_multi_kernel<kVerifyMaxT><<<blocks, 64, 0, (cudaStream_t) stream>>>(
+            x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    }
     check("gdn_ab_multi");
 }
 
@@ -417,8 +478,17 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
-        state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+    static const bool commit_split = [] {
+        const char* e = std::getenv("STRATA_GDN_COMMIT_SPLIT");
+        return !e || e[0] != '0';
+    }();
+    if (commit_split && n_keep != nullptr && t_out_begin >= n_tok) {
+        gdn_step_commit_kernel<<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, h_k, h_v, n_keep);
+    } else {
+        gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+    }
     check("gdn_step_norm_multi");
 }
 
@@ -430,15 +500,58 @@ __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t valu
 }  // namespace
 
 namespace {
-__global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
+// one thread per window entry: up to kVerifyMaxT tokens x 10 routed experts (80), so 128 (#646 had 64: a window of
+// 7+ tokens lost its last entries)
+constexpr int kResidentPlanMax = 128;
+static_assert(kVerifyMaxT * 10 <= kResidentPlanMax, "resident_plan: one thread per entry");
+__global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
                                      int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
                                      long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
                                      uint32_t ring) {
-    // one thread: at most kVerifyMaxT * 10 entries, the host's exact loop
-    for (int i = 0; i < n; ++i) {
-        const int32_t e = ids[i];
-        if (e < 0 || e >= n_expert || res[e] < 0) { *skip = 0; return; }
+    __shared__ int32_t s_ids[kResidentPlanMax];
+    __shared__ unsigned long long s_ptr[kResidentPlanMax];
+    __shared__ int32_t s_first[kResidentPlanMax];
+    __shared__ int32_t s_cnt[kResidentPlanMax];
+    __shared__ int32_t s_gstart[kResidentPlanMax];
+    __shared__ int s_bad;
+    const int tid = threadIdx.x;
+    if (tid == 0) s_bad = 0;
+    __syncthreads();
+
+    int32_t eid = -1;
+    if (tid < n) {
+        eid = ids[tid];
+        s_ids[tid] = eid;
+        const int32_t slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
+        if (slot < 0) {
+            atomicOr(&s_bad, 1);
+        } else {
+            s_ptr[tid] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+        }
     }
+    __syncthreads();
+    if (s_bad) {
+        if (tid == 0 && skip != nullptr) *skip = 0;
+        return;
+    }
+
+    int first_j = tid;
+    int rank_in_group = 0;
+    int count_same = 0;
+    if (tid < n) {
+        for (int j = 0; j < n; ++j) {
+            if (s_ids[j] == eid) {
+                if (j < first_j) first_j = j;
+                if (j < tid) ++rank_in_group;
+                ++count_same;
+            }
+        }
+        const bool is_first = (first_j == tid);
+        s_first[tid] = is_first ? 1 : 0;
+        s_cnt[tid] = is_first ? count_same : 0;
+    }
+    __syncthreads();
+
     int32_t* counts = pl;
     int32_t* start = pl + 4;
     int32_t* dst = start + capx + 1;
@@ -446,30 +559,38 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
     const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
     unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
     int32_t* start2 = pl + ptr_off + 4 * capx;
-    int groups = 0, entries = 0;
-    for (int i0 = 0; i0 < n; ++i0) {
-        bool first = true;
-        for (int j = 0; j < i0; ++j) if (ids[j] == ids[i0]) { first = false; break; }
-        if (!first) continue;
-        const int32_t slot = res[ids[i0]];
-        ptr[groups] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
-        start[groups] = entries;
-        for (int i = i0; i < n; ++i)
-            if (ids[i] == ids[i0]) {
-                // an entry belongs to i0's group when its first occurrence is i0: the same expert id
-                dst[entries] = i;
-                tok[entries] = i / k;
-                ++entries;
-            }
-        ++groups;
+
+    if (tid < n && first_j == tid) {
+        int grp_idx = 0;
+        int ent_start = 0;
+        for (int j = 0; j < tid; ++j) {
+            grp_idx += s_first[j];
+            ent_start += s_cnt[j];
+        }
+        ptr[grp_idx] = s_ptr[tid];
+        start[grp_idx] = ent_start;
+        s_gstart[tid] = ent_start;
     }
-    start[groups] = entries;
-    start2[0] = entries;
-    counts[0] = groups;
-    counts[1] = entries;
-    counts[2] = 0;
-    __threadfence();
-    *skip = ring;
+    __syncthreads();
+
+    if (tid < n) {
+        const int out_idx = s_gstart[first_j] + rank_in_group;
+        dst[out_idx] = tid;
+        tok[out_idx] = tid / k;
+    }
+    if (tid == 0) {
+        int groups = 0;
+        for (int j = 0; j < n; ++j) groups += s_first[j];
+        start[groups] = n;
+        start2[0] = n;
+        counts[0] = groups;
+        counts[1] = n;
+        counts[2] = 0;
+        if (skip != nullptr) {
+            __threadfence();
+            *skip = ring;
+        }
+    }
 }
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
@@ -487,90 +608,13 @@ __global__ void copy_or_zero_kernel(float4* __restrict__ dst, const volatile flo
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (long long) gridDim.x * blockDim.x)
         dst[i] = zero ? make_float4(0.f, 0.f, 0.f, 0.f) : const_cast<const float4*>(src)[i];
 }
-__global__ void resident_plan_warp_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
-                                          int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
-                                          long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
-                                          uint32_t ring) {
-    const int tid = threadIdx.x;
-    __shared__ int32_t s_ids[512];
-
-    int invalid = 0;
-    for (int i = tid; i < n; i += 32) {
-        const int32_t e = ids[i];
-        if (i < 512) s_ids[i] = e;
-        if (e < 0 || e >= n_expert || res[e] < 0) invalid = 1;
-    }
-    if (__any_sync(0xffffffff, invalid)) {
-        if (tid == 0) *skip = 0;
-        return;
-    }
-    __syncwarp();
-
-    int32_t* counts = pl;
-    int32_t* start = pl + 4;
-    int32_t* dst = start + capx + 1;
-    int32_t* tok = dst + capx;
-    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
-    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
-    int32_t* start2 = pl + ptr_off + 4 * capx;
-
-    int groups = 0, entries = 0;
-
-    for (int i0 = 0; i0 < n; ++i0) {
-        const int32_t target_e = (i0 < 512) ? s_ids[i0] : ids[i0];
-        bool first = true;
-        for (int j = 0; j < i0; ++j) {
-            const int32_t prev_e = (j < 512) ? s_ids[j] : ids[j];
-            if (prev_e == target_e) { first = false; break; }
-        }
-        if (!first) continue;
-
-        if (tid == 0) {
-            const int32_t slot = res[target_e];
-            ptr[groups] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
-            start[groups] = entries;
-        }
-
-        for (int base = i0; base < n; base += 32) {
-            const int idx = base + tid;
-            const bool match = (idx < n) && (((idx < 512) ? s_ids[idx] : ids[idx]) == target_e);
-            const uint32_t mask = __ballot_sync(0xffffffff, match);
-            if (match) {
-                const int rank = __popc(mask & ((1u << tid) - 1));
-                dst[entries + rank] = idx;
-                tok[entries + rank] = idx / k;
-            }
-            entries += __popc(mask);
-        }
-        ++groups;
-    }
-
-    if (tid == 0) {
-        start[groups] = entries;
-        start2[0] = entries;
-        counts[0] = groups;
-        counts[1] = entries;
-        counts[2] = 0;
-        __threadfence();
-        *skip = ring;
-    }
-}
 }  // namespace
 
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream) {
-    static const bool use_warp = [] {
-        const char* e = std::getenv("STRATA_WARP_PLAN");
-        return e == nullptr || std::atoi(e) != 0;
-    }();
-    if (use_warp) {
-        resident_plan_warp_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base,
-                                                                       slot_off, blob, plan, capx, skip, ring);
-    } else {
-        resident_plan_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
-                                                                 blob, plan, capx, skip, ring);
-    }
+    resident_plan_kernel<<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
+                                                              blob, plan, capx, skip, ring);
     check("resident_plan");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
@@ -580,10 +624,6 @@ void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip,
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
                                  void* stream) {
     if (n <= 0) return;
-    if (n > 0x7fffffffLL) {   // D2 bounds: the kernel's n is int; fail closed, never truncate
-        std::fprintf(stderr, "copy_i32_from_mapped_unless: n=%lld exceeds the kernel bound; refusing\n", n);
-        std::exit(1);
-    }
     copy_i32_unless_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n, skip, value);
     check("copy_i32_from_mapped_unless");
 }
@@ -626,7 +666,9 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 // a GPU timestamp (ns, %globaltimer) into buf[i] - the verify window's stage profiler
 namespace { __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
     unsigned long long t;
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)
+    t = wall_clock64() * 40ull;   // gfx906: the wall clock runs at 25 MHz (hipDeviceAttributeWallClockRate) -> ns
+#elif defined(__HIPCC__)
     t = wall_clock64() * 10ull;   // gfx10.3 / gfx11 / gfx12: a constant 100 MHz counter, in ns
 #else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -635,149 +677,6 @@ namespace { __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
 } }
 void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
-}
-
-// Task 7.2: Device-Side Speculative Tree Verification & Path Selection Kernel
-// Cross-Engine Reference: Sequoia (SOSP 2024), EAGLE-2 (arXiv:2406.16858)
-namespace {
-__global__ void spec_tree_verify_dp_kernel(
-    const int32_t* __restrict__ tree_tokens,
-    const int32_t* __restrict__ target_tokens,
-    const int32_t* __restrict__ parents,
-    const float* __restrict__ log_probs,
-    int32_t* __restrict__ best_path_indices,
-    int32_t* __restrict__ n_accepted,
-    int T) {
-
-    __shared__ int32_t s_valid[16];
-    __shared__ int32_t s_len[16];
-    __shared__ float s_score[16];
-    __shared__ int32_t s_parent[16];
-
-    const int tid = threadIdx.x;
-    if (tid < 16) {
-        s_valid[tid] = 0;
-        s_len[tid] = 0;
-        s_score[tid] = -1e9f;
-        s_parent[tid] = (tid < T) ? parents[tid] : -1;
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        if (T <= 0) {
-            *n_accepted = 0;
-            return;
-        }
-
-        // Root (node 0) is unconditionally valid as the prefix/anchor
-        s_valid[0] = 1;
-        s_len[0] = 1;
-        s_score[0] = (log_probs != nullptr) ? log_probs[0] : 0.0f;
-
-        // DP pass over nodes in topological order (parent[i] < i)
-        for (int i = 1; i < T; ++i) {
-            const int p = s_parent[i];
-            if (p >= 0 && p < i && s_valid[p]) {
-                const int32_t expected = target_tokens[p];
-                const int32_t actual = tree_tokens[i];
-                if (actual == expected) {
-                    s_valid[i] = 1;
-                    s_len[i] = s_len[p] + 1;
-                    const float score_inc = (log_probs != nullptr) ? log_probs[i] : 0.0f;
-                    s_score[i] = s_score[p] + score_inc;
-                }
-            }
-        }
-
-        // Find leaf node with maximum length, breaking ties with cumulative score
-        int best_node = 0;
-        int max_len = 1;
-        float max_score = s_score[0];
-
-        for (int i = 1; i < T; ++i) {
-            if (s_valid[i]) {
-                if (s_len[i] > max_len || (s_len[i] == max_len && s_score[i] > max_score)) {
-                    max_len = s_len[i];
-                    max_score = s_score[i];
-                    best_node = i;
-                }
-            }
-        }
-
-        // Backtrack path from best_node to root
-        int32_t path_rev[16];
-        int curr = best_node;
-        int count = 0;
-        while (curr >= 0 && count < 16) {
-            path_rev[count++] = curr;
-            curr = s_parent[curr];
-        }
-
-        // Emit best_path_indices in forward (root-to-leaf) order
-        for (int k = 0; k < count; ++k) {
-            best_path_indices[k] = path_rev[count - 1 - k];
-        }
-        *n_accepted = count;
-    }
-}
-__global__ void gpu_timeline_signal_kernel(uint64_t* timeline, uint64_t val) {
-    if (threadIdx.x == 0 && timeline != nullptr) {
-        __threadfence_system();
-        atomicMax((unsigned long long*) timeline, (unsigned long long) val);
-        __threadfence_system();
-    }
-}
-
-__global__ void gpu_timeline_wait_ge_kernel(const volatile uint64_t* timeline, uint64_t val) {
-    if (threadIdx.x == 0 && timeline != nullptr) {
-        while (*timeline < val) {
-            __nanosleep(50);
-        }
-        __threadfence_system();
-    }
-}
-
-__global__ void gpu_stamp_kernel(uint32_t* flag, uint32_t val) {
-    if (threadIdx.x == 0 && flag != nullptr) {
-        __threadfence_system();
-        atomicExch((unsigned int*) flag, (unsigned int) val);
-        __threadfence_system();
-    }
-}
-
-}  // namespace
-
-void spec_tree_verify_dp(const int32_t* tree_tokens,
-                         const int32_t* target_tokens,
-                         const int32_t* parents,
-                         const float* log_probs,
-                         int32_t* best_path_indices,
-                         int32_t* n_accepted,
-                         int T,
-                         void* stream) {
-    if (T <= 0) return;
-    const int actual_t = (T > 16) ? 16 : T;
-    spec_tree_verify_dp_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(
-        tree_tokens, target_tokens, parents, log_probs, best_path_indices, n_accepted, actual_t);
-    check("spec_tree_verify_dp");
-}
-
-void gpu_timeline_signal(uint64_t* timeline, uint64_t val, void* stream) {
-    if (!timeline) return;
-    gpu_timeline_signal_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(timeline, val);
-    check("gpu_timeline_signal");
-}
-
-void gpu_timeline_wait_ge(const uint64_t* timeline, uint64_t val, void* stream) {
-    if (!timeline) return;
-    gpu_timeline_wait_ge_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(timeline, val);
-    check("gpu_timeline_wait_ge");
-}
-
-void gpu_stamp(uint32_t* flag, uint32_t val, void* stream) {
-    if (!flag) return;
-    gpu_stamp_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(flag, val);
-    check("gpu_stamp");
 }
 
 }  // namespace strata::kernels

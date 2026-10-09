@@ -1,5 +1,3 @@
-#include "strata/kernels/kv_q4.hpp"
-#include "strata/kernels/kv_q8.hpp"
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
 #include "strata/core/session.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -40,16 +38,16 @@ uint64_t align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
 /// The floats one GDN layer's recurrent + conv state needs.  `gdn_buffers_bytes` carves them for ONE layer and
 /// `GdnBuffers::state`/`conv_state` point INTO that carve, so a session with 36 GDN layers has to give each one
 /// its own - they cannot share, because the recurrence is the whole point.
-}  // namespace
-
 uint64_t gdn_state_floats(const ModelGeometry& g) {
     return (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
            (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
 }
 
+}  // namespace
+
 /// `NG_HIST` rows of `hc_dim` floats: the PLE conv's history, which is the ONLY PLE state that lives in the
 /// session arena.  The table and the weights are model-level and the caller owns them.
-uint64_t ple_hist_bytes() {
+static uint64_t ple_hist_bytes() {
     return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
@@ -162,97 +160,6 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     s.ple_prev[0] = -1;
     s.ple_prev[1] = -1;
     s.ple_token = -1;
-}
-
-bool session_fork(const SessionState& parent, SessionState& child, const ModelGeometry& g,
-                  int64_t prefix_tokens, void* stream, std::string& err,
-                  const float* parent_R, const float* parent_gdn, const float* parent_ple,
-                  const int32_t* parent_ple_prev, int32_t parent_ple_token) {
-    cudaStream_t cs = (cudaStream_t) stream;
-    if (child.gdn_alloc != parent.gdn_alloc || child.qsa_alloc != parent.qsa_alloc ||
-        child.gdn_ord0 != parent.gdn_ord0 || child.qsa_ord0 != parent.qsa_ord0) {
-        err = "session_fork: incompatible session carve";
-        return false;
-    }
-    // 1. Residual block.R
-    const float* src_R = parent_R ? parent_R : parent.block.R;
-    if (src_R && child.block.R) {
-        cudaMemcpyAsync(child.block.R, src_R, (size_t) g.hc * g.n_embd * sizeof(float),
-                        cudaMemcpyDeviceToDevice, cs);
-    }
-    // 2. GDN recurrence and conv history across all owned GDN layers
-    const float* src_gdn = parent_gdn ? parent_gdn : parent.gdn_state;
-    if (child.gdn_alloc > 0 && src_gdn && child.gdn_state) {
-        cudaMemcpyAsync(child.gdn_state, src_gdn,
-                        (size_t) child.gdn_alloc * gdn_state_floats(g) * sizeof(float),
-                        cudaMemcpyDeviceToDevice, cs);
-    }
-    // 3. PLE conv history and token window
-    const float* src_ple = parent_ple ? parent_ple : parent.ple_hist;
-    if (src_ple && child.ple_hist) {
-        cudaMemcpyAsync(child.ple_hist, src_ple, (size_t) ple_hist_bytes(),
-                        cudaMemcpyDeviceToDevice, cs);
-    }
-    if (parent_ple_prev) {
-        child.ple_prev[0] = parent_ple_prev[0];
-        child.ple_prev[1] = parent_ple_prev[1];
-    } else {
-        child.ple_prev[0] = parent.ple_prev[0];
-        child.ple_prev[1] = parent.ple_prev[1];
-    }
-    child.ple_token = (parent_ple_token != -1) ? parent_ple_token : parent.ple_token;
-
-    // 4. QSA attention layers: copy KV pools and indexer up to prefix_tokens
-    const int64_t cells = std::min<int64_t>(prefix_tokens, child.max_cells);
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-    s.n_head = g.n_head;
-    s.n_head_kv = g.n_head_kv;
-    s.head_dim = g.head_dim;
-    s.idx_n_head = g.idx_q_heads;
-    s.idx_dim = g.idx_key_dim;
-    const int64_t pages = (cells + s.page_size - 1) / s.page_size;
-    const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
-    for (int64_t j = 0; j < child.qsa_alloc; ++j) {
-        const QsaState& pst = parent.qsa_states[parent.qsa_ord0 + j];
-        QsaState& cst = child.qsa_states[child.qsa_ord0 + j];
-        if (cells > 0) {
-            if (cst.kv_hybrid) {
-                const size_t k_bytes = rows * s.head_dim;
-                const size_t sc_bytes = rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
-                const size_t v_bytes = rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
-                if (pst.k_q && cst.k_q) cudaMemcpyAsync(cst.k_q, pst.k_q, k_bytes, cudaMemcpyDeviceToDevice, cs);
-                if (pst.k_scale && cst.k_scale) cudaMemcpyAsync(cst.k_scale, pst.k_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
-                if (pst.v_q4 && cst.v_q4) cudaMemcpyAsync(cst.v_q4, pst.v_q4, v_bytes, cudaMemcpyDeviceToDevice, cs);
-            } else if (cst.kv_q4) {
-                const size_t bytes = rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
-                if (pst.k_q4 && cst.k_q4) cudaMemcpyAsync(cst.k_q4, pst.k_q4, bytes, cudaMemcpyDeviceToDevice, cs);
-                if (pst.v_q4 && cst.v_q4) cudaMemcpyAsync(cst.v_q4, pst.v_q4, bytes, cudaMemcpyDeviceToDevice, cs);
-            } else if (cst.kv_int8) {
-                const size_t bytes = rows * s.head_dim;
-                const size_t sc_bytes = rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
-                if (pst.k_q && cst.k_q) cudaMemcpyAsync(cst.k_q, pst.k_q, bytes, cudaMemcpyDeviceToDevice, cs);
-                if (pst.v_q && cst.v_q) cudaMemcpyAsync(cst.v_q, pst.v_q, bytes, cudaMemcpyDeviceToDevice, cs);
-                if (pst.k_scale && cst.k_scale) cudaMemcpyAsync(cst.k_scale, pst.k_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
-                if (pst.v_scale && cst.v_scale) cudaMemcpyAsync(cst.v_scale, pst.v_scale, sc_bytes, cudaMemcpyDeviceToDevice, cs);
-            } else {
-                const size_t bytes = rows * s.head_dim * 2;
-                if (pst.k_pool && cst.k_pool) cudaMemcpyAsync(cst.k_pool, pst.k_pool, bytes, cudaMemcpyDeviceToDevice, cs);
-                if (pst.v_pool && cst.v_pool) cudaMemcpyAsync(cst.v_pool, pst.v_pool, bytes, cudaMemcpyDeviceToDevice, cs);
-            }
-            // Indexer tail and dead states
-            const size_t tail_bytes = (size_t) (s.idx_block - 1) * s.idx_dim * sizeof(float);
-            const size_t dead_bytes = (size_t) s.idx_dim * sizeof(float);
-            if (pst.idx_tail && cst.idx_tail) cudaMemcpyAsync(cst.idx_tail, pst.idx_tail, tail_bytes, cudaMemcpyDeviceToDevice, cs);
-            if (pst.idx_dead && cst.idx_dead) cudaMemcpyAsync(cst.idx_dead, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
-            if (pst.idx_block_pos && cst.idx_block_pos) cudaMemcpyAsync(cst.idx_block_pos, pst.idx_block_pos, sizeof(int32_t), cudaMemcpyDeviceToDevice, cs);
-            const int64_t pooled_rows = prefix_tokens / s.idx_block;
-            if (pooled_rows > 0 && pst.idx_pooled && cst.idx_pooled) {
-                cudaMemcpyAsync(cst.idx_pooled, pst.idx_pooled, (size_t) pooled_rows * s.idx_dim * sizeof(float), cudaMemcpyDeviceToDevice, cs);
-                cudaMemcpyAsync(cst.idx_pooled + (size_t) pooled_rows * s.idx_dim, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
-            }
-        }
-    }
-    return true;
 }
 
 /// Sets `s.gdn.state`/`conv_state` for `layer`, which is what makes one layer's GDN state its own.  Shared by
@@ -368,34 +275,9 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
     return true;
 }
 
-// ================================ THE REPLAY FAMILY IS WHOLE-MODEL ================================
-// **A REPLAY PATH LAUNCHES ONE SESSION'S EVERY LAYER AND REPORTS A WHOLE-MODEL NUMBER.**  A layer-split stage's
-// session is not a whole model: it owns [layer_lo, layer_hi) and takes its input from the previous stage's
-// hand-off (serve runs the stages' verifiers; the prompt path runs the stages' prefill chain).  A range capture
-// has `gr.n` == its range's length - not `g.n_layers` - so these paths REFUSE it rather than launch a graph list
-// that stops at the carve's edge while the caller reads a whole-model number.
-namespace {
-bool whole_model_capture(const ModelGeometry& g, const SessionGraphs& gr, const char* what, std::string& err) {
-    if (gr.captured && gr.n == g.n_layers) return true;
-    err = std::string(what) + ": these paths run the whole model through one session; this capture covers " +
-          std::to_string(gr.n) + " of " + std::to_string(g.n_layers) + " layers" +
-          (gr.captured ? "" : " (nothing is captured)") +
-          " - a layer split serves its stages through their verifiers and prompt chain";
-    return false;
-}
-/// The token paths (`session_token`, `session_capture_token` - and through the capture guard, `session_run_token`)
-/// need the same thing of the SESSION: one carved for the whole model.  An unresolved session (a hand-built one
-/// that never ran `session_init`) has 0/0 here and is left alone - only a session `session_init` resolved to a
-/// partial range is refused.
-bool whole_model_session(const ModelGeometry& g, const SessionState& s) {
-    return s.layer_lo == 0 && (s.layer_hi == 0 || s.layer_hi == g.n_layers) &&
-           s.qsa_ord0 == 0 && s.gdn_ord0 == 0;
-}
-}  // namespace
-
 bool session_replay(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
                     void* stream, std::string& err) {
-    if (!whole_model_capture(g, gr, "session_replay", err)) return false;
+    if (!gr.captured || gr.n != g.n_layers) { err = "session_replay: not captured"; return false; }
     cudaStream_t cs = (cudaStream_t) stream;
     stage_token(g, pos, pos_base, s);
     for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -410,8 +292,7 @@ bool session_replay(const ModelGeometry& g, int64_t pos, int32_t pos_base, Sessi
 
 bool session_replay_full(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s,
                          SessionGraphs& gr, void* stream, std::string& err) {
-    if (!whole_model_capture(g, gr, "session_replay_full", err)) return false;
-    if (gr.posts == nullptr) {
+    if (!gr.captured || gr.n != g.n_layers || gr.posts == nullptr) {
         err = "session_replay_full: not captured with post graphs";
         return false;
     }
@@ -441,7 +322,6 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
         err = "session_replay_stages: not captured with the split";
         return false;
     }
-    if (!whole_model_capture(g, gr, "session_replay_stages_per_layer", err)) return false;
     cudaStream_t cs = (cudaStream_t) stream;
     stage_token(g, pos, pos_base, s);
 
@@ -498,7 +378,6 @@ bool session_replay_stage_sweep(const ModelGeometry& g, int64_t pos, int32_t pos
         err = "session_replay_stage_sweep: not captured with the split";
         return false;
     }
-    if (!whole_model_capture(g, gr, "session_replay_stage_sweep", err)) return false;
     if (k < 1 || k > 5) { err = "session_replay_stage_sweep: k must be 1..5"; return false; }
     cudaStream_t cs = (cudaStream_t) stream;
     stage_token(g, pos, pos_base, s);
@@ -540,7 +419,6 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
         err = "session_replay_stage_prefixes: not captured with the split";
         return false;
     }
-    if (!whole_model_capture(g, gr, "session_replay_stage_prefixes", err)) return false;
     cudaStream_t cs = (cudaStream_t) stream;
     stage_token(g, pos, pos_base, s);
     const int64_t n = g.n_layers;
@@ -669,9 +547,7 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
     const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
     if (!cores.empty()) {
         pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
-        pinned = true;
-        // The pre-pin allowed set, for the auxiliary threads that must not inherit this pin (see pool.hpp).
-        strata::kernels::cpu::remember_spawn_mask(pinned_core);
+        pinned = pinned_core.valid;
     }
     return true;
 }
@@ -682,7 +558,7 @@ void SessionLoopScratch::free() {
     if (pinned) {
         strata::kernels::cpu::restore_thread_affinity(pinned_core);
         pinned = false;
-        pinned_core = -1;
+        pinned_core = {};
     }
     if (probe != nullptr) { cudaEventDestroy(probe); probe = nullptr; }
     if (y_miss != nullptr) { cudaFreeHost(y_miss); y_miss = nullptr; }
@@ -692,7 +568,7 @@ void SessionLoopScratch::free() {
 bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
                   PoolFn pool, HitFn hits, void* user, bool overlap, void* stream, std::string& err,
                   float* dump_layers, SessionLoopScratch* scratch) {
-    if (!whole_model_capture(g, gr, "session_loop", err)) return false;
+    if (!gr.captured || gr.n != g.n_layers) { err = "session_loop: not captured"; return false; }
     if (gr.parts_dev == nullptr) { err = "session_loop: the graphs were captured without a parts buffer"; return false; }
     if (s.db == nullptr) { err = "session_loop: no doorbell; the loop has nothing to poll"; return false; }
 
@@ -905,14 +781,6 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                    SessionState& s, const float* parts, void* stream, bool sync_every_layer,
                    std::string& err) {
-    // **THE TOKEN PATHS ARE WHOLE-MODEL, LIKE THE REPLAY FAMILY.**  This one broadcasts ONE embedding into `R`
-    // and walks every layer to the head, and the row arithmetic below assumes a whole-model session
-    // (`gdn_index` is the model-global GDN ordinal); a layer-split stage's session would index
-    // `gdn_state`/`qsa_states` outside its carve.  Refuse it here rather than corrupt state.
-    if (!whole_model_session(g, s)) {
-        err = "session_token: a layer-split stage session cannot run the whole-model token path";
-        return false;
-    }
     cudaStream_t cs = (cudaStream_t) stream;
     int64_t qsa_index = 0;
     int64_t gdn_index = 0;
@@ -961,11 +829,6 @@ namespace strata::core {
 bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, SessionState& s, float* parts_dev,
                            const float* y_miss_host, size_t parts_bytes, TokenGraph& tg, std::string& err,
                            const TokenHits* hits) {
-    // the same whole-model rule as `session_token`: the captured graph holds every layer and reads one session.
-    if (!whole_model_session(g, s)) {
-        err = "session_capture_token: a layer-split stage session cannot capture the whole-model token graph";
-        return false;
-    }
     if (hits != nullptr && !hits->on()) { err = "session_capture_token: incomplete hit configuration"; return false; }
     if (tg.captured) return true;
     if (s.db == nullptr || s.db->d_flag == nullptr || s.db->d_seq == nullptr) {

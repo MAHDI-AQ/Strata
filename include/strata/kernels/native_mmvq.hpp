@@ -38,9 +38,13 @@ bool native_mmvq_multi_exact();
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
                           void* stream);
 
-void native_fused_swiglu_quantize_q8_1(const float* gate, const float* up,
-                                       void* x_q8_1, int n_in, int ncols,
-                                       void* stream);
+void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
+                                 int n_in, int ncols, void* stream);
+inline void native_fused_swiglu_quantize_q8_1(const float* gate, const float* up,
+                                              void* x_q8_1, int n_in, int ncols,
+                                              void* stream) {
+    native_swiglu_quantize_q8_1(gate, up, x_q8_1, n_in, ncols, stream);
+}
 
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
