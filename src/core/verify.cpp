@@ -1377,8 +1377,7 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
                     for (const auto& b : batch) {
                         sample_tokens(head_logits_ + (size_t) r_member * n_vocab_, b.count,
                                       (int) n_vocab_, nullptr, 0, sp, b.verifier->m_out_, cs_);
-                        if (b.verifier->head_sampling_ &&
-                            ((!b.verifier->sampling_.greedy && b.verifier->sampling_.temperature > 0.0f) || b.verifier->hist_d_ != nullptr)) {
+                        if (b.verifier->head_sampling_ && b.verifier->head_logits_ != nullptr) {
                             copy(b.verifier->head_logits_, head_logits_ + (size_t) r_member * n_vocab_,
                                  (size_t) b.count * n_vocab_ * sizeof(float), cs_);
                         }
@@ -1586,7 +1585,7 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
     // ---- the last stage: the head ran here (members' phase 4) — sampling and outputs
     for (const auto& b : batch) {
         Verifier& v = *b.verifier;
-        if (v.head_sampling_ && ((!v.sampling_.greedy && v.sampling_.temperature > 0) || v.hist_d_)) {
+        if (v.head_sampling_ && v.head_logits_ != nullptr && ((!v.sampling_.greedy && v.sampling_.temperature >= 1e-4f) || v.hist_d_)) {
             auto sp = v.sampling_;
             sp.counter = (uint64_t) b.position;
             sample_tokens(v.head_logits_, b.count, (int) v.n_vocab_, v.hist_d_, v.hist_len_, sp, v.m_out_, cs_);
@@ -2017,7 +2016,7 @@ bool Verifier::end_pass_batch(const std::vector<BatchWindow>& batch, std::string
     // ---- the last stage: the head ran here (members' phase 4) - sampling and outputs
     for (const auto& b : batch) {
         Verifier& v = *b.verifier;
-        if (v.head_sampling_ && ((!v.sampling_.greedy && v.sampling_.temperature > 0) || v.hist_d_)) {
+        if (v.head_sampling_ && v.head_logits_ != nullptr && ((!v.sampling_.greedy && v.sampling_.temperature >= 1e-4f) || v.hist_d_)) {
             auto sp = v.sampling_;
             sp.counter = (uint64_t) b.position;
             sample_tokens(v.head_logits_, b.count, (int) v.n_vocab_, v.hist_d_, v.hist_len_, sp, v.m_out_, cs_);

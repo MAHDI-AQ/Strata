@@ -1317,7 +1317,7 @@ class Service:
         self.idle_unload_s = 0
         self.min_free_vram_mib = 0
         self.before_load = None
-        self.reasoning_budget_tokens = 32768                 # #123: the config's default thinking budget (0: none)
+        self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))

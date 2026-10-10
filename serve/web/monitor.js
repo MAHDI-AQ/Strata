@@ -57,7 +57,7 @@ function content() {
 async function showDetail() {
   if (!selected) return;
   const id = selected;
-  const value = await api(`/api/requests?id=${encodeURIComponent(id)}`);
+  const value = await api(`api/requests?id=${encodeURIComponent(id)}`);
   if (selected !== id) return;
   detail = value; $("selection").hidden = false; $("no-selection").hidden = true;
   text("detail-title", `${value.id} · ${value.path}`);
@@ -72,7 +72,7 @@ async function showDetail() {
 }
 async function refresh() {
   try {
-    const [status, history, metrics] = await Promise.all([api("/v1/status"), api("/api/requests"), api("/metrics").catch(() => null)]);
+    const [status, history, metrics] = await Promise.all([api("v1/status"), api("api/requests"), api("metrics").catch(() => null)]);
     state = status; records = history.requests;
     status.loaded = history.loaded; status.auto_load = history.auto_load;
     if (selected && !records.some(r => r.id === selected)) {
