@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Strata</title>
 <link rel="stylesheet" href="web/tokens.css">
-<link rel="stylesheet" href="web/components.css">
-<link rel="stylesheet" href="web/app.css">
+<link rel="stylesheet" href="web/components.css?v=1791633689">
+<link rel="stylesheet" href="web/app.css?v=1791633689">
 <script>
   // the theme before the first paint: the saved choice, else the system's
   try {
@@ -94,15 +94,48 @@
 
       <div class="monitor-row">
         <div class="st-card ctx-card">
-          <span class="card-title">Context fill</span>
-          <div class="ctx-gauge">
-            <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
-              <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
-                      stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
-              <circle class="st-gauge__fill" id="ctx-fill" cx="60" cy="60" r="50" fill="none" stroke-width="10"
-                      stroke-linecap="round" stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
-            </svg>
-            <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct">0%</span><span class="muted" id="ctx-sub">&ndash;</span></div>
+          <div class="ctx-card-header">
+            <span class="card-title">Parallel Slots & Context Fill</span>
+            <span class="muted small" id="slots-summary">2 Slots · 262k ctx each</span>
+          </div>
+          <div class="slots-container" id="slots-container">
+            <!-- Dynamically populated per slot -->
+            <div class="slot-box" id="slot-0">
+              <div class="slot-head">
+                <span class="slot-name"><b>Slot 0</b></span>
+                <span class="st-badge" id="slot-badge-0">Idle</span>
+              </div>
+              <div class="slot-gauge-wrap">
+                <div class="ctx-gauge ctx-gauge--sm">
+                  <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
+                    <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
+                            stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
+                    <circle class="st-gauge__fill" id="ctx-fill-0" cx="60" cy="60" r="50" fill="none" stroke-width="10"
+                            stroke-linecap="round" stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+                  </svg>
+                  <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct-0">0%</span><span class="muted" id="ctx-sub-0">&ndash;</span></div>
+                </div>
+              </div>
+              <div class="slot-detail-row"><span class="muted">Req / Speed:</span> <span id="slot-speed-0">&ndash;</span></div>
+            </div>
+            <div class="slot-box" id="slot-1">
+              <div class="slot-head">
+                <span class="slot-name"><b>Slot 1</b></span>
+                <span class="st-badge" id="slot-badge-1">Idle</span>
+              </div>
+              <div class="slot-gauge-wrap">
+                <div class="ctx-gauge ctx-gauge--sm">
+                  <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
+                    <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
+                            stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
+                    <circle class="st-gauge__fill" id="ctx-fill-1" cx="60" cy="60" r="50" fill="none" stroke-width="10"
+                            stroke-linecap="round" stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+                  </svg>
+                  <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct-1">0%</span><span class="muted" id="ctx-sub-1">&ndash;</span></div>
+                </div>
+              </div>
+              <div class="slot-detail-row"><span class="muted">Req / Speed:</span> <span id="slot-speed-1">&ndash;</span></div>
+            </div>
           </div>
           <div class="bar-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
           <div class="st-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div>
@@ -218,6 +251,6 @@
 </aside>
 <div class="scrim" id="scrim" hidden></div>
 <div class="st-toasts" id="toasts" aria-live="polite"></div>
-<script src="web/app.js"></script>
+<script src="web/app.js?v=1791633689"></script>
 </body>
 </html>

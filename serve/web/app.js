@@ -271,16 +271,56 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   }
   spark("sp-disk", h.disk_read_mb);
 
-  // context fill: the running request, else the last one
+  // context fill & parallel slot rendering
   const ctx = eng.max_context || 0;
-  let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-  const frac = ctx ? Math.min(1, used / ctx) : 0;
-  $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
-  $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
-  $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
-  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+  const slots = d.slots || [];
+  const numSlots = slots.length || (eng.concurrency || 2);
+  if ($("slots-summary")) $("slots-summary").textContent = `${numSlots} Parallel Slots · ${ctxfmt(ctx)} each`;
+
+  // Render each slot individually
+  for (let sId = 0; sId < 2; sId++) {
+    const slot = slots.find(s => s.id === sId) || { id: sId, status: "idle", prompt_tokens: 0, generated: 0 };
+    let sUsed = (slot.prompt_tokens || 0) + (slot.generated || 0);
+    // If idle and this slot has a recent request or last request
+    if (slot.status === "idle" && last && sId === 0 && live.state === "idle") {
+      sUsed = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+    }
+    const sFrac = ctx ? Math.min(1, sUsed / ctx) : 0;
+    const fillEl = $(`ctx-fill-${sId}`);
+    if (fillEl) {
+      fillEl.setAttribute("stroke-dasharray", `${(235.6 * sFrac).toFixed(1)} 314.2`);
+      fillEl.style.opacity = 235.6 * sFrac >= 3 ? "1" : "0";
+    }
+    if ($(`ctx-pct-${sId}`)) $(`ctx-pct-${sId}`).textContent = `${Math.round(sFrac * 100)}%`;
+    if ($(`ctx-sub-${sId}`)) $(`ctx-sub-${sId}`).textContent = ctx ? `${kfmt(sUsed)} / ${ctxfmt(ctx)}` : "–";
+    
+    const badgeEl = $(`slot-badge-${sId}`);
+    if (badgeEl) {
+      if (slot.status === "reading") {
+        badgeEl.className = "st-badge st-badge--reading";
+        badgeEl.textContent = "Reading";
+      } else if (slot.status === "generating") {
+        badgeEl.className = "st-badge st-badge--generating";
+        badgeEl.textContent = slot.phase ? slot.phase[0].toUpperCase() + slot.phase.slice(1) : "Generating";
+      } else {
+        badgeEl.className = "st-badge";
+        badgeEl.textContent = "Idle";
+      }
+    }
+    
+    const speedEl = $(`slot-speed-${sId}`);
+    if (speedEl) {
+      if (slot.status === "generating" && slot.tok_s) {
+        speedEl.innerHTML = `<b>${slot.tok_s}</b> tok/s`;
+      } else if (slot.status === "reading") {
+        speedEl.innerHTML = `prefill in progress`;
+      } else if (sId === 0 && last && live.state === "idle" && last.decode_tok_s) {
+        speedEl.textContent = `last: ${last.decode_tok_s} t/s`;
+      } else {
+        speedEl.textContent = "–";
+      }
+    }
+  }
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
   $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";

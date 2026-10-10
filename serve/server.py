@@ -1275,6 +1275,8 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.concurrency = int((getattr(engine, "info", {}) or {}).get("concurrency", 1))
         self.fifo = threading.BoundedSemaphore(self.concurrency)
+        self.available_slots = set(range(self.concurrency))
+        self.slots_state = {i: {"id": i, "status": "idle", "request_id": None, "phase": None, "prompt_tokens": 0, "generated": 0, "max_tokens": 0, "tok_s": None, "started": None} for i in range(self.concurrency)}
         self.active_requests = 0
         self.live_requests = {}
         self.request_serial = 0
@@ -1663,7 +1665,9 @@ class Service:
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
-        return {"engine": engine, "live": live, "active_requests": active, "requests": hist[::-1][:None if all_requests else 12],
+        with self.status_lock:
+            slots_data = [dict(sl) for sl in self.slots_state.values()]
+        return {"engine": engine, "live": live, "slots": slots_data, "active_requests": active, "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -1790,6 +1794,9 @@ class Service:
                 if self.live_first_token is None:
                     self.live_first_token = s["first_token"]
                 self.rate.append((time.time(), self.live_generated))
+                slot_id = s.get("slot_id")
+                if slot_id is not None and slot_id in self.slots_state:
+                    self.slots_state[slot_id].update(status="generating", phase=s.get("phase"), generated=n, tok_s=round(n / max(1e-6, time.time() - s["first_token"]), 1) if s.get("first_token") else None)
                 for ev in evs:
                     if ev.kind == "reasoning":
                         s["phase"] = "thinking"
@@ -1879,7 +1886,10 @@ class Service:
                         request_started = time.time()
                         self.request_serial += 1
                         request_id = self.request_serial
-                        self.live_requests[request_id] = dict(phase="reading the prompt", prompt_tokens=len(ids), generated=0,
+                        slot_id = min(self.available_slots) if self.available_slots else 0
+                        self.available_slots.discard(slot_id)
+                        self.slots_state[slot_id] = {"id": slot_id, "status": "reading", "request_id": request_id, "phase": "reading the prompt", "prompt_tokens": len(ids), "generated": 0, "max_tokens": max_new, "tok_s": None, "started": request_started}
+                        self.live_requests[request_id] = dict(slot_id=slot_id, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                            started=request_started, first_token=None, tool=None, tail="", max_tokens=max_new)
                         self._refresh_status_locked()
                         self.last_request_at = time.time()
@@ -2026,6 +2036,9 @@ class Service:
                         if request_started is not None:
                             self.active_requests -= 1
                             self.live_requests.pop(request_id, None)
+                            if "slot_id" in locals() and slot_id is not None:
+                                self.available_slots.add(slot_id)
+                                self.slots_state[slot_id] = {"id": slot_id, "status": "idle", "request_id": None, "phase": None, "prompt_tokens": 0, "generated": 0, "max_tokens": 0, "tok_s": None, "started": None}
                         if not self.live_requests:
                             self.status["busy"] = False
                             self.status.pop("tail", None)
@@ -2641,9 +2654,8 @@ def make_handler(svc: Service):
                 if self._authorized():
                     loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
                     with svc.status_lock:
-                        busy = bool(svc.status.get("busy"))
-                    slot = {"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy}
-                    self._json(200, [slot] if loaded else [])
+                        slots_list = [{"id": s["id"], "n_ctx": svc.engine.max_context, "is_processing": s["status"] != "idle", **s} for s in svc.slots_state.values()]
+                    self._json(200, slots_list if loaded else [])
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())

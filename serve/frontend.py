@@ -55,6 +55,7 @@ class ChatTemplate:
         messages = [m for i, m in enumerate(messages)
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
+                                                      and not _text_of(m.get("reasoning_content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)

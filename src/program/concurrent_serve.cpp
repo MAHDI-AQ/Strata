@@ -23,6 +23,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/core/radix_tree.hpp"
+#include "strata/core/nvme_tier.hpp"
 #include "strata/core/shm_ipc.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/core/continuous_scheduler.hpp"
@@ -733,14 +734,19 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         const int64_t read0 = s.read.load(std::memory_order_acquire);
         // Task 1.2: Fine-grained dynamic chunk sizing & micro-prefill
         int active_decodes = 0;
+        int active_prefills = 0;
         for (const auto& ptr : m.slots) {
             const auto& sl = *ptr;
-            if (sl.active.load(std::memory_order_relaxed) &&
-                sl.read.load(std::memory_order_relaxed) >= sl.position.load(std::memory_order_relaxed)) {
-                ++active_decodes;
+            if (sl.active.load(std::memory_order_relaxed)) {
+                if (sl.read.load(std::memory_order_relaxed) >= sl.position.load(std::memory_order_relaxed)) {
+                    ++active_decodes;
+                } else {
+                    ++active_prefills;
+                }
             }
         }
         int64_t dynamic_chunk = c.prefill_chunk;
+        if (active_prefills >= 2) dynamic_chunk = std::min<int64_t>(dynamic_chunk, 2048);
         if (active_decodes >= 2) dynamic_chunk = std::min<int64_t>(dynamic_chunk, 512);
         else if (active_decodes == 1) dynamic_chunk = std::min<int64_t>(dynamic_chunk, 1024);
 
@@ -898,6 +904,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         return (size_t) 64;
     }();
     core::RadixTree radix_tree(radix_slots, radix_host_slots);
+    const char* nvme_dir_env = std::getenv("STRATA_NVME_TIER_DIR");
+    if (nvme_dir_env && *nvme_dir_env) {
+        auto nvme_tier = std::make_shared<core::NVMeStorageTier>(std::string(nvme_dir_env));
+        radix_tree.set_nvme_tier(nvme_tier);
+        std::fprintf(stderr, "strata-agx concurrent: RadixTree DirectStorage L3 NVMe tier enabled (%s)\n", nvme_tier->base_path().c_str());
+    }
     std::fprintf(stderr, "strata-agx concurrent: RadixTree HiCache L2 host-RAM parking enabled (VRAM slots: %zu, Host-RAM slots: %zu)\n",
                  radix_slots, radix_host_slots);
     core::RadixCompactor radix_compactor(&radix_tree);
@@ -1598,29 +1610,16 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 if (nmax <= best) continue;   // cannot beat the current best: skip before any compare
                 Impl::Slot* cand = nullptr;
                 int64_t candL = 0;
-                if (pending[q].session != 0) {
-                    for (auto& ptr : m.slots) {
-                        const auto& held = *ptr;
-                        if (held.active.load() || held.session != pending[q].session || (int64_t) tokens.size() >= held.max_context) continue;
-                        const int64_t L = (int64_t) held.consumed.size();
-                        if (L < 1 || L > nmax) break;
-                        bool same = true;
-                        for (int64_t i = 0; i < L && same; ++i) same = held.consumed[(size_t) i] == (int32_t) tokens[(size_t) i];
-                        if (same) { cand = ptr.get(); candL = L; }
-                        break;
-                    }
+                for (auto& ptr : m.slots) {
+                    const auto& held = *ptr;
+                    if (held.active.load() || (int64_t) tokens.size() >= held.max_context) continue;
+                    const int64_t L = (int64_t) held.consumed.size();
+                    if (L < 1 || L > nmax || L <= candL) continue;
+                    bool same = true;
+                    for (int64_t i = 0; i < L && same; ++i) same = held.consumed[(size_t) i] == (int32_t) tokens[(size_t) i];
+                    if (same) { candL = L; cand = ptr.get(); }
                 }
-                if (cand == nullptr) {
-                    for (auto& ptr : m.slots) {
-                        const auto& held = *ptr;
-                        if (held.active.load() || (int64_t) tokens.size() >= held.max_context) continue;
-                        const int64_t L = (int64_t) held.consumed.size();
-                        if (L < 1 || L > nmax || L <= candL) continue;
-                        bool same = true;
-                        for (int64_t i = 0; i < L && same; ++i) same = held.consumed[(size_t) i] == (int32_t) tokens[(size_t) i];
-                        if (same) { candL = L; cand = ptr.get(); }
-                    }
-                }
+
                 if (cand != nullptr && candL > best) { best = candL; pick = cand; pick_q = q; }
             }
             if (pick == nullptr) break;
@@ -1730,10 +1729,22 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             const int64_t req_len = (int64_t) req.tokens.size();
             Impl::Slot* pick = nullptr;
 
+            // 1. Prefer an empty slot (consumed.empty()) to preserve cached slots for other conversations
             for (auto& ptr : m.slots) {
-                if (!ptr->active.load() && req_len < ptr->max_context) {
+                if (!ptr->active.load() && req_len < ptr->max_context && ptr->consumed.empty()) {
                     pick = ptr.get();
                     break;
+                }
+            }
+            // 2. If no empty slots, pick round-robin / rotation to avoid constantly thrashing Slot 0
+            if (pick == nullptr) {
+                for (size_t si = 0; si < m.slots.size(); ++si) {
+                    auto& ptr = m.slots[(m.prompt_rotation + si) % m.slots.size()];
+                    if (!ptr->active.load() && req_len < ptr->max_context) {
+                        pick = ptr.get();
+                        m.prompt_rotation = (m.prompt_rotation + si + 1) % m.slots.size();
+                        break;
+                    }
                 }
             }
             if (pick != nullptr) {

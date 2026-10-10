@@ -513,7 +513,10 @@ size_t RadixTree::evict_to_budget(size_t need_bytes) {
     while (device_snapshot_bytes_locked() + need_bytes > vram_budget_) {
         const size_t before = cached_snapshots_;
         evict_lru_locked(before > 0 ? before - 1 : 0);
-        if (cached_snapshots_ >= before) break;
+        if (cached_snapshots_ >= before) {
+            // If leaves were empty or unreferenced leaves were not available, break to avoid infinite loop
+            break;
+        }
         ++evicted;
     }
     return evicted;
@@ -556,7 +559,7 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
             // P18 L1: a node is fork-usable only when the query extends at least one token past its
             // coverage (the reused prefix must not pass the query's last index); a shorter hit falls
             // back to the next-shallower snapshotted ancestor already held in `best`.
-            if ((curr->has_snapshot() || curr->has_host_snapshot()) && (int64_t) n - 1 >= (int64_t) matched_len) {
+            if (curr->has_snapshot() && (int64_t) n - 1 >= (int64_t) matched_len) {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {
@@ -616,7 +619,7 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
             // P18 L1: a node is fork-usable only when the query extends at least one token past its
             // coverage (the reused prefix must not pass the query's last index); a shorter hit falls
             // back to the next-shallower snapshotted ancestor already held in `best`.
-            if ((curr->has_snapshot() || curr->has_host_snapshot()) && (int64_t) n - 1 >= (int64_t) matched_len) {
+            if (curr->has_snapshot() && (int64_t) n - 1 >= (int64_t) matched_len) {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {
@@ -951,9 +954,6 @@ bool RadixTree::fork_to_session(
     std::string& err) {
 
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    if (node && !node->has_snapshot() && node->has_host_snapshot()) {
-        node->unpark_to_device();   // P18/P20: an L2-host-parked node restores before the fork
-    }
     if (!node || !node->has_snapshot()) {
         err = "radix_fork: node has no snapshot";
         return false;
@@ -964,6 +964,10 @@ bool RadixTree::fork_to_session(
             err = "radix_fork: failed to hydrate node from NVMe L3";
             return false;
         }
+    }
+
+    if (node->has_host_snapshot() && !node->has_device_snapshot()) {
+        node->unpark_to_device();   // P18/P20: an L2-host-parked node restores before the fork
     }
 
     const size_t n_stages = stage_devices.size();
@@ -1185,6 +1189,8 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
                 break;
             }
         }
+        if (!host_victim) break;
+
         if (nvme_tier_ && host_victim->has_host_snapshot()) {
             if (host_victim->offload_to_nvme(*nvme_tier_)) {
                 ++cached_nvme_snapshots_;
