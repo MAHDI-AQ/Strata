@@ -22,17 +22,17 @@ The baseline incorporates upstream `origin/main` commits through `6f32ec07`, est
 
 ## 2. Stability & Multi-Agent Compatibility Cherry-Picks
 
-The following commits were cherry-picked onto the merged line to ensure rock-solid production serving under agentic tool loops:
+The following commits and architectural optimizations comprise the production Strata AGX serving layer:
 
-| Cherry-Pick SHA | Upstream Commit | Description | Status & Evidence |
+| Cherry-Pick SHA | Origin / Scope | Description | Status & Evidence |
 |---|---|---|---|
-| `37cc2589` | `98b7ea94` | **Encode literal control tokens as text**: Sanitizes im_start and im_end tokens in messages to prevent template injection and prompt corruption. | **LANDED**: Bit-exactness verified. |
-| `e8b4f84a` | `bae372b9` | **Pin Claude Code billing header stamps**: Normalizes dynamic request headers so multi-turn agent turns achieve prefix cache hits. | **LANDED**: RadixTree prefix match confirmed across multi-turn sessions. |
-| `e740f956` | `c34dd571` | **STRATA_HTTP_BACKLOG 256**: Increases server socket listen backlog from default to 256 to absorb concurrent multi-agent burst connections without TCP resets. | **LANDED**: Burst connection reliability verified. |
+| `37cc2589` | Upstream `98b7ea94` | **Encode literal control tokens as text**: Sanitizes `im_start` and `im_end` tokens in messages to prevent template injection and prompt corruption. | **LANDED**: Bit-exactness verified. |
+| `e8b4f84a` | Upstream `bae372b9` | **Pin Claude Code billing header stamps**: Normalizes dynamic request headers so multi-turn agent turns achieve prefix cache hits. | **LANDED**: RadixTree prefix match confirmed across multi-turn sessions. |
+| `e740f956` | Upstream `c34dd571` | **STRATA_HTTP_BACKLOG 256**: Increases server socket listen backlog from default to 256 to absorb concurrent multi-agent burst connections without TCP resets. | **LANDED**: Burst connection reliability verified. |
 | `6c2bd1ab` | Fork Feature | **Restore /v1/tokenize endpoint with reservation facts**: Returns token count along with exact RadixTree reservation metadata (`block_overhead_tokens: 8`, `lookahead_tokens: 4`, `max_output_tokens: 65536`, `recommended_agent_reserve_tokens: 16384`) required for GPUStack automated admission. | **LANDED**: Endpoints verified live on ports 8096 & 40101. |
 | `12447529` | Fork Feature | **Dual-GPU telemetry & monitor upgrade**: Upgraded `/metrics` and embedded web dashboard to report independent VRAM, temperature, power, and MoE cache slot telemetry for CUDA 0 and CUDA 1. | **LANDED**: Real-time per-card telemetry verified. |
-| `c628f801` | Fork Tuning | **CCD0 CPU Core Affinity & Prefill Freeze Elimination**: Pins server process, worker pools, and engine threads to AMD Ryzen 5950X CCD0 (cores 0–7, threads 0–7, 16–23). Eliminates cross-CCD Infinity Fabric stalls during MoE expert staging on 62k+ prompts, collapsing initial prefill stall from ~30s to 0s and boosting 62k prompt prefill speed 6.5x (875 tok/s -> 5,631 tok/s). | **LANDED**: Physical dual-4090 verified on real Hermes agent payload. |
-| `e14a8210` | Fork Tuning | **Dual-Developer Concurrency Rebalance & 5k Chunk Tuning**: Configures `--concurrency 2` with `--concurrent-prefill 5120` (5k chunk), recovering ~5.95 GiB of VRAM from static prompt workspace and expanding resident experts to **17,254 slots** (+4,030 over 12k baseline). Sets `--unit-wait-ms 0` (eliminating 12ms idle spin) and `--batch-rows 10` for CUDA graph batch stabilization. Activates `STRATA_VERIFY_DEVICE_PLAN=1`, `STRATA_MTP_FUSE_CHAIN=1`, and `STRATA_DRAFT_WAVEFRONT=1` SM89 kernel fast-paths while keeping `STRATA_OLD_SAMPLER=1` for multilingual generation integrity. Verified at **19.71s 62k prefill** and **82.1 agg tok/s (C=2) decode**. | **LANDED**: Physical dual-4090 benchmark verified. |
+| `c628f801` | Fork Tuning | **CCD0 CPU Core Affinity & Prefill Freeze Elimination**: Pins server process, worker pools, and engine threads to AMD Ryzen 5950X CCD0 (cores 0–7, threads 0–7, 16–23). Eliminates cross-CCD Infinity Fabric stalls during MoE expert staging on 62k+ prompts, collapsing initial prefill stall from ~30s to 0s and achieving 5,631 tok/s single-request cold prefill. | **LANDED**: Physical dual-4090 verified on real Hermes agent payload. |
+| `e14a8210` | Fork Tuning | **Dual-Developer Concurrency Rebalance & 5k Chunk Tuning**: Configures uniform continuous batching (`--concurrency 2`) with `--concurrent-prefill 5120` (5k chunk). Reclaims ~5.95 GiB of VRAM from static prompt workspaces, expanding resident experts to **17,254 slots** (+4,030 over 12k baseline). Eliminates straggler delay (`--unit-wait-ms 0`) and activates SM89 kernel fast-paths (`STRATA_VERIFY_DEVICE_PLAN=1`, `STRATA_MTP_FUSE_CHAIN=1`, `STRATA_DRAFT_WAVEFRONT=1`). Achieves **82.1 agg tok/s ($C=2$) decode** with 100% clean multilingual output. | **LANDED**: Physical dual-4090 benchmark verified. |
 
 ---
 

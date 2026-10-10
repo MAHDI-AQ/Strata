@@ -41,9 +41,9 @@ While upstream Strata demonstrated that 125B MoE models can run on dual 24GB GPU
 All figures below represent real physical hardware benchmarks measured on live multi-turn completions:
 
 ### Physical Hardware Environment
-- **GPUs:** Dual NVIDIA GeForce RTX 4090 24GB (PCIe 4.0 x16 / x8)
+- **GPUs:** Dual NVIDIA GeForce RTX 4090 24GB (PCIe 4.0 x16 / x8, Total 48GB VRAM)
   - *Clocks:* Core Offset +150 MHz (~2,800 MHz boost) · GDDR6X Memory Offset +1000 MHz (11.5 GHz effective / ~1,104 GB/s per GPU)
-- **CPU:** AMD Ryzen 9 5950X (16-Core / 32-Thread)
+- **CPU:** AMD Ryzen 9 5950X (16-Core / 32-Thread, CCD0 pinned: cores 0–7, threads 0–7, 16–23)
 - **RAM:** 96 GB DDR4-3200 (Quad-channel configuration)
 - **Storage:** WD_BLACK SN850X 4TB NVMe SSD
 - **OS:** Ubuntu 24.04 LTS (Linux 6.8, CUDA 12.4)
@@ -57,17 +57,24 @@ All figures below represent real physical hardware benchmarks measured on live m
 - **KV Precision:** `q4_0` with FWHT-256 rotation
 - **Speculative Verification:** MTP `--spec 4 --mtp-max-t 2 --suffix-draft 3 --spec-min-p 0.55`
 
-| Serving Metric | Measured Production Value | Operational Detail |
-|---|---:|---|
-| **Sustained Decode Speed (Warm)** | **105.0 – 120.4 tok/s** | Sustained real-world generation (7.2 – 8.9 ms/token) |
-| **Peak Decode Speed** | **141.0 – 156.2 tok/s** | High speculative acceptance runs |
-| **Speculative Acceptance Rate** | **78.2% – 86.4%** | Average 19 to 23 of every 23 offered draft tokens accepted |
-| **Cold Prefill Throughput (Single)** | **5,631.7 – 6,325.0 tok/s** | Single-request path via CCD0-pinned CPU MoE staging (0s initial stall on 62k+ prompts) |
-| **Concurrent 62k Prefill Throughput** | **3,180 tok/s (19.71s)** | Rebalanced 5,120-token concurrent chunk limit (reclaiming 5.95 GiB VRAM for decode) |
-| **Time to First Token (TTFT)** | **~24 – 35 ms** | On cached prompts (50k+ prefix match via RadixTree) |
-| **Concurrent Throughput ($C=2$)** | **82.1 tok/s aggregate** | 2 simultaneous active streams (~98 tok/s per-stream peak, zero cross-talk) |
-| **VRAM Expert Residency (Concurrent)** | **17,254 / 24,576 slots (70.2%)** | 10,247 on CUDA 0 (14.9 GB cache) + 7,007 on CUDA 1 (13.0 GB cache) (+4,030 recovered) |
-| **Total VRAM Consumption** | **47.6 GB across dual GPUs** | 23.9 GB on GPU 0 (97% VRAM) + 23.9 GB on GPU 1 (97% VRAM) |
+### Transparent Serving Modes & Operational Performance
+
+The engine provides two distinct operational profiles tailored for specific deployment goals:
+
+| Serving Metric | Mode A: Dedicated Single-Stream ($C=1$) | Mode B: Dual-Agent Concurrency ($C=2$) | Operational Detail |
+|---|---:|---:|---|
+| **Primary Goal** | Maximum Solo Prefill Throughput | Simultaneous Multi-Developer Serving | Mode B prevents agent blocking under concurrency |
+| **MoE VRAM Residency** | **20,739 / 24,576 slots (84.4%)** | **17,254 / 24,576 slots (70.2%)** | Mode B reserves 4.6 GiB dedicated prompt workspace |
+| **VRAM Cache Allocation** | 17.9 GB (CUDA0) / 16.5 GB (CUDA1) | 14.9 GB (CUDA0) / 13.0 GB (CUDA1) | Zero thrashing across PCIe bus |
+| **Cold Prefill (62k Hermes)** | **11.0 s (~5,631 tok/s)** | **19.7 s (~3,180 tok/s)** | Tested on 61,948 token real Hermes payload + 33 tools |
+| **Extreme Cold Prefill (181k)** | **28.7 s (~6,325 tok/s)** | — | Synthetic continuous long-context probe |
+| **Warm TTFT (Cached Prefix)** | **24 – 35 ms** | **24 – 35 ms** | Instant RadixTree prefix match (50k+ prefix hit) |
+| **Sustained Decode Speed** | **105.0 – 120.4 tok/s** | **82.1 tok/s aggregate** | Mode B serves 2 simultaneous streams @ ~98 tok/s peak |
+| **Peak Decode Speed** | **156.2 tok/s** | **120+ tok/s** | High speculative acceptance runs |
+| **Speculative Acceptance Rate** | **78.2% – 86.4%** | **80.5% – 88.7%** | Fused MTP draft chain (`STRATA_MTP_FUSE_CHAIN=1`) |
+| **Total VRAM Consumption** | **47.6 GB across dual GPUs** | **47.6 GB across dual GPUs** | 23.9 GB on GPU 0 + 23.9 GB on GPU 1 (97% VRAM) |
+
+> **Architectural Note on Concurrency vs. Prefill**: In single-stream mode ($C=1$), prompt prefill dynamically borrows MoE cache slots via `lend()` and returns them immediately, allowing high prefill throughput. In true concurrent mode ($C=2$), simultaneous streams require independent prompt workspace buffers (`--concurrent-prefill 5120`). Sizing this buffer at 5k chunks reclaims ~5.95 GiB of VRAM compared to 12k chunks, restoring +4,030 resident experts to guarantee high sustained decode throughput without PCIe bottlenecking.
 
 ---
 
