@@ -679,7 +679,7 @@ class StrataEngine:
     def sampling_keys(sampling: dict) -> str:
         keys = ""
         t = sampling.get("temperature")
-        if isinstance(t, (int, float)) and float(t) > 0.0:
+        if isinstance(t, (int, float)) and float(t) >= 1e-4:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
         if isinstance(tp, (int, float)) and float(tp) < 1.0:

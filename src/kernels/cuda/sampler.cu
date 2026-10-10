@@ -831,7 +831,7 @@ coupled_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int kp
         if (lane == 0) { sel_ids[i] = id < nv ? id : 0; sel_logit[i] = v; }
     });
     __syncwarp();
-    if (p.greedy || p.temperature <= 0.0f) {   // never launched for greedy requests; the argmax, defensively
+    if (p.greedy || p.temperature < 1e-4f) {   // never launched for greedy requests; the argmax, defensively
         if (lane == 0) { pick[0] = sel_ids[0]; prob[0] = 1.0f; }
     } else {
         sampled_tail_warp<true>(sel_ids, sel_logit, k, p, 0, pick, ex, prob);
@@ -994,7 +994,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     const unsigned shmem = (history != nullptr && history_len > 0 && p.penalty_last_n > 0)
                                ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)   // the penalty bitmap
                                : 0;
-    if (p.greedy || p.temperature <= 0.0f) {
+    if (p.greedy || p.temperature < 1e-4f) {
         // Without penalties (shmem == 0: no window) on sm_90+, a cluster of CTAs per token - the same token; see
         // `sampler_greedy_cluster_kernel`.  STRATA_ARGMAX_MULTI=0: always the one-block kernel.
         static const bool multi = [] {
