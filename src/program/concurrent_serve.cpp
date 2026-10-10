@@ -1030,6 +1030,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             radix_tree.release(s.radix_node);
             s.radix_node = nullptr;
         }
+        for (size_t st = 0; st < m.stages.size(); ++st) {
+            const core::OnDevice on(m.stages[st].device);
+            cudaStreamSynchronize(m.stage_rt[st].prompt_stream);
+        }
         live.erase(s.request.id);
         s.active.store(false);
         int finish_slot_idx = -1;
