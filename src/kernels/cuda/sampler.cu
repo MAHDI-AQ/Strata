@@ -67,6 +67,7 @@ __device__ __forceinline__ float philox_uniform(uint64_t seed, uint64_t counter)
 // unconditionally is the natural reading of the source paper and it INVERTS the penalty on half the
 // vocabulary.  The presence penalty is `float(count > 0)`, a boolean, not the count.
 __device__ __forceinline__ int history_count(const int* __restrict__ h, int n, int v) {
+    if (!h || n <= 0 || v < 0) return 0;
     int c = 0;
     for (int i = 0; i < n; ++i) if (h[i] == v) ++c;
     return c;
