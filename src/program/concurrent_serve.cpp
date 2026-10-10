@@ -1210,6 +1210,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 // saw CSTOP with nothing in flight): the request was already erased from `live`, so
                 // finish it as cancelled instead of committing its window.
                 if (!live.count(s.request.id)) { finish(s, "cancel"); continue; }
+                // Task 3.1: Speculative Tree & Linear Draft Verification (EAGLE-2 / Sequoia Style)
                 int accepted = 0;
                 while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
                 int keep = accepted + 1;

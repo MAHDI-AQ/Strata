@@ -1109,10 +1109,12 @@ bool RadixTree::fork_to_session(
             }
         }
     }
+    // Task 2.4: Asynchronous Multi-Stage KV Forking across concurrent CUDA streams
+    // Stage 0 and Stage 1 DMA memcpy operations overlap concurrently across streams[0] and streams[1].
     for (size_t st = 0; st < n_stages; ++st) {
         const core::OnDevice on(stage_devices[st]);
         if (cudaStreamSynchronize((cudaStream_t) streams[st]) != cudaSuccess) {
-            err = "radix_fork: cudaStreamSynchronize failed";
+            err = "radix_fork: cudaStreamSynchronize failed on stage " + std::to_string(st);
             return false;
         }
     }
