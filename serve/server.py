@@ -783,10 +783,14 @@ class StrataEngine:
                     raise ValueError(line[4:].strip())
         finally:
             if sent and not done:                     # stopped early (stop token, cancel, disconnect)
-                deadline = time.monotonic() + MULTIPLEX_DONE_DRAIN_S
+                try:
+                    self._send(f"CSTOP {number}")       # EAGER DISPATCH: tell engine immediately before draining
+                except OSError:
+                    pass
+                deadline = time.monotonic() + min(0.5, MULTIPLEX_DONE_DRAIN_S)
                 while time.monotonic() < deadline:
                     try:
-                        payload = channel.get(timeout=0.25)
+                        payload = channel.get(timeout=0.05)
                     except queue.Empty:
                         continue
                     if payload is None:               # engine gone
@@ -803,11 +807,6 @@ class StrataEngine:
                 self._channels.pop(number, None)
             self._shared_progress.pop(number, None)          # lock-free (see progress)
             self._shared_queue_wait.pop(number, None)        # D1: lock-free (see progress)
-            if sent and not done:
-                try:
-                    self._send(f"CSTOP {number}")
-                except OSError:
-                    pass
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         if getattr(self, "multiplex", False):
