@@ -77,7 +77,7 @@ IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
-REASONING_ANSWER_RESERVE = 256   # #P28: tokens kept free for the answer when the budget is auto-derived
+REASONING_ANSWER_RESERVE = 32   # #P28: tokens kept free for the answer when the budget is auto-derived
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
@@ -1317,7 +1317,7 @@ class Service:
         self.idle_unload_s = 0
         self.min_free_vram_mib = 0
         self.before_load = None
-        self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.reasoning_budget_tokens = 32768                 # #123: the config's default thinking budget (0: none)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -1862,6 +1862,8 @@ class Service:
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
         request_id = None
+        request_started = None
+        slot_id = None
         with self.status_lock:
             self.status["queued"] += 1
         try:
