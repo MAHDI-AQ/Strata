@@ -189,7 +189,7 @@ function render(m) {
     setPill("idle", "Idle");
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
+  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.slots || []);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -202,33 +202,40 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
-  // model state
-  const on = live.queued > 0 ? "queued" : live.state;
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
-  const prog = $("state-progress");
-  let label = "Waiting for a request", detail = "", pct = 0;
-  if (live.state === "reading") {
-    label = "Reading prompt";
-    prog.dataset.tone = "info";
-    if (live.prompt_total) {
-      pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
-    } else {
-      detail = `${fmt(live.prompt_tokens)} tokens`;
+function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slotsList) {
+  // Dual Slot State Cards rendering (Slot 0 and Slot 1)
+  const slots = slotsList || [];
+  for (let sId = 0; sId < 2; sId++) {
+    const slot = slots.find(s => s.id === sId) || { id: sId, status: "idle", prompt_tokens: 0, generated: 0 };
+    const onSlot = (slot.status === "reading" || slot.status === "generating") ? slot.status : (live.queued > 0 && sId === 0 ? "queued" : "idle");
+    for (const b of document.querySelectorAll(`#state-badges-${sId} .st-badge`)) {
+      b.classList.toggle("on", b.dataset.s === onSlot || (b.dataset.s === slot.status));
     }
-  } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
-    delete prog.dataset.tone;
-    pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
-  } else if (last) {
-    delete prog.dataset.tone;
-    detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
+    const prog = $(`state-progress-${sId}`);
+    let label = "Waiting for a request", detail = "", pct = 0;
+    if (slot.status === "reading") {
+      label = "Reading prompt";
+      if (prog) prog.dataset.tone = "info";
+      pct = slot.max_tokens ? Math.min(100, (100 * (slot.prompt_tokens || 0)) / slot.max_tokens) : 40;
+      detail = `${fmt(slot.prompt_tokens || 0)} prompt tokens`;
+    } else if (slot.status === "generating") {
+      label = slot.phase ? slot.phase[0].toUpperCase() + slot.phase.slice(1) : "Generating";
+      if (prog) delete prog.dataset.tone;
+      pct = slot.max_tokens ? Math.min(100, (100 * (slot.generated || 0)) / slot.max_tokens) : 0;
+      detail = `${fmt(slot.generated || 0)} tokens${slot.tok_s ? ` · ${fmt(slot.tok_s, 1)} tok/s` : ""}`;
+    } else if (last && sId === 0 && live.state === "idle") {
+      if (prog) delete prog.dataset.tone;
+      label = "Idle (Ready)";
+      detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
+    } else {
+      if (prog) delete prog.dataset.tone;
+      label = "Idle (Ready for request)";
+      detail = "Standing by";
+    }
+    if ($(`state-label-${sId}`)) $(`state-label-${sId}`).textContent = label;
+    if ($(`state-detail-${sId}`)) $(`state-detail-${sId}`).textContent = detail;
+    if ($(`state-bar-${sId}`)) $(`state-bar-${sId}`).style.width = `${pct}%`;
   }
-  $("state-label").textContent = label;
-  $("state-detail").textContent = detail;
-  $("state-bar").style.width = `${pct}%`;
 
   // the eight cards
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
@@ -273,7 +280,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
 
   // context fill & parallel slot rendering
   const ctx = eng.max_context || 0;
-  const slots = d.slots || [];
+  const slots = slotsList || [];
   const numSlots = slots.length || (eng.concurrency || 2);
   if ($("slots-summary")) $("slots-summary").textContent = `${numSlots} Parallel Slots · ${ctxfmt(ctx)} each`;
 

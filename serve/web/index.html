@@ -73,19 +73,35 @@
   <!-- ============================ Monitor ============================ -->
   <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" hidden>
     <div class="monitor">
-      <div class="st-card state-card">
-        <div class="state-card__head">
-          <span class="card-title">Model state</span>
-          <span class="badges" id="state-badges">
-            <span class="st-badge" data-s="idle">Idle</span>
-            <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
-            <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
-            <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
-            <span class="st-badge st-badge--error" data-s="error">Error</span>
-          </span>
+      <div class="state-cards-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+        <div class="st-card state-card" id="state-card-0" style="border-left:4px solid var(--st-accent)">
+          <div class="state-card__head">
+            <span class="card-title" style="font-weight:700;color:var(--st-accent)">Slot 0 State</span>
+            <span class="badges" id="state-badges-0">
+              <span class="st-badge" data-s="idle">Idle</span>
+              <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
+              <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
+              <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
+              <span class="st-badge st-badge--error" data-s="error">Error</span>
+            </span>
+          </div>
+          <div class="state-card__row"><span id="state-label-0">Waiting for a request</span><span class="muted" id="state-detail-0"></span></div>
+          <div class="st-progress" id="state-progress-0"><div class="st-progress__bar" id="state-bar-0" style="width:0%"></div></div>
         </div>
-        <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
-        <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+        <div class="st-card state-card" id="state-card-1" style="border-left:4px solid #3b82f6">
+          <div class="state-card__head">
+            <span class="card-title" style="font-weight:700;color:#3b82f6">Slot 1 State</span>
+            <span class="badges" id="state-badges-1">
+              <span class="st-badge" data-s="idle">Idle</span>
+              <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
+              <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
+              <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
+              <span class="st-badge st-badge--error" data-s="error">Error</span>
+            </span>
+          </div>
+          <div class="state-card__row"><span id="state-label-1">Waiting for a request</span><span class="muted" id="state-detail-1"></span></div>
+          <div class="st-progress" id="state-progress-1"><div class="st-progress__bar" id="state-bar-1" style="width:0%"></div></div>
+        </div>
       </div>
 
       <div class="metrics" id="metrics">
