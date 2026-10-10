@@ -895,7 +895,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     });
     const size_t radix_slots = [] {
         const char* e = std::getenv("STRATA_RADIX_VRAM_SLOTS");
-        return (e && std::atoi(e) > 0) ? (size_t) std::atoi(e) : (size_t) 4;
+        return e ? (size_t) std::atoi(e) : (size_t) 4;
     }();
     const size_t radix_host_slots = [&] {
         const char* e = std::getenv("STRATA_RADIX_HOST_SLOTS");
@@ -1485,8 +1485,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             s.radix_node = radix_parent;
             radix_tree.acquire(s.radix_node);
             std::fprintf(stderr, "strata-agx concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld (%s)\n", (long long) reused, (long long) radix_parent->id, radix_parent->has_device_snapshot() ? "VRAM" : "Host-RAM HiCache L2");
-        } else if (parent != nullptr && parent != &s) {
-            // SPRINT 1: Cross-slot prefix fork from parent slot snapshot
+        } else if (parent != nullptr) {
+            // SPRINT 1: Cross-slot or self-slot prefix fork from snapshot
             s.consumed.assign(parent->saved_consumed.begin(), parent->saved_consumed.begin() + reused);
             for (size_t st = 0; st < m.stages.size(); ++st) {
                 const core::OnDevice on(m.stages[st].device);
@@ -1496,7 +1496,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                                         (void*) m.stage_rt[st].prompt_stream, fork_err,
                                         ps.R_saved, ps.gdn_saved, ps.ple_saved,
                                         ps.ple_prev_saved, ps.ple_token_saved)) {
-                    err = "concurrency: cross-slot fork failed on stage " + std::to_string(st) + ": " + fork_err;
+                    err = "concurrency: snapshot fork failed on stage " + std::to_string(st) + ": " + fork_err;
                     return false;
                 }
             }
@@ -1512,12 +1512,15 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
                 s.draft->kv_restore(reused);
             }
-            std::fprintf(stderr, "strata-agx concurrent: cross-slot fork: slot forks %lld tokens from parent (saved=%lld)\n",
-                         (long long) reused, (long long) parent->saved_prefix);
+            std::fprintf(stderr, "strata-agx concurrent: snapshot fork: slot forks %lld tokens from %s (saved=%lld)\n",
+                         (long long) reused, (parent == &s ? "self" : "parent"), (long long) parent->saved_prefix);
         } else {
-            // Intra-slot retention (slot continues itself)
+            // Intra-slot retention (slot continues itself with zero-copy truncation)
+            if ((int64_t) s.consumed.size() > reused) {
+                s.consumed.resize((size_t) reused);
+            }
             s.draft->kv_restore(reused);
-            std::fprintf(stderr, "strata-agx concurrent: live retention: slot resumes %lld tokens\n", (long long) reused);
+            std::fprintf(stderr, "strata-agx concurrent: live retention: slot resumes %lld tokens (truncated)\n", (long long) reused);
         }
         s.draft->set_prompt_len((int64_t) s.request.tokens.size());
         s.stages[0].verify.set_sampling(s.request.sampling);
@@ -1618,11 +1621,19 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 for (auto& ptr : m.slots) {
                     const auto& held = *ptr;
                     if (held.active.load() || (int64_t) tokens.size() >= held.max_context) continue;
+                    if (std::find(admitted_this_round.begin(), admitted_this_round.end(), ptr.get()) != admitted_this_round.end()) continue;
                     const int64_t L = (int64_t) held.consumed.size();
-                    if (L < 1 || L > nmax || L <= candL) continue;
-                    bool same = true;
-                    for (int64_t i = 0; i < L && same; ++i) same = held.consumed[(size_t) i] == (int32_t) tokens[(size_t) i];
-                    if (same) { candL = L; cand = ptr.get(); }
+                    if (L < 1) continue;
+                    // Compute Longest Common Prefix (LCP) allowing partial prefix rollback
+                    int64_t match_len = 0;
+                    const int64_t limit = std::min<int64_t>(L, nmax);
+                    while (match_len < limit && held.consumed[(size_t) match_len] == (int32_t) tokens[(size_t) match_len]) {
+                        ++match_len;
+                    }
+                    if (match_len >= 256 && match_len > candL) {
+                        candL = match_len;
+                        cand = ptr.get();
+                    }
                 }
 
                 if (cand != nullptr && candL > best) { best = candL; pick = cand; pick_q = q; }
@@ -1668,7 +1679,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             Impl::Slot* pick_child = nullptr;
             if (pick_child == nullptr) {
                 for (auto& ptr : m.slots) {
-                    if (!ptr->active.load() && req_len < ptr->max_context) { pick_child = ptr.get(); break; }
+                    if (!ptr->active.load() && req_len < ptr->max_context &&
+                        std::find(admitted_this_round.begin(), admitted_this_round.end(), ptr.get()) == admitted_this_round.end()) {
+                        pick_child = ptr.get(); break;
+                    }
                 }
             }
             if (pick_child == nullptr) break;
@@ -1677,6 +1691,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             s.request = std::move(pending[pick_q]);
             pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
             if (!admit_slot(s, best, nullptr, best_node)) return 1;
+            admitted_this_round.push_back(&s);
         }
 
         // SPRINT 1: Cross-slot prefix fork pass.
@@ -1710,9 +1725,17 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
 
             const int64_t req_len = (int64_t) pending[pick_q].tokens.size();
             Impl::Slot* pick_child = nullptr;
+            // Prefer the parent slot itself if it is idle, otherwise pick any idle child slot
+            if (pick_parent != nullptr && !pick_parent->active.load() && req_len < pick_parent->max_context &&
+                std::find(admitted_this_round.begin(), admitted_this_round.end(), pick_parent) == admitted_this_round.end()) {
+                pick_child = pick_parent;
+            }
             if (pick_child == nullptr) {
                 for (auto& ptr : m.slots) {
-                    if (!ptr->active.load() && req_len < ptr->max_context && ptr.get() != pick_parent) { pick_child = ptr.get(); break; }
+                    if (!ptr->active.load() && req_len < ptr->max_context &&
+                        std::find(admitted_this_round.begin(), admitted_this_round.end(), ptr.get()) == admitted_this_round.end()) {
+                        pick_child = ptr.get(); break;
+                    }
                 }
             }
             if (pick_child == nullptr) break;
@@ -1721,6 +1744,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             s.request = std::move(pending[pick_q]);
             pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
             if (!admit_slot(s, best, pick_parent)) return 1;
+            admitted_this_round.push_back(&s);
         }
 
         if (retain && admitting) {   // D1 falsifier: the whole-queue scan's added stall at the safe point
@@ -1736,7 +1760,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
 
             // 1. Prefer an empty slot (consumed.empty()) to preserve cached slots for other conversations
             for (auto& ptr : m.slots) {
-                if (!ptr->active.load() && req_len < ptr->max_context && ptr->consumed.empty()) {
+                if (!ptr->active.load() && req_len < ptr->max_context && ptr->consumed.empty() &&
+                    std::find(admitted_this_round.begin(), admitted_this_round.end(), ptr.get()) == admitted_this_round.end()) {
                     pick = ptr.get();
                     break;
                 }
@@ -1745,7 +1770,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (pick == nullptr) {
                 for (size_t si = 0; si < m.slots.size(); ++si) {
                     auto& ptr = m.slots[(m.prompt_rotation + si) % m.slots.size()];
-                    if (!ptr->active.load() && req_len < ptr->max_context) {
+                    if (!ptr->active.load() && req_len < ptr->max_context &&
+                        std::find(admitted_this_round.begin(), admitted_this_round.end(), ptr.get()) == admitted_this_round.end()) {
                         pick = ptr.get();
                         m.prompt_rotation = (m.prompt_rotation + si + 1) % m.slots.size();
                         break;
@@ -1757,6 +1783,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 s.request = std::move(pending[q]);
                 pending.erase(pending.begin() + (std::ptrdiff_t) q);
                 if (!admit_slot(s, 0, nullptr)) return 1;
+                admitted_this_round.push_back(&s);
             } else {
                 ++q;
             }

@@ -777,6 +777,10 @@ std::shared_ptr<RadixNode> RadixTree::insert(
         }
     }
 
+    if (vram_budget_ == 0 || max_cached_snapshots_ == 0) {
+        return curr;
+    }
+
     if (!curr->has_snapshot()) {
         const size_t n_stages = stage_devices.size();
         curr->stage_snapshots.resize(n_stages);
