@@ -345,11 +345,12 @@ bool RadixNode::hydrate_from_nvme(NVMeStorageTier& nvme) {
     const uint8_t* p = buffer.data();
     size_t offset = 0;
 
+    if (!p || l3_bytes < sizeof(NVMeNodeHeader)) return false;
     NVMeNodeHeader hdr;
     std::memcpy(&hdr, p + offset, sizeof(hdr));
     offset += sizeof(hdr);
 
-    if (hdr.magic != kNVMeMagic || hdr.version != kNVMeVersion) {
+    if (hdr.magic != kNVMeMagic || hdr.version != kNVMeVersion || hdr.node_id != id) {
         return false;
     }
 
