@@ -62,11 +62,11 @@ All figures below represent real physical hardware benchmarks measured on live m
 | **Sustained Decode Speed (Warm)** | **105.0 – 120.4 tok/s** | Sustained real-world generation (7.2 – 8.9 ms/token) |
 | **Peak Decode Speed** | **141.0 – 156.2 tok/s** | High speculative acceptance runs |
 | **Speculative Acceptance Rate** | **78.2% – 86.4%** | Average 19 to 23 of every 23 offered draft tokens accepted |
-| **Cold Prefill Throughput** | **5,631.7 – 6,325.0 tok/s** | Single-request path via CCD0-pinned CPU MoE staging (0s initial stall on 62k+ prompts) |
-| **Concurrent Prefill Throughput** | **1,850 – 2,200 tok/s** | 12,288-token concurrent chunk limit |
+| **Cold Prefill Throughput (Single)** | **5,631.7 – 6,325.0 tok/s** | Single-request path via CCD0-pinned CPU MoE staging (0s initial stall on 62k+ prompts) |
+| **Concurrent 62k Prefill Throughput** | **3,180 tok/s (19.71s)** | Rebalanced 5,120-token concurrent chunk limit (reclaiming 5.95 GiB VRAM for decode) |
 | **Time to First Token (TTFT)** | **~24 – 35 ms** | On cached prompts (50k+ prefix match via RadixTree) |
-| **Concurrent Throughput ($C=2$)** | **152.4 tok/s aggregate** | 2 parallel streams @ 100 tok/s per stream with zero cross-talk |
-| **VRAM Expert Residency** | **20,739 / 24,576 slots (84.4%)** | 12,077 on CUDA 0 (17.9 GB cache) + 8,662 on CUDA 1 (16.5 GB cache) |
+| **Concurrent Throughput ($C=2$)** | **82.1 tok/s aggregate** | 2 simultaneous active streams (~98 tok/s per-stream peak, zero cross-talk) |
+| **VRAM Expert Residency (Concurrent)** | **17,254 / 24,576 slots (70.2%)** | 10,247 on CUDA 0 (14.9 GB cache) + 7,007 on CUDA 1 (13.0 GB cache) (+4,030 recovered) |
 | **Total VRAM Consumption** | **47.6 GB across dual GPUs** | 23.9 GB on GPU 0 (97% VRAM) + 23.9 GB on GPU 1 (97% VRAM) |
 
 ---
@@ -117,6 +117,8 @@ python3 serve/server.py --engine strata --config configs/q3-xxs-dual-4090-servin
   "host": "127.0.0.1",
   "port": 8096,
   "env": {
+    "STRATA_RADIX_VRAM_SLOTS": "8",
+    "STRATA_RADIX_HOST_SLOTS": "8",
     "STRATA_WATCHDOG_S": "180",
     "STRATA_STAGE_OVERLAP": "1",
     "STRATA_PREFILL_CHAIN": "1",
@@ -124,8 +126,19 @@ python3 serve/server.py --engine strata --config configs/q3-xxs-dual-4090-servin
     "STRATA_PLE_PREFETCH": "1",
     "STRATA_MMQ_BLOB": "1",
     "STRATA_STAGE_OVERLAP_CROSSDEV": "1",
+    "STRATA_CONCURRENT_RETAIN": "1",
+    "STRATA_CONCURRENT_PROFILE": "1",
+    "STRATA_PASS_STALL_MS": "250",
+    "STRATA_IPC_SHM": "/strata_ipc_8096",
+    "STRATA_NVME_TIER_DIR": "/srv/lab/cache/strata/nvme_radix",
+    "STRATA_SAMPLER_ONE_BLOCK": "1",
     "STRATA_PIN_LIMIT_GIB": "32",
-    "STRATA_OLD_SAMPLER": "1"
+    "STRATA_RADIX_VRAM_MIB": "2048",
+    "STRATA_RADIX_DEEP_RESERVE_MIB": "1280",
+    "STRATA_OLD_SAMPLER": "1",
+    "STRATA_VERIFY_DEVICE_PLAN": "1",
+    "STRATA_MTP_FUSE_CHAIN": "1",
+    "STRATA_DRAFT_WAVEFRONT": "1"
   },
   "sampling": {
     "temperature": 0.6,
@@ -148,14 +161,25 @@ python3 serve/server.py --engine strata --config configs/q3-xxs-dual-4090-servin
     "--spec-min-p", "0.55",
     "--mtp", "/path/to/models/mtp/rt",
     "--max-context", "262144",
+    "--concurrency", "2",
+    "--unit-wait-ms", "0",
+    "--batch-rows", "10",
+    "--batch-policy", "fair",
+    "--concurrent-prefill", "5120",
+    "--batch-parallel", "1",
+    "--batch-graphs", "16",
+    "--batch-padding", "1",
     "--kv", "q4_0",
     "--layer-split", "27",
     "--split-device", "1",
     "--ple-row-cache", "320001536",
-    "--vram-reserve-mib", "960",
+    "--vram-reserve-mib", "636",
     "--adapt-every", "0",
+    "--nanobatch", "2",
     "--pcie-frac", "0.85"
-  ]
+  ],
+  "cors_origins": ["http://127.0.0.1:8096", "http://localhost:8096"],
+  "allowed_hosts": ["127.0.0.1", "localhost"]
 }
 ```
 
