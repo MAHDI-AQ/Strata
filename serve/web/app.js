@@ -280,7 +280,6 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
 
   // context fill & parallel slot rendering
   const ctx = eng.max_context || 0;
-  const slots = slotsList || [];
   const numSlots = slots.length || (eng.concurrency || 2);
   if ($("slots-summary")) $("slots-summary").textContent = `${numSlots} Parallel Slots · ${ctxfmt(ctx)} each`;
 
