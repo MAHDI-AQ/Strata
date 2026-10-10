@@ -108,7 +108,9 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
         // Check if data is already page-aligned
         if ((reinterpret_cast<uintptr_t>(data) % kDirectBlockAlignment != 0) || (bytes != aligned_len)) {
             staging.allocate(aligned_len);
-            std::memcpy(staging.data(), data, bytes);
+            if (staging.data() && bytes > 0) {
+                std::memcpy(staging.data(), data, bytes);
+            }
             write_ptr = staging.data();
             write_bytes = aligned_len;
         }
