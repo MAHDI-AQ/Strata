@@ -75,6 +75,9 @@ public:
     /// Returns slot_id, or -1 if no suitable slot is idle.
     int allocate_slot(uint64_t request_id, int64_t prompt_tokens, int64_t max_new,
                       int64_t max_context) {
+        if (max_context > 0 && prompt_tokens + std::max<int64_t>(0, max_new) > max_context) {
+            return -1;
+        }
         std::lock_guard<std::mutex> lock(sched_mutex_);
         const auto t0 = std::chrono::steady_clock::now();
 

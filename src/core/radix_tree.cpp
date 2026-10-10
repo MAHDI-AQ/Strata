@@ -969,6 +969,10 @@ bool RadixTree::fork_to_session(
 
     if (node->has_host_snapshot() && !node->has_device_snapshot()) {
         node->unpark_to_device();   // P18/P20: an L2-host-parked node restores before the fork
+        if (!node->has_device_snapshot()) {
+            err = "radix_fork: failed to restore host snapshot to device VRAM";
+            return false;
+        }
     }
 
     const size_t n_stages = stage_devices.size();
