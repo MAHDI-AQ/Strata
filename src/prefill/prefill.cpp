@@ -584,7 +584,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             m.grp_host = m.grp_dev = nullptr;
             m.grp_n = m.grp_tk = 0;
             void *h = nullptr, *d = nullptr;
-            if (cudaHostAlloc(&h, need * 4, cudaHostAllocMapped) == cudaSuccess &&
+            if (cudaHostAlloc(&h, need * 4, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
                 cudaHostGetDevicePointer(&d, h, 0) == cudaSuccess) {
                 m.grp_host = (int32_t*) h;
                 m.grp_dev = (int32_t*) d;
@@ -601,7 +601,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         // buffers' idiom).  One slice per group per layer; ng = ceil(n_expert / MMQ_GROUP) groups.
         const size_t ng = (size_t) (m.g->n_expert + MMQ_GROUP - 1) / MMQ_GROUP;
         void *h = nullptr, *d = nullptr;
-        if (cudaHostAlloc(&h, ng * 2 * (size_t) MMQ_GROUP * sizeof(const char*), cudaHostAllocMapped) == cudaSuccess &&
+        if (cudaHostAlloc(&h, ng * 2 * (size_t) MMQ_GROUP * sizeof(const char*), cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
             cudaHostGetDevicePointer(&d, h, 0) == cudaSuccess) {
             m.gsrc_host = (const char**) h;
             m.gsrc_dev = (const char**) d;
